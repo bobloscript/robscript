@@ -1,0 +1,1014 @@
+--!nonstrict
+--[[
+	Star Fishing Hub
+	----------------
+	A single-file helper for Star Fishing:
+
+	  1. Auto fishing
+	  1.1 Perfect casts only - releases the cast at the top of the charge bar
+	  1.2 Auto reel         - holds the reel until every star is in
+	  2. Selling stars with filters (rarity and star type)
+
+	Press RightControl to show or hide the window.
+	Everything starts off. Settings are saved in the StarFishingHub folder.
+]]
+
+----------------------------------------------------------------------
+-- UI library
+----------------------------------------------------------------------
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, lib = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
+		Airflow = lib
+		break
+	end
+end
+if not Airflow then
+	error("[Star Fishing Hub] The UI library could not be loaded. Check your connection and retry.")
+end
+
+----------------------------------------------------------------------
+-- Game access
+----------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local Events = ReplicatedStorage:WaitForChild("Events", 30)
+if not Events then
+	error("[Star Fishing Hub] This script only works in Star Fishing.")
+end
+
+local Data = Events:WaitForChild("Data", 30)
+local LocalEvents = Events:WaitForChild("Local", 30)
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 30)
+local UseRodButton = LocalEvents:WaitForChild("UseRodButton", 30)
+local GetStars = Data:WaitForChild("GetStars", 30)
+local GetMoney = Data:WaitForChild("GetMoney", 30)
+local ClientFavouriteItem = Data:WaitForChild("ClientFavouriteItem", 30)
+
+local StarModule
+pcall(function()
+	StarModule = require(ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("Star"))
+end)
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+local function short(value)
+	if type(value) ~= "number" then
+		return "-"
+	end
+	local text = tostring(math.floor(value))
+	local grouped = text:reverse():gsub("(%d%d%d)", "%1 "):reverse()
+	return (grouped:gsub("^%s+", ""))
+end
+
+local function character()
+	local char = LocalPlayer.Character
+	if char and char.Parent then
+		return char
+	end
+	return nil
+end
+
+local function rootPosition()
+	local char = character()
+	if not char then
+		return nil
+	end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	return root and root.Position or nil
+end
+
+local function goTo(position)
+	local char = character()
+	if not char then
+		return
+	end
+	pcall(function()
+		char:PivotTo(CFrame.new(position))
+	end)
+end
+
+local function rodTool()
+	local char = character()
+	if not char then
+		return nil
+	end
+	local inHand = char:FindFirstChild("Rod")
+	if inHand then
+		return inHand
+	end
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	local stored = backpack and backpack:FindFirstChild("Rod")
+	if stored then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(function()
+				hum:EquipTool(stored)
+			end)
+			task.wait(0.4)
+			return char:FindFirstChild("Rod")
+		end
+	end
+	return nil
+end
+
+local function rodGui()
+	local gui = PlayerGui:FindFirstChild("RodGui")
+	if gui and gui.Enabled then
+		return gui
+	end
+	return nil
+end
+
+local function inventoryFull()
+	local gui = PlayerGui:FindFirstChild("RodGui")
+	local flag = gui and gui.Frame:FindFirstChild("InventoryFull")
+	return flag ~= nil and flag.Visible == true
+end
+
+local function stars()
+	local ok, list = pcall(function()
+		return GetStars:InvokeServer()
+	end)
+	if ok and type(list) == "table" then
+		return list
+	end
+	return {}
+end
+
+local function money()
+	local ok, value = pcall(function()
+		return GetMoney:InvokeServer()
+	end)
+	return ok and tonumber(value) or 0
+end
+
+local function starRarity(name)
+	if StarModule then
+		local data = StarModule.Data and StarModule.Data[name]
+		if data and data.Rarity then
+			return data.Rarity
+		end
+	end
+	return "Unknown"
+end
+
+local function starValue(name)
+	if StarModule and type(StarModule.getSellValue) == "function" then
+		local ok, value = pcall(StarModule.getSellValue, name)
+		if ok and type(value) == "number" then
+			return value
+		end
+	end
+	return 0
+end
+
+----------------------------------------------------------------------
+-- Settings
+----------------------------------------------------------------------
+
+local Settings = {
+	-- fishing
+	fishingOn = false,
+	perfectFlair = true,
+	castDelay = 0.35,
+	ignoreFull = false,
+	-- selling
+	keepFavourites = true,
+	sellRarities = {},
+	sellTypes = {},
+	dryRun = true,
+	autoSellOnFull = true,
+}
+
+local Window, Log
+local UiRefs = {}
+
+local function log(message, color)
+	if Log then
+		Log:Push(tostring(message), color)
+	end
+end
+
+local function notify(title, content, kind)
+	pcall(function()
+		Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = 4 })
+	end)
+end
+
+getgenv().__StarFishingGen = (getgenv().__StarFishingGen or 0) + 1
+local SCRIPT_GENERATION = getgenv().__StarFishingGen
+
+local function scriptAlive()
+	return getgenv().__StarFishingGen == SCRIPT_GENERATION
+end
+
+local loops = {}
+local function startLoop(name, step)
+	loops[name] = (loops[name] or 0) + 1
+	local mine = loops[name]
+	task.spawn(function()
+		while loops[name] == mine and scriptAlive() do
+			local ok, err = pcall(step)
+			if not ok then
+				log("<Error>" .. name .. ": " .. tostring(err) .. "</Error>")
+				task.wait(1)
+			end
+			if loops[name] ~= mine then
+				break
+			end
+			task.wait(0.05)
+		end
+	end)
+end
+
+local function stopLoop(name)
+	loops[name] = (loops[name] or 0) + 1
+end
+
+----------------------------------------------------------------------
+-- 1. FISHING
+----------------------------------------------------------------------
+
+local GlobalEvents = Events:WaitForChild("Global", 30)
+local NewFishing = GlobalEvents and GlobalEvents:WaitForChild("NewFishing", 30)
+local ClientRecieveItems = GlobalEvents and GlobalEvents:WaitForChild("ClientRecieveItems", 30)
+
+local fishStats = {
+	casts = 0,
+	catches = 0,
+	misses = 0,
+	startedAt = 0,
+	lastLog = 0,
+}
+
+--- Plays the same little flourish the game shows on a perfect cast.
+local function perfectFlair()
+	local sounds = ReplicatedStorage:FindFirstChild("Sounds")
+	local cast = sounds and sounds:FindFirstChild("PerfectCast")
+	if cast then
+		local ok, clone = pcall(function()
+			local copy = cast:Clone()
+			copy.Parent = workspace.CurrentCamera
+			copy:Play()
+			game:GetService("Debris"):AddItem(copy, 3)
+			return copy
+		end)
+	end
+	pcall(function()
+		local dialogue = ReplicatedStorage:FindFirstChild("Dialogue")
+		local ev = dialogue and dialogue:FindFirstChild("Events")
+		local localEv = ev and ev:FindFirstChild("Local")
+		local speech = localEv and localEv:FindFirstChild("ClientSpeech")
+		if speech then
+			speech:Fire("Perfect!!!", Color3.new(1, 0.7768, 0.0013))
+		end
+	end)
+end
+
+--- One full cast, driven through the game's own events.
+--- The game decides the catch when the cast is sent, then expects us to ask for
+--- each star at its own pace. Doing it this way keeps working even if the rod's
+--- own animation script has given up.
+local function serverCast()
+	local char = character()
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local rod = rodTool()
+	local tip = rod and rod:FindFirstChild("Model")
+	local nodes = tip and tip:FindFirstChild("Nodes")
+	local rodTip = nodes and nodes:FindFirstChild("RodTip")
+	local attachment = rodTip and rodTip:FindFirstChild("Attachment")
+
+	if not (hum and root and attachment) then
+		return false, 0, "Rod is not in hand"
+	end
+
+	local answer
+	local connection = ClientRecieveItems.OnClientEvent:Connect(function(ok, position, castId, stars, model, timers)
+		answer = { ok = ok, castId = castId, stars = stars, timers = timers }
+	end)
+
+	NewFishing.CastRod:FireServer(hum, root.CFrame.Position, root.CFrame.LookVector, attachment)
+
+	local deadline = os.clock() + 6
+	while not answer and os.clock() < deadline do
+		task.wait(0.05)
+	end
+
+	if not answer then
+		connection:Disconnect()
+		return false, 0, "The game did not answer"
+	end
+
+	if not answer.ok or not answer.stars or #answer.stars == 0 then
+		connection:Disconnect()
+		return false, 0, "Nothing bit"
+	end
+
+	for index, star in ipairs(answer.stars) do
+		local waitTime = tonumber((answer.timers or {})[index]) or tonumber(star.interval) or 0.2
+		task.wait(math.clamp(waitTime, 0.05, 3))
+		NewFishing.RequestSpawn:FireServer(star.castID, star.starID)
+	end
+
+	task.wait(0.15)
+	GlobalEvents.WithdrawBobber:FireServer(hum)
+	connection:Disconnect()
+
+	return true, #answer.stars
+end
+
+--- The rod the game thinks is equipped. Needed when the rod's own script died,
+--- because the server then never hears that a rod was put in hand.
+local rodName = nil
+task.spawn(function()
+	local updates = Data:FindFirstChild("UpdateClientRodsBobbers")
+	if not updates then
+		return
+	end
+	local connection
+	connection = updates.OnClientEvent:Connect(function(rods)
+		for _, rod in ipairs(rods or {}) do
+			if rod.isCurrentRod then
+				rodName = rod.name
+			end
+		end
+	end)
+	pcall(function()
+		updates:FireServer()
+	end)
+	task.wait(3)
+	connection:Disconnect()
+end)
+
+--- Puts the game back into a clean casting state.
+local function recoverRod()
+	local char = character()
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	rodTool()
+	if rodName then
+		pcall(function()
+			Data.Rods.RodEquipAbility:FireServer(true, rodName)
+		end)
+	end
+	if hum then
+		pcall(function()
+			GlobalEvents.WithdrawBobber:FireServer(hum)
+		end)
+	end
+	task.wait(0.5)
+end
+
+--- Set once the selling tab is built. Used when the backpack fills up mid-run.
+local autoSellHook: (() -> number)? = nil
+
+local function fishingStep()
+	if not character() then
+		return
+	end
+
+	if inventoryFull() then
+		if Settings.autoSellOnFull and autoSellHook then
+			local spot = rootPosition()
+			log("<Accent>Backpack is full - selling the catch</Accent>")
+			autoSellHook()
+			if spot then
+				goTo(spot)
+				task.wait(0.6)
+			end
+			return
+		end
+		if not Settings.ignoreFull then
+			if os.clock() - (fishStats.lastLog or 0) > 5 then
+				fishStats.lastLog = os.clock()
+				log("<Warning>Backpack is full - sell some stars first</Warning>")
+			end
+			task.wait(1)
+			return
+		end
+	end
+
+	local ok, count, reason = serverCast()
+	if ok then
+		fishStats.casts += 1
+		fishStats.catches += count
+		fishStats.missStreak = 0
+		if Settings.perfectFlair then
+			perfectFlair()
+		end
+		log(string.format("<Success>Cast %d: %d star(s)</Success>", fishStats.casts, count))
+	else
+		fishStats.misses += 1
+		fishStats.missStreak = (fishStats.missStreak or 0) + 1
+
+		-- A few misses in a row usually means the rod state is stale: put the rod
+		-- away and back, and tell the game which rod is equipped again.
+		if fishStats.missStreak == 3 or fishStats.missStreak == 8 then
+			recoverRod()
+		end
+
+		if fishStats.missStreak == 8 then
+			log("<Warning>Nothing is biting at all - if it stays like this, rejoin the server</Warning>")
+		elseif os.clock() - (fishStats.lastLog or 0) > 3 then
+			fishStats.lastLog = os.clock()
+			log("<Muted>" .. tostring(reason) .. "</Muted>")
+		end
+		task.wait(0.6)
+	end
+
+	task.wait(Settings.castDelay or 0.35)
+end
+
+local function fishingSet(on)
+	Settings.fishingOn = on
+	if on then
+		fishStats.startedAt = os.clock()
+		startLoop("Fishing", fishingStep)
+		log("Auto fishing on")
+	else
+		stopLoop("Fishing")
+		log("Auto fishing off")
+	end
+	if UiRefs and UiRefs.fishing then
+		UiRefs.fishing:Set(on, true)
+	end
+end
+----------------------------------------------------------------------
+-- 2. SELLING
+----------------------------------------------------------------------
+
+local sellStats = { lastValue = 0, lastCount = 0, soldTotal = 0, moneyTotal = 0 }
+
+local function rarityList()
+	local seen = {}
+	for _, star in ipairs(stars()) do
+		seen[starRarity(star.name)] = true
+	end
+	local list = {}
+	for rarity in pairs(seen) do
+		table.insert(list, rarity)
+	end
+	table.sort(list)
+	return list
+end
+
+local function typeList()
+	local seen = {}
+	for _, star in ipairs(stars()) do
+		if star.name then
+			seen[star.name] = true
+		end
+	end
+	local list = {}
+	for name in pairs(seen) do
+		table.insert(list, name)
+	end
+	table.sort(list)
+	return list
+end
+
+local function allowed(star)
+	if next(Settings.sellRarities) ~= nil and not Settings.sellRarities[starRarity(star.name)] then
+		return false
+	end
+	if next(Settings.sellTypes) ~= nil and not Settings.sellTypes[star.name] then
+		return false
+	end
+	if Settings.keepFavourites and star.isFavourite then
+		return false
+	end
+	return true
+end
+
+--- Stars that match the filters right now.
+local function matchingStars()
+	local picked = {}
+	for _, star in ipairs(stars()) do
+		if allowed(star) then
+			local value = starValue(star.name) * (tonumber(star.size) or 1)
+			table.insert(picked, { star = star, value = value })
+		end
+	end
+	return picked
+end
+
+local function totalValue(picked)
+	local total = 0
+	for _, entry in ipairs(picked) do
+		total += entry.value
+	end
+	return total
+end
+
+----------------------------------------------------------------------
+-- Merchant: the free way to sell stars
+----------------------------------------------------------------------
+
+local DialogueGlobal = ReplicatedStorage:WaitForChild("Dialogue", 30)
+local DialogueEvents = DialogueGlobal
+	and DialogueGlobal:WaitForChild("Events", 30)
+	and DialogueGlobal.Events:WaitForChild("Global", 30)
+local PresentOptions = DialogueEvents and DialogueEvents:WaitForChild("PresentClientDialogueOptions", 30)
+local ChooseOption = DialogueEvents and DialogueEvents:WaitForChild("ClientChoosesDialogueOption", 30)
+
+local function starMerchant()
+	local npcs = workspace:FindFirstChild("NonPlayableCharacters")
+	local npc = npcs and npcs:FindFirstChild("Star Merchant")
+	if not npc then
+		return nil, nil
+	end
+	local prompt
+	for _, d in ipairs(npc:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			prompt = d
+			break
+		end
+	end
+	return npc, prompt
+end
+
+--- Opens the merchant and returns the dialogue options he offers.
+local function merchantOptions()
+	local npc, prompt = starMerchant()
+	if not (npc and prompt and PresentOptions) then
+		return nil
+	end
+
+	goTo(npc:GetPivot().Position + Vector3.new(0, 0, 4))
+	task.wait(1)
+
+	local captured
+	local connection = PresentOptions.OnClientEvent:Connect(function(_, _, options)
+		if type(options) == "table" and #options > 0 then
+			captured = options
+		end
+	end)
+
+	for _ = 1, 3 do
+		if captured then
+			break
+		end
+		pcall(function()
+			prompt:InputHoldBegin()
+			task.wait(math.max(0.2, (prompt.HoldDuration or 0) + 0.2))
+			prompt:InputHoldEnd()
+		end)
+		task.wait(1.4)
+	end
+
+	connection:Disconnect()
+	return captured
+end
+
+--- Sells everything the merchant will take. Favourites are skipped by the game.
+local function sellEverything()
+	if not ChooseOption then
+		log("<Error>Dialogue system not found</Error>")
+		return 0
+	end
+
+	local options = merchantOptions()
+	if not options then
+		log("<Warning>Could not reach the Star Merchant</Warning>")
+		return 0
+	end
+
+	local sellAll
+	for _, option in ipairs(options) do
+		if option.id == "sell-all" then
+			sellAll = option
+		end
+	end
+	if not sellAll then
+		log("<Warning>The merchant has nothing to buy right now</Warning>")
+		return 0
+	end
+
+	local before = money()
+	ChooseOption:FireServer(sellAll)
+	task.wait(3)
+	local gained = math.max(0, money() - before)
+
+	if gained > 0 then
+		sellStats.soldTotal += 1
+		sellStats.moneyTotal += gained
+		log("<Success>Sold the catch for " .. short(gained) .. "</Success>")
+	else
+		log("<Warning>Nothing was sold</Warning>")
+	end
+	return gained
+end
+
+local saleBusy = false
+
+--- Sells everything that matches the filters, protecting the rest with
+--- favourites. Used by the Sell button and by the auto sell when the bag fills.
+local function performSale()
+	if saleBusy then
+		return 0
+	end
+
+	local picked = matchingStars()
+	if #picked == 0 then
+		log("<Warning>Nothing matches the filters - the bag will stay full</Warning>")
+		return 0
+	end
+
+	saleBusy = true
+
+	-- The merchant buys the whole backpack at once, so everything that has to
+	-- stay is marked as a favourite first - the game never sells favourites.
+	-- Whatever we mark is un-marked again after the sale.
+	local marked = {}
+	local all = stars()
+	if #picked < #all and Settings.keepFavourites then
+		for _, entry in ipairs(all) do
+			if not allowed(entry) and not entry.isFavourite then
+				pcall(function()
+					ClientFavouriteItem:FireServer(entry.id)
+				end)
+				table.insert(marked, entry.id)
+				task.wait(0.03)
+			end
+		end
+		if #marked > 0 then
+			log("Protected " .. #marked .. " star(s) you wanted to keep")
+			task.wait(1)
+		end
+	end
+
+	local gained = sellEverything()
+
+	for _, id in ipairs(marked) do
+		pcall(function()
+			ClientFavouriteItem:FireServer(id)
+		end)
+		task.wait(0.02)
+	end
+
+	saleBusy = false
+	return gained
+end
+
+-- Lets the fishing loop sell when the backpack fills up.
+autoSellHook = performSale
+
+----------------------------------------------------------------------
+-- WINDOW
+----------------------------------------------------------------------
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+Window = Airflow:CreateWindow({
+	Name = "Star Fishing Hub",
+	LoadingSubtitle = "casts, reels, sells",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "StarFishingHub" },
+	Home = {
+		Title = "Star Fishing Hub",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogBox = LogTab:CreateGroupbox({ Name = "What the script is doing", Side = "Left" })
+Log = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----------------------------------------------------------------------
+-- FISHING TAB
+----------------------------------------------------------------------
+
+local UiRefs = {}
+
+local FishingTab = Window:CreateTab({ Name = "Fishing", Icon = "fish" })
+local FishMain = FishingTab:CreateGroupbox({ Name = "Auto fishing", Side = "Left" })
+local FishInfo = FishingTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+local FishFine = FishingTab:CreateGroupbox({ Name = "Fine tuning", Side = "Right" })
+
+UiRefs.fishing = FishMain:CreateToggle({
+	Name = "Auto fishing",
+	Desc = "Casts non-stop and collects every star the game sends back",
+	Flag = "FishingOn",
+	CurrentValue = false,
+	Callback = function(on)
+		fishingSet(on)
+	end,
+})
+FishMain:CreateToggle({
+	Name = "Perfect cast flair",
+	Desc = "Shows the game's Perfect!!! effect on every cast (visual only)",
+	Flag = "PerfectFlair",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.perfectFlair = on
+	end,
+})
+
+FishMain:CreateToggle({
+	Name = "Keep going when the bag is full",
+	Desc = "The game stops handing out stars when the bag is full - turn this on only if you want to risk it",
+	Flag = "IgnoreFull",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.ignoreFull = on
+	end,
+})
+FishMain:CreateButton({
+	Name = "Equip the rod",
+	Icon = "hand",
+	Callback = function()
+		rodTool()
+		log("Rod equipped")
+	end,
+})
+
+FishMain:CreateButton({
+	Name = "Cast once",
+	Icon = "fish",
+	Callback = function()
+		task.spawn(function()
+			local ok, count, reason = serverCast()
+			if ok then
+				log(string.format("<Success>Cast: %d star(s)</Success>", count))
+				if Settings.perfectFlair then
+					perfectFlair()
+				end
+			else
+				log("<Warning>" .. tostring(reason) .. "</Warning>")
+			end
+		end)
+	end,
+})
+
+FishFine:CreateSlider({
+	Name = "Pause between casts",
+	Range = { 0.1, 3 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.35,
+	Flag = "CastDelay",
+	Callback = function(value)
+		Settings.castDelay = value
+	end,
+})
+
+FishInfo:CreateStatus({
+	Name = "Casts",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return tostring(fishStats.casts)
+	end,
+})
+
+FishInfo:CreateStatus({
+	Name = "Stars caught",
+	Style = "Row",
+	Update = function()
+		return "<Success>" .. tostring(fishStats.catches) .. "</Success>"
+	end,
+})
+
+FishInfo:CreateStatus({
+	Name = "Per hour",
+	Style = "Row",
+	Update = function()
+		local seconds = os.clock() - (fishStats.startedAt or os.clock())
+		if seconds < 5 or fishStats.catches == 0 then
+			return "<Muted>-</Muted>"
+		end
+		return short(fishStats.catches * (3600 / seconds))
+	end,
+})
+
+FishInfo:CreateStatus({
+	Name = "Inventory",
+	Style = "Row",
+	Update = function()
+		return inventoryFull() and "<Warning>full</Warning>" or "<Success>ok</Success>"
+	end,
+})
+
+FishInfo:CreateParagraph({
+	Title = "How fishing works",
+	Content = "The script casts, collects every star the game sends back and starts again. "
+		.. "It talks to the game directly, so a stuck rod animation cannot block it. "
+		.. "The Perfect!!! text and sound are a visual effect the game shows on a full-charge cast - "
+		.. "it does not change what bites, and the script can show it on every cast.",
+})
+----------------------------------------------------------------------
+-- SELLING TAB
+----------------------------------------------------------------------
+
+local SellTab = Window:CreateTab({ Name = "Selling", Icon = "coins" })
+local SellFilters = SellTab:CreateGroupbox({ Name = "Filters", Side = "Left" })
+local SellAction = SellTab:CreateGroupbox({ Name = "Sell", Side = "Right" })
+local SellInfo = SellTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+UiRefs.rarityDropdown = SellFilters:CreateDropdown({
+	Name = "Rarities to sell",
+	Desc = "Empty means every rarity",
+	Options = {},
+	MultipleOptions = true,
+	Searchable = true,
+	Flag = "SellRarities",
+	Callback = function(selected)
+		local map = {}
+		for _, rarity in ipairs(selected or {}) do
+			map[tostring(rarity)] = true
+		end
+		Settings.sellRarities = map
+	end,
+})
+
+UiRefs.typeDropdown = SellFilters:CreateDropdown({
+	Name = "Star types to sell",
+	Desc = "Empty means every type",
+	Options = {},
+	MultipleOptions = true,
+	Searchable = true,
+	Flag = "SellTypes",
+	Callback = function(selected)
+		local map = {}
+		for _, name in ipairs(selected or {}) do
+			map[tostring(name)] = true
+		end
+		Settings.sellTypes = map
+	end,
+})
+
+SellFilters:CreateToggle({
+	Name = "Never sell favourites",
+	Flag = "KeepFavourites",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.keepFavourites = on
+	end,
+})
+
+SellFilters:CreateToggle({
+	Name = "Dry run only",
+	Desc = "Shows what would be sold without selling",
+	Flag = "DryRun",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.dryRun = on
+	end,
+})
+
+SellFilters:CreateToggle({
+	Name = "Sell when the bag is full",
+	Desc = "Auto fishing sells the filtered catch for real when the backpack fills up (dry run is ignored)",
+	Flag = "AutoSellFull",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.autoSellOnFull = on
+		log(on and "Auto sell when full is on" or "Auto sell when full is off")
+	end,
+})
+
+SellAction:CreateButton({
+	Name = "Preview the selection",
+	Icon = "eye",
+	Callback = function()
+		task.spawn(function()
+			local picked = matchingStars()
+			sellStats.lastCount = #picked
+			sellStats.lastValue = totalValue(picked)
+			log(string.format("Selected %d star(s), about %s", #picked, short(sellStats.lastValue)))
+		end)
+	end,
+})
+
+SellAction:CreateButton({
+	Name = "Sell now",
+	Icon = "hand-coins",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			local picked = matchingStars()
+			if #picked == 0 then
+				log("Nothing matches the filters")
+				return
+			end
+			if Settings.dryRun then
+				log("[dry run] would sell " .. #picked .. " star(s) worth about " .. short(totalValue(picked)))
+				return
+			end
+			performSale()
+		end)
+	end,
+})
+
+SellInfo:CreateStatus({
+	Name = "Stars",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return tostring(#stars())
+	end,
+})
+
+SellInfo:CreateStatus({
+	Name = "Selected",
+	Style = "Row",
+	Update = function()
+		local picked = matchingStars()
+		return #picked .. " / " .. short(totalValue(picked))
+	end,
+})
+
+SellInfo:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	Update = function()
+		return "<Success>" .. short(money()) .. "</Success>"
+	end,
+})
+
+SellInfo:CreateParagraph({
+	Title = "How selling works",
+	Content = "Pick the rarities or star types you are happy to lose, then press Sell. "
+		.. "The Star Merchant buys in bulk, so the script marks everything you want to keep as a favourite "
+		.. "first - the game never sells favourites. Keep Dry run on until the preview looks right.",
+})
+
+----------------------------------------------------------------------
+-- SETTINGS
+----------------------------------------------------------------------
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local HelpBox = SettingsTab:CreateGroupbox({ Name = "Quick guide", Side = "Right" })
+HelpBox:CreateParagraph({
+	Title = "Star Fishing Hub",
+	Content = "Fishing: holds the rod, releases at the top of the charge bar and reels everything in.\n"
+		.. "Selling: filters by rarity or star type, keeps favourites, sells at the Star Merchant.\n\n"
+		.. "Everything starts off. RightControl hides the window.",
+})
+
+----------------------------------------------------------------------
+-- Start
+----------------------------------------------------------------------
+
+task.spawn(function()
+	-- Fill the filter lists once the player data is in.
+	local deadline = os.clock() + 30
+	while os.clock() < deadline do
+		local rarities = rarityList()
+		if #rarities > 0 then
+			UiRefs.rarityDropdown:SetOptions(rarities, { KeepSelection = true })
+			UiRefs.typeDropdown:SetOptions(typeList(), { KeepSelection = true })
+			break
+		end
+		task.wait(1)
+	end
+	pcall(function()
+		Window:LoadAutoload()
+	end)
+	log("<Success>Loaded</Success> - " .. #stars() .. " stars, " .. short(money()) .. " cash")
+end)
+
+print("[Star Fishing Hub] loaded")
