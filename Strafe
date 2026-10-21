@@ -1,0 +1,1173 @@
+--!nonstrict
+--[[
+	Strafe Hub
+	----------
+	Player modifiers for Strafe [BETA]:
+
+	  1. Movement  - speed, fly, noclip, jump, anti-ragdoll
+	  2. Teleport  - coordinates, saved spots, to a player, up/down
+	  3. Visual    - FOV, fullbright, no fog, hide viewmodel, anti-AFK
+	  4. Combat    - hitbox expander, aimbot
+
+	The game drives movement from its own framework, so everything here works
+	through velocity overrides instead of WalkSpeed - WalkSpeed is reset every
+	frame by the game.
+
+	Hotkeys: F fly, N noclip, V speed, RightShift aimbot (hold).
+	RightControl shows or hides the window.
+]]
+
+----------------------------------------------------------------------
+-- UI library
+----------------------------------------------------------------------
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, lib = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
+		Airflow = lib
+		break
+	end
+end
+if not Airflow then
+	error("[Strafe Hub] The UI library could not be loaded. Check your connection and retry.")
+end
+
+----------------------------------------------------------------------
+-- Services
+----------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+
+local function character()
+	local char = LocalPlayer.Character
+	if char and char.Parent then
+		return char
+	end
+	return nil
+end
+
+local function humanoid()
+	local char = character()
+	return char and char:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function root()
+	local char = character()
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function short(value)
+	if type(value) ~= "number" then
+		return "-"
+	end
+	local text = tostring(math.floor(value))
+	return (text:reverse():gsub("(%d%d%d)", "%1 "):reverse():gsub("^%s+", ""))
+end
+
+local function fmtVector(v)
+	if typeof(v) ~= "Vector3" then
+		return "-"
+	end
+	return string.format("%.1f, %.1f, %.1f", v.X, v.Y, v.Z)
+end
+
+----------------------------------------------------------------------
+-- Settings
+----------------------------------------------------------------------
+
+local Settings = {
+	speedOn = false,
+	speed = 60,
+	flyOn = false,
+	flySpeed = 60,
+	noclip = false,
+	infiniteJump = false,
+	jumpPower = 55,
+	antiRagdoll = false,
+
+	fov = 0, -- 0 = leave it alone
+	fullbright = false,
+	noFog = false,
+	hideViewmodel = false,
+	antiAfk = false,
+
+	hitbox = false,
+	aimbot = false,
+	aimbotFov = 120,
+	aimbotHold = true, -- true = only while RightShift is held
+
+	spots = {},
+}
+
+local Window, Log
+local UiRefs = {}
+
+local function log(message, color)
+	if Log then
+		Log:Push(tostring(message), color)
+	end
+end
+
+getgenv().__StrafeHubGen = (getgenv().__StrafeHubGen or 0) + 1
+local SCRIPT_GENERATION = getgenv().__StrafeHubGen
+
+local function scriptAlive()
+	return getgenv().__StrafeHubGen == SCRIPT_GENERATION
+end
+
+----------------------------------------------------------------------
+-- Velocity helpers
+----------------------------------------------------------------------
+
+--- The game resets WalkSpeed every frame, so movement is done with a body
+--- velocity instead. LinearVelocity did not move the character in this game,
+--- BodyVelocity does, so that is what is used.
+local velocity = {
+	speed = { body = nil },
+	fly = { body = nil },
+}
+
+local function clearVelocity(slot)
+	local entry = velocity[slot]
+	if entry.body then
+		entry.body:Destroy()
+		entry.body = nil
+	end
+end
+
+local function ensureVelocity(slot)
+	local entry = velocity[slot]
+	local r = root()
+	if not r then
+		return nil
+	end
+	if entry.body and entry.body.Parent == r then
+		return entry.body
+	end
+	clearVelocity(slot)
+
+	local body = Instance.new("BodyVelocity")
+	body.Name = "StrafeHub_" .. slot
+	body.P = 12500
+	body.MaxForce = Vector3.zero
+	body.Velocity = Vector3.zero
+	body.Parent = r
+
+	entry.body = body
+	return body
+end
+
+local function applyVelocity(slot, vector, verticalToo)
+	local body = ensureVelocity(slot)
+	if not body then
+		return
+	end
+	body.Velocity = vector
+	if verticalToo then
+		body.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+	else
+		-- Horizontal only, so gravity still works while running.
+		body.MaxForce = Vector3.new(1e6, 0, 1e6)
+	end
+end
+
+local function stopVelocity(slot)
+	local entry = velocity[slot]
+	if entry.body then
+		entry.body.MaxForce = Vector3.zero
+	end
+end
+----------------------------------------------------------------------
+-- 1. MOVEMENT
+----------------------------------------------------------------------
+
+local movement = { flyInput = Vector3.zero, jumpQueued = false }
+
+local function setSpeed(on)
+	Settings.speedOn = on
+	if not on then
+		clearVelocity("speed")
+	end
+	if UiRefs.speed then
+		UiRefs.speed:Set(on, true)
+	end
+end
+
+local function setFly(on)
+	Settings.flyOn = on
+	local hum = humanoid()
+
+	if on then
+		ensureVelocity("fly")
+		if hum then
+			hum.PlatformStand = true
+		end
+		log("Fly on")
+	else
+		clearVelocity("fly")
+		if hum then
+			hum.PlatformStand = false
+		end
+		log("Fly off")
+	end
+
+	if UiRefs.fly then
+		UiRefs.fly:Set(on, true)
+	end
+end
+
+local function setNoclip(on)
+	Settings.noclip = on
+	local char = character()
+	if char and not on then
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.CanCollide = true
+			end
+		end
+	end
+	if UiRefs.noclip then
+		UiRefs.noclip:Set(on, true)
+	end
+end
+
+local function setInfiniteJump(on)
+	Settings.infiniteJump = on
+	if UiRefs.jump then
+		UiRefs.jump:Set(on, true)
+	end
+end
+
+local function setAntiRagdoll(on)
+	Settings.antiRagdoll = on
+	if UiRefs.antiRagdoll then
+		UiRefs.antiRagdoll:Set(on, true)
+	end
+end
+
+--- Movement tick: applies speed, fly and the small housekeeping modifiers.
+local function movementTick(dt)
+	local char = character()
+	local hum = humanoid()
+	local r = root()
+	if not (char and hum and r) then
+		return
+	end
+
+	-- Noclip
+	if Settings.noclip then
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				part.CanCollide = false
+			end
+		end
+	end
+
+	-- Anti ragdoll / immobile: the framework parks you with these flags.
+	if Settings.antiRagdoll then
+		local values = char:FindFirstChild("Values")
+		if values then
+			local ragdolled = values:FindFirstChild("Ragdolled")
+			if ragdolled and ragdolled.Value then
+				ragdolled.Value = false
+			end
+			local immobile = values:FindFirstChild("Immobile")
+			if immobile and immobile.Value then
+				immobile.Value = false
+			end
+		end
+	end
+
+	-- Infinite jump
+	if Settings.infiniteJump then
+		local state = hum:GetState()
+		if state == Enum.HumanoidStateType.Freefall then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+			r.AssemblyLinearVelocity = Vector3.new(
+				r.AssemblyLinearVelocity.X,
+				Settings.jumpPower,
+				r.AssemblyLinearVelocity.Z
+			)
+		end
+	end
+
+	-- Fly
+	if Settings.flyOn then
+		local lv = ensureVelocity("fly")
+		if lv then
+			local camera = workspace.CurrentCamera
+			local direction = Vector3.zero
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+				direction += camera.CFrame.LookVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+				direction -= camera.CFrame.LookVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+				direction += camera.CFrame.RightVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+				direction -= camera.CFrame.RightVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+				direction += Vector3.yAxis
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+				direction -= Vector3.yAxis
+			end
+
+			if direction.Magnitude > 0 then
+				direction = direction.Unit
+			end
+
+			applyVelocity("fly", direction * Settings.flySpeed, true)
+			hum.PlatformStand = true
+		end
+	else
+		stopVelocity("fly")
+	end
+
+	-- Speed
+	if Settings.speedOn and not Settings.flyOn then
+		if hum.MoveDirection.Magnitude > 0.05 then
+			applyVelocity("speed", hum.MoveDirection * Settings.speed, false)
+		else
+			stopVelocity("speed")
+		end
+	else
+		stopVelocity("speed")
+	end
+end
+
+----------------------------------------------------------------------
+-- 2. TELEPORT
+----------------------------------------------------------------------
+
+local function teleportTo(position)
+	local r = root()
+	if not r then
+		return false
+	end
+	local char = character()
+	pcall(function()
+		char:PivotTo(CFrame.new(position))
+	end)
+	return true
+end
+
+local function teleportUp(delta)
+	local r = root()
+	if r then
+		teleportTo(r.Position + Vector3.new(0, delta, 0))
+	end
+end
+
+local function teleportToPlayer(name)
+	local target = Players:FindFirstChild(name)
+	if target and target.Character then
+		teleportTo(target.Character:GetPivot().Position + Vector3.new(0, 3, 0))
+		log("Teleported to " .. name)
+	end
+end
+
+local function playerNames()
+	local list = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			table.insert(list, player.Name)
+		end
+	end
+	table.sort(list)
+	return list
+end
+
+----------------------------------------------------------------------
+-- 3. VISUAL
+----------------------------------------------------------------------
+
+local visualBackup = {}
+
+local function applyFullbright(on)
+	if on then
+		if not visualBackup.brightness then
+			visualBackup.brightness = Lighting.Brightness
+			visualBackup.ambient = Lighting.Ambient
+			visualBackup.outdoor = Lighting.OutdoorAmbient
+			visualBackup.clock = Lighting.ClockTime
+		end
+		Lighting.Brightness = 3
+		Lighting.Ambient = Color3.fromRGB(178, 178, 178)
+		Lighting.OutdoorAmbient = Color3.fromRGB(178, 178, 178)
+		Lighting.ClockTime = 14
+	elseif visualBackup.brightness then
+		Lighting.Brightness = visualBackup.brightness
+		Lighting.Ambient = visualBackup.ambient
+		Lighting.OutdoorAmbient = visualBackup.outdoor
+		Lighting.ClockTime = visualBackup.clock
+		visualBackup.brightness = nil
+	end
+end
+
+local function applyNoFog(on)
+	if on then
+		if not visualBackup.fogEnd then
+			visualBackup.fogEnd = Lighting.FogEnd
+			visualBackup.fogStart = Lighting.FogStart
+		end
+		Lighting.FogEnd = 1e6
+		Lighting.FogStart = 1e6
+	elseif visualBackup.fogEnd then
+		Lighting.FogEnd = visualBackup.fogEnd
+		Lighting.FogStart = visualBackup.fogStart
+		visualBackup.fogEnd = nil
+	end
+end
+
+local function viewmodel()
+	local camera = workspace.CurrentCamera
+	return camera and camera:FindFirstChild("Viewmodel")
+end
+
+local function applyHideViewmodel(on)
+	local model = viewmodel()
+	if not model then
+		for _, child in ipairs(workspace.CurrentCamera:GetChildren()) do
+			if child.Name:lower():find("viewmodel") or child.Name:lower():find("arms") then
+				model = child
+				break
+			end
+		end
+	end
+	if not model then
+		return
+	end
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.LocalTransparencyModifier = on and 1 or 0
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- 4. COMBAT
+----------------------------------------------------------------------
+
+local hitboxes = {}
+
+local function clearHitboxes()
+	for part in pairs(hitboxes) do
+		if part and part.Parent then
+			part:Destroy()
+		end
+	end
+	hitboxes = {}
+end
+
+local function updateHitboxes()
+	if not Settings.hitbox then
+		clearHitboxes()
+		return
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local torso = player.Character:FindFirstChild("HumanoidRootPart")
+			if torso and not torso:FindFirstChild("StrafeHubHitbox") then
+				local part = Instance.new("Part")
+				part.Name = "StrafeHubHitbox"
+				part.Size = Vector3.new(14, 14, 14)
+				part.Transparency = 1
+				part.CanCollide = false
+				part.CanTouch = false
+				part.CanQuery = true
+				part.Massless = true
+				part.Parent = torso
+
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0 = part
+				weld.Part1 = torso
+				weld.Parent = part
+
+				hitboxes[part] = true
+			end
+		end
+	end
+end
+
+local function aimTarget()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local origin = camera.CFrame.Position
+	local best, bestAngle = nil, math.rad(Settings.aimbotFov)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local hum = player.Character:FindFirstChildOfClass("Humanoid")
+			local head = player.Character:FindFirstChild("Head")
+			if hum and hum.Health > 0 and head then
+				local direction = (head.Position - origin)
+				if direction.Magnitude > 0 then
+					local angle = math.acos(math.clamp(camera.CFrame.LookVector:Dot(direction.Unit), -1, 1))
+					if angle < bestAngle then
+						best, bestAngle = head, angle
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+----------------------------------------------------------------------
+-- Hotkey state
+----------------------------------------------------------------------
+
+local aimHeld = false
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	local key = input.KeyCode
+	if key == Enum.KeyCode.F then
+		setFly(not Settings.flyOn)
+	elseif key == Enum.KeyCode.N then
+		setNoclip(not Settings.noclip)
+	elseif key == Enum.KeyCode.V then
+		setSpeed(not Settings.speedOn)
+	elseif key == Enum.KeyCode.RightShift then
+		aimHeld = true
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		aimHeld = false
+	end
+end)
+
+----------------------------------------------------------------------
+-- Main loops
+----------------------------------------------------------------------
+
+RunService.Heartbeat:Connect(function(dt)
+	if not scriptAlive() then
+		return
+	end
+	pcall(movementTick, dt)
+end)
+
+RunService.RenderStepped:Connect(function()
+	if not scriptAlive() then
+		return
+	end
+
+	-- FOV: the game rewrites it every frame, so we write it after them.
+	if Settings.fov > 0 and workspace.CurrentCamera then
+		workspace.CurrentCamera.FieldOfView = Settings.fov
+	end
+
+	-- Aimbot
+	if Settings.aimbot and (not Settings.aimbotHold or aimHeld) then
+		local head = aimTarget()
+		local camera = workspace.CurrentCamera
+		if head and camera then
+			camera.CFrame = CFrame.lookAt(camera.CFrame.Position, head.Position)
+		end
+	end
+end)
+
+task.spawn(function()
+	while scriptAlive() do
+		if Settings.hitbox then
+			pcall(updateHitboxes)
+		end
+		task.wait(1)
+	end
+end)
+
+----------------------------------------------------------------------
+-- WINDOW
+----------------------------------------------------------------------
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+Window = Airflow:CreateWindow({
+	Name = "Strafe Hub",
+	LoadingSubtitle = "player modifiers",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "StrafeHub" },
+	Home = {
+		Title = "Strafe Hub",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogBox = LogTab:CreateGroupbox({ Name = "What the script is doing", Side = "Left" })
+Log = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----------------------------------------------------------------------
+-- MOVEMENT TAB
+----------------------------------------------------------------------
+
+local MoveTab = Window:CreateTab({ Name = "Movement", Icon = "footprints" })
+local MoveMain = MoveTab:CreateGroupbox({ Name = "Movement", Side = "Left" })
+local MoveInfo = MoveTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+local MoveTune = MoveTab:CreateGroupbox({ Name = "Tuning", Side = "Right" })
+
+UiRefs.speed = MoveMain:CreateToggle({
+	Name = "Speed boost",
+	Desc = "V to toggle. The game resets WalkSpeed, so this pushes you with velocity",
+	Flag = "SpeedOn",
+	CurrentValue = false,
+	Callback = function(on)
+		setSpeed(on)
+	end,
+})
+
+UiRefs.fly = MoveMain:CreateToggle({
+	Name = "Fly",
+	Desc = "F to toggle. WASD to move, Space up, Ctrl down",
+	Flag = "FlyOn",
+	CurrentValue = false,
+	Callback = function(on)
+		setFly(on)
+	end,
+})
+
+UiRefs.noclip = MoveMain:CreateToggle({
+	Name = "Noclip",
+	Desc = "N to toggle. Walk through walls",
+	Flag = "Noclip",
+	CurrentValue = false,
+	Callback = function(on)
+		setNoclip(on)
+	end,
+})
+
+UiRefs.jump = MoveMain:CreateToggle({
+	Name = "Infinite jump",
+	Desc = "Hold Space to keep climbing",
+	Flag = "InfiniteJump",
+	CurrentValue = false,
+	Callback = function(on)
+		setInfiniteJump(on)
+	end,
+})
+
+UiRefs.antiRagdoll = MoveMain:CreateToggle({
+	Name = "Anti ragdoll",
+	Desc = "Clears the game's ragdoll and immobile flags",
+	Flag = "AntiRagdoll",
+	CurrentValue = false,
+	Callback = function(on)
+		setAntiRagdoll(on)
+	end,
+})
+
+MoveTune:CreateSlider({
+	Name = "Speed",
+	Range = { 20, 200 },
+	Increment = 5,
+	CurrentValue = 60,
+	Flag = "SpeedValue",
+	Callback = function(value)
+		Settings.speed = value
+	end,
+})
+
+MoveTune:CreateSlider({
+	Name = "Fly speed",
+	Range = { 20, 200 },
+	Increment = 5,
+	CurrentValue = 60,
+	Flag = "FlySpeed",
+	Callback = function(value)
+		Settings.flySpeed = value
+	end,
+})
+
+MoveTune:CreateSlider({
+	Name = "Jump power",
+	Range = { 20, 150 },
+	Increment = 5,
+	CurrentValue = 55,
+	Flag = "JumpPower",
+	Callback = function(value)
+		Settings.jumpPower = value
+	end,
+})
+
+MoveInfo:CreateStatus({
+	Name = "Position",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local r = root()
+		return r and fmtVector(r.Position) or "<Muted>-</Muted>"
+	end,
+})
+
+MoveInfo:CreateStatus({
+	Name = "Velocity",
+	Style = "Row",
+	Update = function()
+		local r = root()
+		if not r then
+			return "<Muted>-</Muted>"
+		end
+		local v = r.AssemblyLinearVelocity
+		return string.format("%.0f", Vector3.new(v.X, 0, v.Z).Magnitude) .. " studs/s"
+	end,
+})
+
+MoveInfo:CreateStatus({
+	Name = "Active",
+	Style = "Row",
+	Update = function()
+		local parts = {}
+		if Settings.speedOn then
+			table.insert(parts, "speed")
+		end
+		if Settings.flyOn then
+			table.insert(parts, "fly")
+		end
+		if Settings.noclip then
+			table.insert(parts, "noclip")
+		end
+		if Settings.infiniteJump then
+			table.insert(parts, "jump")
+		end
+		if #parts == 0 then
+			return "<Muted>nothing</Muted>"
+		end
+		return "<Success>" .. table.concat(parts, " + ") .. "</Success>"
+	end,
+})
+
+MoveInfo:CreateParagraph({
+	Title = "Why velocity and not WalkSpeed",
+	Content = "The game runs its own movement framework and rewrites WalkSpeed every frame, "
+		.. "so a plain speed hack is undone instantly. These modifiers push the character with a "
+		.. "velocity constraint instead, which the framework does not reset.",
+})
+
+----------------------------------------------------------------------
+-- TELEPORT TAB
+----------------------------------------------------------------------
+
+local TpTab = Window:CreateTab({ Name = "Teleport", Icon = "map-pin" })
+local TpMain = TpTab:CreateGroupbox({ Name = "Coordinates", Side = "Left" })
+local TpSpots = TpTab:CreateGroupbox({ Name = "Saved spots", Side = "Right" })
+local TpPlayers = TpTab:CreateGroupbox({ Name = "Players", Side = "Right" })
+
+local coordX = TpMain:CreateInput({ Name = "X", PlaceholderText = "x", CurrentValue = "0" })
+local coordY = TpMain:CreateInput({ Name = "Y", PlaceholderText = "y", CurrentValue = "0" })
+local coordZ = TpMain:CreateInput({ Name = "Z", PlaceholderText = "z", CurrentValue = "0" })
+
+TpMain:CreateButton({
+	Name = "Teleport to coordinates",
+	Icon = "arrow-right",
+	Style = "Primary",
+	Callback = function()
+		local x = tonumber(coordX:Get())
+		local y = tonumber(coordY:Get())
+		local z = tonumber(coordZ:Get())
+		if x and y and z then
+			teleportTo(Vector3.new(x, y, z))
+			log("Teleported to " .. fmtVector(Vector3.new(x, y, z)))
+		else
+			log("<Warning>Enter numbers for X, Y and Z</Warning>")
+		end
+	end,
+})
+
+TpMain:CreateButtonRow({
+	{
+		Name = "Up 25",
+		Callback = function()
+			teleportUp(25)
+		end,
+	},
+	{
+		Name = "Up 100",
+		Callback = function()
+			teleportUp(100)
+		end,
+	},
+	{
+		Name = "Down 25",
+		Callback = function()
+			teleportUp(-25)
+		end,
+	},
+})
+
+TpMain:CreateButton({
+	Name = "Copy my position",
+	Icon = "copy",
+	Callback = function()
+		local r = root()
+		if r then
+			coordX:Set(string.format("%.1f", r.Position.X))
+			coordY:Set(string.format("%.1f", r.Position.Y))
+			coordZ:Set(string.format("%.1f", r.Position.Z))
+			log("Position copied")
+		end
+	end,
+})
+
+local spotName = TpSpots:CreateInput({ Name = "Spot name", PlaceholderText = "base", CurrentValue = "spot" })
+
+TpSpots:CreateButton({
+	Name = "Save current spot",
+	Icon = "plus",
+	Callback = function()
+		local r = root()
+		if not r then
+			return
+		end
+		local name = tostring(spotName:Get())
+		if name == "" then
+			name = "spot"
+		end
+		Settings.spots[name] = r.Position
+		log("Saved spot " .. name)
+		if UiRefs.spots then
+			local names = {}
+			for key in pairs(Settings.spots) do
+				table.insert(names, key)
+			end
+			table.sort(names)
+			UiRefs.spots:SetOptions(names, { KeepSelection = true })
+		end
+	end,
+})
+
+UiRefs.spots = TpSpots:CreateDropdown({
+	Name = "My spots",
+	Options = {},
+	Flag = "SpotPick",
+	Callback = function(value)
+		local name = type(value) == "table" and value[1] or value
+		local position = Settings.spots[name]
+		if position then
+			teleportTo(position)
+			log("Teleported to spot " .. tostring(name))
+		end
+	end,
+})
+
+TpSpots:CreateButton({
+	Name = "Delete spot",
+	Icon = "trash-2",
+	Callback = function()
+		local name = tostring(spotName:Get())
+		Settings.spots[name] = nil
+		local names = {}
+		for key in pairs(Settings.spots) do
+			table.insert(names, key)
+		end
+		table.sort(names)
+		UiRefs.spots:SetOptions(names, { KeepSelection = true })
+		log("Deleted spot " .. name)
+	end,
+})
+
+UiRefs.players = TpPlayers:CreateDropdown({
+	Name = "Teleport to player",
+	Options = {},
+	Flag = "PlayerPick",
+	Callback = function(value)
+		local name = type(value) == "table" and value[1] or value
+		if name then
+			teleportToPlayer(name)
+		end
+	end,
+})
+
+task.spawn(function()
+	while scriptAlive() do
+		if UiRefs.players then
+			local names = playerNames()
+			local current = UiRefs.players:GetOptions()
+			if #names ~= #current then
+				UiRefs.players:SetOptions(names, { KeepSelection = true })
+			end
+		end
+		task.wait(5)
+	end
+end)
+
+----------------------------------------------------------------------
+-- VISUAL TAB
+----------------------------------------------------------------------
+
+local VisTab = Window:CreateTab({ Name = "Visual", Icon = "eye" })
+local VisMain = VisTab:CreateGroupbox({ Name = "Looks", Side = "Left" })
+local VisInfo = VisTab:CreateGroupbox({ Name = "Info", Side = "Right" })
+
+VisMain:CreateSlider({
+	Name = "Field of view",
+	Desc = "0 leaves the game value alone",
+	Range = { 0, 120 },
+	Increment = 1,
+	CurrentValue = 0,
+	Flag = "FovValue",
+	Callback = function(value)
+		Settings.fov = value
+	end,
+})
+
+VisMain:CreateToggle({
+	Name = "Fullbright",
+	Flag = "Fullbright",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.fullbright = on
+		applyFullbright(on)
+	end,
+})
+
+VisMain:CreateToggle({
+	Name = "No fog",
+	Flag = "NoFog",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.noFog = on
+		applyNoFog(on)
+	end,
+})
+
+VisMain:CreateToggle({
+	Name = "Hide viewmodel",
+	Flag = "HideViewmodel",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.hideViewmodel = on
+		applyHideViewmodel(on)
+	end,
+})
+
+VisMain:CreateToggle({
+	Name = "Anti AFK",
+	Desc = "Nudges the client so the game does not kick you",
+	Flag = "AntiAfk",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.antiAfk = on
+		log(on and "Anti AFK on" or "Anti AFK off")
+	end,
+})
+
+VisInfo:CreateStatus({
+	Name = "FOV",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return tostring(math.floor(workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView or 0))
+	end,
+})
+
+
+VisInfo:CreateParagraph({
+	Title = "About the viewmodel",
+	Content = "Strafe draws your arms and gun in a separate viewmodel. Hiding it clears the parts "
+		.. "while the toggle is on; it comes back as soon as you turn the toggle off.",
+})
+
+LocalPlayer.Idled:Connect(function()
+	if Settings.antiAfk then
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.zero)
+		end)
+	end
+end)
+
+----------------------------------------------------------------------
+-- COMBAT TAB
+----------------------------------------------------------------------
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local CombatMain = CombatTab:CreateGroupbox({ Name = "Combat", Side = "Left" })
+local CombatInfo = CombatTab:CreateGroupbox({ Name = "Info", Side = "Right" })
+
+CombatMain:CreateToggle({
+	Name = "Hitbox expander",
+	Desc = "Puts a big invisible hitbox around other players (client side)",
+	Flag = "Hitbox",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.hitbox = on
+		if not on then
+			clearHitboxes()
+		end
+		log(on and "Hitbox expander on" or "Hitbox expander off")
+	end,
+})
+
+CombatMain:CreateToggle({
+	Name = "Aimbot",
+	Desc = "Snaps the camera to the closest head inside the field of view",
+	Flag = "Aimbot",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.aimbot = on
+		log(on and "Aimbot on" or "Aimbot off")
+	end,
+})
+
+CombatMain:CreateToggle({
+	Name = "Only while RightShift is held",
+	Flag = "AimbotHold",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.aimbotHold = on
+	end,
+})
+
+CombatMain:CreateSlider({
+	Name = "Aimbot field of view",
+	Range = { 10, 360 },
+	Increment = 5,
+	Suffix = " deg",
+	CurrentValue = 120,
+	Flag = "AimbotFov",
+	Callback = function(value)
+		Settings.aimbotFov = value
+	end,
+})
+
+CombatInfo:CreateStatus({
+	Name = "Targets",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local count = 0
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("Head") then
+				count += 1
+			end
+		end
+		return tostring(count)
+	end,
+})
+
+CombatInfo:CreateParagraph({
+	Title = "Note",
+	Content = "Hitboxes and the aimbot are client side. They help when the game decides hits on the "
+		.. "client, and do nothing when the server checks the shot itself.",
+})
+
+----------------------------------------------------------------------
+-- SETTINGS TAB
+----------------------------------------------------------------------
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local HelpBox = SettingsTab:CreateGroupbox({ Name = "Hotkeys", Side = "Right" })
+HelpBox:CreateParagraph({
+	Title = "Strafe Hub",
+	Content = "F - fly\nN - noclip\nV - speed\nRightShift - hold for aimbot\nRightControl - show/hide the window\n\n"
+		.. "Everything starts off. Configs save your setup.",
+})
+
+----------------------------------------------------------------------
+-- Start
+----------------------------------------------------------------------
+
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(1)
+	-- Recreate the velocity constraints on the new character.
+	if Settings.speedOn then
+		ensureVelocity("speed")
+	end
+	if Settings.flyOn then
+		ensureVelocity("fly")
+		local hum = humanoid()
+		if hum then
+			hum.PlatformStand = true
+		end
+	end
+	if Settings.noclip then
+		local char = character()
+		if char then
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.CanCollide = false
+				end
+			end
+		end
+	end
+	if Settings.fullbright then
+		applyFullbright(true)
+	end
+	if Settings.noFog then
+		applyNoFog(true)
+	end
+end)
+
+task.spawn(function()
+	local names = {}
+	for key in pairs(Settings.spots) do
+		table.insert(names, key)
+	end
+	table.sort(names)
+	UiRefs.spots:SetOptions(names, { KeepSelection = true })
+	UiRefs.players:SetOptions(playerNames(), { KeepSelection = true })
+
+	pcall(function()
+		Window:LoadAutoload()
+	end)
+
+	local hum = humanoid()
+	log("<Success>Loaded</Success> - " .. (hum and ("walk " .. tostring(hum.WalkSpeed)) or "no character"))
+end)
+
+print("[Strafe Hub] loaded")
