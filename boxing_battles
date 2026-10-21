@@ -1,0 +1,1324 @@
+--!nonstrict
+--[[
+	Boxing Battles Hub
+	------------------
+	One file, five tools for Boxing Battles:
+
+	  1. Training  - grows your strength with the game's free auto train while you stand in the gym
+	  1.1 Weights  - buys and equips the dumbbells you prefer, as soon as you are allowed to use them
+	  2. Money     - parks you on the AFK pad so cash keeps coming in
+	  3. Battles   - queues you into a ring, fights for you and starts the next one
+	     - Kill aura   : picks the closest opponent and keeps you on top of them
+	     - Fly above   : hovers you over the target while you hit
+	     - Auto hits   : presses the punch over and over
+	     - Wait timer  : how long to wait for a match before trying another ring
+	  4. Rotation  - flips between money, battles and training on a timer
+
+	Press RightControl to show or hide the window.
+	Every switch starts off - nothing happens until you turn it on.
+	Settings are saved in the BoxingBattlesHub folder.
+]]
+
+----------------------------------------------------------------------
+-- UI library
+----------------------------------------------------------------------
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, lib = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
+		Airflow = lib
+		break
+	end
+end
+if not Airflow then
+	error("[Boxing Battles Hub] The UI library could not be loaded. Check your connection and retry.")
+end
+
+----------------------------------------------------------------------
+-- Game access
+----------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+if not Remotes then
+	error("[Boxing Battles Hub] This script only works in Boxing Battles.")
+end
+
+local SourceFolder = ReplicatedStorage:WaitForChild("src", 30)
+local WeightModule = SourceFolder
+	and require(SourceFolder:WaitForChild("Collections", 30):WaitForChild("WeightCollection", 30))
+
+local leaderstats = LocalPlayer:WaitForChild("leaderstats", 30)
+
+----------------------------------------------------------------------
+-- Small helpers
+----------------------------------------------------------------------
+
+local function money()
+	return leaderstats and leaderstats.Money and leaderstats.Money.Value or 0
+end
+
+local function strength()
+	return leaderstats and leaderstats.Strength and leaderstats.Strength.Value or 0
+end
+
+local function streak()
+	return leaderstats and leaderstats.Streak and leaderstats.Streak.Value or 0
+end
+
+local function rebirths()
+	return leaderstats and leaderstats.Rebirths and leaderstats.Rebirths.Value or 0
+end
+
+local function short(value)
+	if type(value) ~= "number" then
+		return "-"
+	end
+	local rounded = math.floor(value)
+	local text = tostring(rounded)
+	local grouped = text:reverse():gsub("(%d%d%d)", "%1 "):reverse()
+	return (grouped:gsub("^%s+", ""))
+end
+
+local function character()
+	local char = LocalPlayer.Character
+	if char and char.Parent then
+		return char
+	end
+	return nil
+end
+
+local function humanoid()
+	local char = character()
+	return char and char:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function rootPosition()
+	local char = character()
+	if not char then
+		return nil
+	end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	return root and root.Position or nil
+end
+
+local dataCache, dataCacheAt = nil, 0
+
+local function playerData(force)
+	local now = os.clock()
+	if not force and dataCache and (now - dataCacheAt) < 2 then
+		return dataCache
+	end
+	local ok, data = pcall(function()
+		return Remotes.ReadPlayerData:InvokeServer()
+	end)
+	if ok and type(data) == "table" then
+		dataCache, dataCacheAt = data, now
+		return data
+	end
+	return dataCache
+end
+
+--- Puts the character on a spot. Used for the gym, the AFK pad and the ring pads.
+local function goTo(position)
+	local char = character()
+	if not char then
+		return false
+	end
+	return pcall(function()
+		char:PivotTo(CFrame.new(position))
+	end)
+end
+
+local function distanceTo(position)
+	local current = rootPosition()
+	if not current then
+		return math.huge
+	end
+	return (current - position).Magnitude
+end
+
+----------------------------------------------------------------------
+-- Where things are on the map
+----------------------------------------------------------------------
+
+local Map = workspace:WaitForChild("Boxing Map", 30)
+local StandsFolder = Map and Map:FindFirstChild("Dumbbell Stands")
+local Important = Map and Map:FindFirstChild("Important Stuff")
+local RingArea = Map and Map:FindFirstChild("Ring Area")
+
+local function allWeights()
+	local list = {}
+	if not WeightModule then
+		return list
+	end
+	for name, info in pairs(WeightModule) do
+		table.insert(list, {
+			name = name,
+			price = tonumber(info.Price) or 0,
+			gain = tonumber(info.Strength) or 1,
+			req = tonumber(info.StrengthReq) or 0,
+			robux = info.Price == "Robux",
+		})
+	end
+	table.sort(list, function(a, b)
+		if a.robux ~= b.robux then
+			return not a.robux
+		end
+		if a.req == b.req then
+			return a.gain < b.gain
+		end
+		return a.req < b.req
+	end)
+	return list
+end
+
+--- Spot next to the rack of a given weight, where training actually counts.
+local function gymSpot(weightName)
+	local stand = StandsFolder and StandsFolder:FindFirstChild(weightName)
+	local red = stand and stand:FindFirstChild("RedPart", true)
+	if red then
+		return red.Position + Vector3.new(0, 0.8, 3.2)
+	end
+	return Vector3.new(38.6, 5.3, 42)
+end
+
+local WEIGH_LIST = allWeights()
+
+local function weights()
+	return WEIGH_LIST
+end
+
+local function afkSpot()
+	local pad = Important and Important:FindFirstChild("AFK Pad")
+	local main = pad and (pad:FindFirstChild("Main") or pad:FindFirstChildWhichIsA("BasePart", true))
+	if main then
+		return main.Position + Vector3.new(0, 3.4, 0)
+	end
+	return Vector3.new(-12.5, 3.4, 19)
+end
+
+--- All ring pads of a match type, with how many players are standing around them.
+local function ringPads(matchType)
+	local result = {}
+	if not RingArea then
+		return result
+	end
+	for _, ring in ipairs(RingArea:GetChildren()) do
+		if ring:GetAttribute("MatchType") == matchType then
+			local pads = ring:FindFirstChild("Pads")
+			if pads then
+				for _, padModel in ipairs(pads:GetChildren()) do
+					local padPart = padModel:FindFirstChildWhichIsA("BasePart", true)
+					if padPart and padModel.Name:find("Pad") then
+						local nearby = 0
+						for _, p in ipairs(Players:GetPlayers()) do
+							if p ~= LocalPlayer and p.Character then
+								local pos = p.Character:GetPivot().Position
+								if (pos - padPart.Position).Magnitude < 16 then
+									nearby += 1
+								end
+							end
+						end
+						table.insert(result, {
+							ring = ring.Name,
+							name = padModel.Name,
+							position = padPart.Position + Vector3.new(0, 3.2, 0),
+							nearby = nearby,
+						})
+					end
+				end
+			end
+		end
+	end
+	table.sort(result, function(a, b)
+		return a.nearby < b.nearby
+	end)
+	return result
+end
+
+----------------------------------------------------------------------
+-- Feature state
+----------------------------------------------------------------------
+
+local Settings = {
+	-- training
+	trainOn = false,
+	trainAutoBuy = true,
+	trainEquip = true,
+	preferredWeight = "Auto",
+	cashReserve = 0,
+	-- money
+	moneyOn = false,
+	-- battles
+	battleOn = false,
+	ringType = "1v1",
+	killAura = true,
+	auraRadius = 60,
+	flyAbove = true,
+	flyHeight = 6,
+	autoHits = true,
+	hitDelay = 0.2,
+	waitForMatch = 45,
+	maxFightTime = 90,
+	requeueDelay = 3,
+	-- rotation
+	rotationOn = false,
+	rotateMoney = true,
+	rotateBattle = true,
+	rotateTraining = false,
+	moneyMinutes = 5,
+	battleMinutes = 10,
+	trainingMinutes = 5,
+}
+
+local Window, Log
+
+local function log(message, color)
+	if Log then
+		Log:Push(tostring(message), color)
+	end
+end
+
+local function notify(title, content, kind)
+	pcall(function()
+		Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = 4 })
+	end)
+end
+
+getgenv().__BoxingHubGen = (getgenv().__BoxingHubGen or 0) + 1
+local SCRIPT_GENERATION = getgenv().__BoxingHubGen
+
+local function scriptAlive()
+	return getgenv().__BoxingHubGen == SCRIPT_GENERATION
+end
+
+--- A background loop that stops when its generation changes.
+local loops = {}
+local function startLoop(name, step)
+	loops[name] = (loops[name] or 0) + 1
+	local myGeneration = loops[name]
+	task.spawn(function()
+		while loops[name] == myGeneration and scriptAlive() do
+			local ok, err = pcall(step)
+			if not ok then
+				log("<Error>" .. name .. ": " .. tostring(err) .. "</Error>")
+				task.wait(1)
+			end
+			if loops[name] ~= myGeneration then
+				break
+			end
+			task.wait(0.1)
+		end
+	end)
+end
+
+local function stopLoop(name)
+	loops[name] = (loops[name] or 0) + 1
+end
+
+----------------------------------------------------------------------
+-- 1. TRAINING: strength at the gym
+----------------------------------------------------------------------
+
+local trainingStats = { started = 0, gained = 0, rate = 0, lastSample = 0, lastStrength = 0, equipped = "-" }
+local UiRefs = {}
+
+local function autoTrainEnabled()
+	local data = playerData()
+	return data ~= nil and data.Autoclicking == true
+end
+
+local function setAutoTrain(on)
+	if autoTrainEnabled() == on then
+		return true
+	end
+	Remotes.AutoTrain:FireServer()
+	task.wait(0.35)
+	local data = playerData(true)
+	return data ~= nil and data.Autoclicking == on
+end
+local function ownedWeights()
+	local data = playerData()
+	return (data and data.Weights) or {}
+end
+
+local function ownsWeight(name)
+	for _, owned in ipairs(ownedWeights()) do
+		if owned == name then
+			return true
+		end
+	end
+	return false
+end
+
+--- Best weight we already own.
+local function bestOwnedWeight()
+	local best, bestGain
+	for _, info in ipairs(WEIGH_LIST) do
+		if not info.robux and ownsWeight(info.name) then
+			if not bestGain or info.gain > bestGain then
+				best, bestGain = info.name, info.gain
+			end
+		end
+	end
+	return best
+end
+
+--- Weight we want to be using right now.
+local function desiredWeight()
+	if Settings.preferredWeight ~= "Auto" then
+		return Settings.preferredWeight
+	end
+	return bestOwnedWeight()
+end
+
+--- Best weight we could buy right now (strength requirement met, cash available).
+local function nextWeightToBuy()
+	local best
+	for _, info in ipairs(WEIGH_LIST) do
+		if
+			not info.robux
+			and not ownsWeight(info.name)
+			and info.req <= strength()
+			and info.price > 0
+			and info.price <= money() - Settings.cashReserve
+		then
+			if not best or info.gain > best.gain then
+				best = info
+			end
+		end
+	end
+	return best
+end
+
+local function equipWeight(name)
+	local char = character()
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (char and hum) then
+		return false
+	end
+	Remotes.EquipWeights:FireServer(name)
+	task.wait(0.6)
+
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	local tool = (backpack and backpack:FindFirstChild(name)) or char:FindFirstChild(name)
+	if tool then
+		pcall(function()
+			hum:EquipTool(tool)
+		end)
+		trainingStats.equipped = name
+		return true
+	end
+	return false
+end
+
+local trainingLoopRunning = false
+
+local function trainingStep()
+	if not character() then
+		return
+	end
+
+	-- Stand where training counts: next to the rack of the weight we want to use.
+	local want = desiredWeight() or "Weights [1Kg]"
+	local spot = gymSpot(want)
+	if distanceTo(spot) > 4 then
+		goTo(spot)
+		task.wait(0.35)
+	end
+
+	-- Buy the next weight when it is allowed and affordable.
+	if Settings.trainAutoBuy and os.clock() - (trainingStats.lastBuyCheck or 0) > 4 then
+		trainingStats.lastBuyCheck = os.clock()
+		local candidate = nextWeightToBuy()
+		if candidate and not ownsWeight(candidate.name) then
+			local target = Settings.preferredWeight ~= "Auto" and Settings.preferredWeight or candidate.name
+			goTo(gymSpot(target))
+			task.wait(0.35)
+			Remotes.BuyWeights:FireServer(target)
+			task.wait(0.9)
+			playerData(true)
+			if ownsWeight(target) then
+				log("<Success>Bought " .. target .. "</Success>")
+			end
+		end
+	end
+
+	-- Put the wanted weight in hand.
+	if Settings.trainEquip then
+		local worn = trainingStats.equipped
+		if desiredWeight() and worn ~= desiredWeight() and ownsWeight(desiredWeight()) then
+			equipWeight(desiredWeight())
+		end
+	end
+
+	-- Keep the game's free auto train switched on.
+	if not autoTrainEnabled() then
+		setAutoTrain(true)
+	end
+
+	-- Strength per minute, for the status row.
+	local now = os.clock()
+	if now - trainingStats.lastSample >= 10 then
+		local delta = strength() - trainingStats.lastStrength
+		if trainingStats.lastSample > 0 then
+			trainingStats.rate = delta * (60 / (now - trainingStats.lastSample))
+		end
+		trainingStats.lastStrength = strength()
+		trainingStats.lastSample = now
+	end
+end
+
+local function trainingSet(on)
+	Settings.trainOn = on
+	if on then
+		trainingStats.lastStrength = strength()
+		trainingStats.lastSample = os.clock()
+		trainingLoopRunning = true
+		startLoop("Training", trainingStep)
+		log("Training on - gym, " .. tostring(desiredWeight() or "default weights"))
+	else
+		trainingLoopRunning = false
+		stopLoop("Training")
+		log("Training off")
+	end
+	if UiRefs.trainToggle then
+		UiRefs.trainToggle:Set(on, true)
+	end
+end
+
+----------------------------------------------------------------------
+-- 2. MONEY: AFK pad
+----------------------------------------------------------------------
+
+local moneyStats = { rate = 0, lastSample = 0, lastMoney = 0 }
+
+local function moneyStep()
+	if not character() then
+		return
+	end
+
+	local spot = afkSpot()
+	if distanceTo(spot) > 6 then
+		goTo(spot)
+		task.wait(0.4)
+	end
+
+	local now = os.clock()
+	if now - moneyStats.lastSample >= 10 then
+		local delta = money() - moneyStats.lastMoney
+		if moneyStats.lastSample > 0 then
+			moneyStats.rate = delta * (60 / (now - moneyStats.lastSample))
+		end
+		moneyStats.lastMoney = money()
+		moneyStats.lastSample = now
+	end
+end
+
+local function moneySet(on)
+	Settings.moneyOn = on
+	if on then
+		moneyStats.lastMoney = money()
+		moneyStats.lastSample = os.clock()
+		startLoop("Money", moneyStep)
+		log("AFK money on - standing on the free cash pad")
+	else
+		stopLoop("Money")
+		log("AFK money off")
+	end
+	if UiRefs.moneyToggle then
+		UiRefs.moneyToggle:Set(on, true)
+	end
+end
+
+----------------------------------------------------------------------
+-- 3. BATTLES
+----------------------------------------------------------------------
+
+local BoxingGui = LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("Boxing", 30)
+
+local battleStats = {
+	phase = "idle", -- idle | queueing | fighting
+	since = os.clock(),
+	wins = 0,
+	losses = 0,
+	opponent = nil,
+	pad = nil,
+	lastHit = 0,
+	lastFly = 0,
+	lastHp = 100,
+}
+
+local function inMatch()
+	return BoxingGui ~= nil and BoxingGui.Enabled == true
+end
+
+local function myHealth()
+	local hum = humanoid()
+	return hum and hum.Health or 0
+end
+
+--- Closest living player that is not us.
+local function closestOpponent()
+	local myPos = rootPosition()
+	if not myPos then
+		return nil
+	end
+	local best, bestDistance
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local hum = player.Character:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then
+				local pos = player.Character:GetPivot().Position
+				local d = (pos - myPos).Magnitude
+				if d <= Settings.auraRadius and (not bestDistance or d < bestDistance) then
+					best, bestDistance = player, d
+				end
+			end
+		end
+	end
+	return best
+end
+
+--- Kill aura, hover and punches.
+local function combatStep()
+	local target = Settings.killAura and closestOpponent() or battleStats.opponent
+	local char = character()
+	if not char then
+		return
+	end
+
+	if target and target.Character then
+		battleStats.opponent = target
+		local targetPos = target.Character:GetPivot().Position
+		local now = os.clock()
+
+		if now - battleStats.lastFly >= 0.1 then
+			battleStats.lastFly = now
+			if Settings.flyAbove then
+				local hover = targetPos + Vector3.new(0, Settings.flyHeight, 0)
+				pcall(function()
+					char:PivotTo(CFrame.new(hover, targetPos))
+				end)
+			elseif (char:GetPivot().Position - targetPos).Magnitude > 5 then
+				pcall(function()
+					char:PivotTo(CFrame.new(targetPos + Vector3.new(0, 3, 0), targetPos))
+				end)
+			end
+		end
+	end
+
+	if Settings.autoHits then
+		local now = os.clock()
+		if now - battleStats.lastHit >= Settings.hitDelay then
+			battleStats.lastHit = now
+			Remotes.Click:FireServer()
+		end
+	end
+end
+
+local function pickPad()
+	local pads = ringPads(Settings.ringType)
+	if #pads == 0 then
+		return nil
+	end
+	local chosen = pads[math.random(1, math.min(3, #pads))]
+	return chosen
+end
+
+local function queueUp()
+	local pad = pickPad()
+	if not pad then
+		log("<Warning>No " .. Settings.ringType .. " ring found</Warning>")
+		return false
+	end
+	battleStats.pad = pad
+	goTo(pad.position)
+	battleStats.phase = "queueing"
+	battleStats.since = os.clock()
+	log("Standing on " .. pad.ring .. " (" .. pad.name .. ") and waiting for an opponent")
+	return true
+end
+
+local function battleStep()
+	local now = os.clock()
+
+	if inMatch() then
+		if battleStats.phase ~= "fighting" then
+			battleStats.phase = "fighting"
+			battleStats.since = now
+			battleStats.opponent = closestOpponent()
+			log("<Success>Match started" .. (battleStats.opponent and (" vs " .. battleStats.opponent.Name) or "") .. "</Success>")
+		end
+
+		combatStep()
+
+		if now - battleStats.since > Settings.maxFightTime then
+			log("<Warning>Fight took too long, leaving the ring</Warning>")
+			goTo(Vector3.new(6.9, 5.4, 18.4))
+			battleStats.phase = "idle"
+			battleStats.since = now
+		end
+		return
+	end
+
+	-- Not in a match any more.
+	if battleStats.phase == "fighting" then
+		if myHealth() <= 0 then
+			battleStats.losses += 1
+			log("<Warning>Lost the match</Warning>")
+		else
+			battleStats.wins += 1
+			log("<Success>Won the match</Success>")
+		end
+		battleStats.phase = "idle"
+		battleStats.since = now
+		battleStats.opponent = nil
+		return
+	end
+
+	if battleStats.phase == "queueing" then
+		if now - battleStats.since > Settings.waitForMatch then
+			log("<Muted>Nobody came, moving to another ring</Muted>")
+			battleStats.phase = "idle"
+			battleStats.since = now
+		end
+		return
+	end
+
+	if now - battleStats.since >= Settings.requeueDelay then
+		queueUp()
+	end
+end
+
+local function battleSet(on)
+	Settings.battleOn = on
+	if on then
+		battleStats.phase = "idle"
+		battleStats.since = os.clock()
+		startLoop("Battle", battleStep)
+		log("Auto battle on (" .. Settings.ringType .. ")")
+	else
+		stopLoop("Battle")
+		log("Auto battle off")
+	end
+	if UiRefs.battleToggle then
+		UiRefs.battleToggle:Set(on, true)
+	end
+end
+
+----------------------------------------------------------------------
+-- 4. ROTATION
+----------------------------------------------------------------------
+
+local ROTATION_PHASES = { "Money", "Battle", "Training" }
+local rotationStats = { index = 0, phase = "-", untilAt = 0, length = 0 }
+
+local function phaseEnabled(name)
+	if name == "Money" then
+		return Settings.rotateMoney
+	elseif name == "Battle" then
+		return Settings.rotateBattle
+	end
+	return Settings.rotateTraining
+end
+
+local function phaseMinutes(name)
+	if name == "Money" then
+		return Settings.moneyMinutes
+	elseif name == "Battle" then
+		return Settings.battleMinutes
+	end
+	return Settings.trainingMinutes
+end
+
+local function applyPhase(name)
+	moneySet(name == "Money")
+	battleSet(name == "Battle")
+	trainingSet(name == "Training")
+	rotationStats.phase = name
+	rotationStats.length = phaseMinutes(name) * 60
+	rotationStats.untilAt = os.clock() + rotationStats.length
+	log("<Accent>Rotation: " .. name .. " for " .. phaseMinutes(name) .. " min</Accent>")
+end
+
+local function nextPhase()
+	for step = 1, #ROTATION_PHASES do
+		rotationStats.index = rotationStats.index % #ROTATION_PHASES + 1
+		local name = ROTATION_PHASES[rotationStats.index]
+		if phaseEnabled(name) then
+			return name
+		end
+	end
+	return nil
+end
+
+local function rotationStep()
+	if not Settings.rotationOn then
+		return
+	end
+	if os.clock() >= rotationStats.untilAt then
+		local name = nextPhase()
+		if name then
+			applyPhase(name)
+		else
+			log("<Warning>Rotation has no phases selected</Warning>")
+			Settings.rotationOn = false
+			stopLoop("Rotation")
+			if UiRefs.rotationToggle then
+				UiRefs.rotationToggle:Set(false, true)
+			end
+		end
+	end
+end
+
+local function rotationSet(on)
+	Settings.rotationOn = on
+	if on then
+		rotationStats.index = 0
+		rotationStats.untilAt = 0
+		startLoop("Rotation", rotationStep)
+		log("Rotation on")
+	else
+		stopLoop("Rotation")
+		rotationStats.phase = "-"
+		-- Leaving rotation off should not leave a phase running behind your back.
+		trainingSet(false)
+		moneySet(false)
+		battleSet(false)
+		log("Rotation off")
+	end
+	if UiRefs.rotationToggle then
+		UiRefs.rotationToggle:Set(on, true)
+	end
+end
+
+----------------------------------------------------------------------
+-- WINDOW
+----------------------------------------------------------------------
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+Window = Airflow:CreateWindow({
+	Name = "Boxing Battles Hub",
+	LoadingSubtitle = "training, money, battles",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "BoxingBattlesHub" },
+	Home = {
+		Title = "Boxing Battles Hub",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogBox = LogTab:CreateGroupbox({ Name = "What the script is doing", Side = "Left" })
+Log = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----------------------------------------------------------------------
+-- TRAINING TAB
+----------------------------------------------------------------------
+
+local TrainTab = Window:CreateTab({ Name = "Training", Icon = "dumbbell" })
+local TrainMain = TrainTab:CreateGroupbox({ Name = "Strength", Side = "Left" })
+local TrainGear = TrainTab:CreateGroupbox({ Name = "Weights", Side = "Right" })
+local TrainInfo = TrainTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+UiRefs.trainToggle = TrainMain:CreateToggle({
+	Name = "Auto train",
+	Desc = "Stands at the dumbbell rack and keeps the game's free auto train running",
+	Flag = "TrainOn",
+	CurrentValue = false,
+	Callback = function(on)
+		trainingSet(on)
+	end,
+})
+
+TrainMain:CreateButton({
+	Name = "Go to the gym now",
+	Icon = "map-pin",
+	Callback = function()
+		goTo(gymSpot(desiredWeight() or "Weights [1Kg]"))
+		log("Moved to the gym")
+	end,
+})
+
+TrainMain:CreateSlider({
+	Name = "Keep this much cash",
+	Desc = "Weights are not bought below this balance",
+	Range = { 0, 500000 },
+	Increment = 100,
+	Suffix = " $",
+	CurrentValue = 0,
+	Flag = "CashReserve",
+	Callback = function(value)
+		Settings.cashReserve = value
+	end,
+})
+
+local weightOptions = {}
+for _, info in ipairs(WEIGH_LIST) do
+	if not info.robux then
+		table.insert(weightOptions, string.format("%s (%s $, needs %s str)", info.name, short(info.price), short(info.req)))
+	end
+end
+table.insert(weightOptions, 1, "Auto (best I own)")
+
+TrainGear:CreateDropdown({
+	Name = "Preferred weight",
+	Desc = "What to wear, and what to buy when auto buy is on",
+	Options = weightOptions,
+	CurrentOption = "Auto (best I own)",
+	Flag = "PreferredWeight",
+	Callback = function(value)
+		local chosen = type(value) == "table" and value[1] or value
+		Settings.preferredWeight = (chosen == "Auto (best I own)") and "Auto" or tostring(chosen):match("^([^%(]+)") or "Auto"
+		Settings.preferredWeight = (Settings.preferredWeight or ""):gsub("%s+$", "")
+	end,
+})
+
+TrainGear:CreateToggle({
+	Name = "Auto buy weights",
+	Desc = "Buys the next weight once your strength allows it",
+	Flag = "TrainAutoBuy",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.trainAutoBuy = on
+	end,
+})
+
+TrainGear:CreateToggle({
+	Name = "Keep the weight in hand",
+	Desc = "Re-equips it if the tool disappears",
+	Flag = "TrainEquip",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.trainEquip = on
+	end,
+})
+
+TrainInfo:CreateStatus({
+	Name = "Strength",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return "<Success>" .. short(strength()) .. "</Success>"
+	end,
+})
+
+TrainInfo:CreateStatus({
+	Name = "Gain",
+	Style = "Row",
+	Update = function()
+		return short(trainingStats.rate) .. " per minute"
+	end,
+})
+
+TrainInfo:CreateStatus({
+	Name = "Wearing",
+	Style = "Row",
+	Update = function()
+		return tostring(trainingStats.equipped or "-")
+	end,
+})
+
+TrainInfo:CreateStatus({
+	Name = "Auto train",
+	Style = "Row",
+	Update = function()
+		return autoTrainEnabled() and "<Success>running</Success>" or "<Muted>off</Muted>"
+	end,
+})
+
+TrainInfo:CreateParagraph({
+	Title = "How training works",
+	Content = "Stand next to a dumbbell rack and the game trains for you - the script just keeps that "
+		.. "auto train switched on. Heavier weights give more strength, but each one needs a minimum "
+		.. "strength before you may buy it, so the script only buys what you can already use.",
+})
+
+----------------------------------------------------------------------
+-- MONEY TAB
+----------------------------------------------------------------------
+
+local MoneyTab = Window:CreateTab({ Name = "Money", Icon = "coins" })
+local MoneyMain = MoneyTab:CreateGroupbox({ Name = "AFK money", Side = "Left" })
+local MoneyInfo = MoneyTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+UiRefs.moneyToggle = MoneyMain:CreateToggle({
+	Name = "Farm money on the AFK pad",
+	Desc = "Stands on the free cash pad and stays there",
+	Flag = "MoneyOn",
+	CurrentValue = false,
+	Callback = function(on)
+		moneySet(on)
+	end,
+})
+
+MoneyMain:CreateButton({
+	Name = "Go to the pad now",
+	Icon = "map-pin",
+	Callback = function()
+		goTo(afkSpot())
+		log("Moved to the AFK pad")
+	end,
+})
+
+MoneyInfo:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return "<Success>" .. short(money()) .. "</Success>"
+	end,
+})
+
+MoneyInfo:CreateStatus({
+	Name = "Per minute",
+	Style = "Row",
+	Update = function()
+		return short(moneyStats.rate)
+	end,
+})
+
+MoneyInfo:CreateStatus({
+	Name = "On the pad",
+	Style = "Row",
+	Update = function()
+		local spot = afkSpot()
+		return distanceTo(spot) < 6 and "<Success>yes</Success>" or "<Muted>no</Muted>"
+	end,
+})
+
+MoneyInfo:CreateParagraph({
+	Title = "How the AFK pad works",
+	Content = "The glowing pad in the middle of the map pays cash every second while you stand on it. "
+		.. "The script keeps you there and puts you back if something knocks you off.",
+})
+
+----------------------------------------------------------------------
+-- BATTLE TAB
+----------------------------------------------------------------------
+
+local BattleTab = Window:CreateTab({ Name = "Battles", Icon = "swords" })
+local BattleMain = BattleTab:CreateGroupbox({ Name = "Auto battle", Side = "Left" })
+local CombatBox = BattleTab:CreateGroupbox({ Name = "Fighting", Side = "Right" })
+local BattleInfo = BattleTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+UiRefs.battleToggle = BattleMain:CreateToggle({
+	Name = "Auto battle",
+	Desc = "Queues into a ring, fights and starts the next match",
+	Flag = "BattleOn",
+	CurrentValue = false,
+	Callback = function(on)
+		battleSet(on)
+	end,
+})
+
+BattleMain:CreateDropdown({
+	Name = "Ring",
+	Options = { "1v1", "2v2" },
+	CurrentOption = "1v1",
+	Flag = "RingType",
+	Callback = function(value)
+		Settings.ringType = type(value) == "table" and (value[1] or "1v1") or value or "1v1"
+	end,
+})
+
+BattleMain:CreateSlider({
+	Name = "Wait for an opponent",
+	Desc = "If nobody shows up in this time, another ring is tried",
+	Range = { 10, 180 },
+	Increment = 5,
+	Suffix = " s",
+	CurrentValue = 45,
+	Flag = "WaitForMatch",
+	Callback = function(value)
+		Settings.waitForMatch = value
+	end,
+})
+
+BattleMain:CreateSlider({
+	Name = "Longest fight",
+	Desc = "Safety limit so a stuck match cannot hold you",
+	Range = { 20, 300 },
+	Increment = 10,
+	Suffix = " s",
+	CurrentValue = 90,
+	Flag = "MaxFightTime",
+	Callback = function(value)
+		Settings.maxFightTime = value
+	end,
+})
+
+CombatBox:CreateToggle({
+	Name = "Kill aura",
+	Desc = "Always picks the closest player and keeps you on them",
+	Flag = "KillAura",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.killAura = on
+	end,
+})
+
+CombatBox:CreateSlider({
+	Name = "Aura range",
+	Range = { 10, 150 },
+	Increment = 5,
+	Suffix = " studs",
+	CurrentValue = 60,
+	Flag = "AuraRadius",
+	Callback = function(value)
+		Settings.auraRadius = value
+	end,
+})
+
+CombatBox:CreateToggle({
+	Name = "Fly above the target",
+	Desc = "Hovers over the opponent while hitting",
+	Flag = "FlyAbove",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.flyAbove = on
+	end,
+})
+
+CombatBox:CreateSlider({
+	Name = "Hover height",
+	Range = { 2, 20 },
+	Increment = 1,
+	Suffix = " studs",
+	CurrentValue = 6,
+	Flag = "FlyHeight",
+	Callback = function(value)
+		Settings.flyHeight = value
+	end,
+})
+
+CombatBox:CreateToggle({
+	Name = "Auto punches",
+	Flag = "AutoHits",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.autoHits = on
+	end,
+})
+
+CombatBox:CreateSlider({
+	Name = "Punch delay",
+	Range = { 0.05, 1 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.2,
+	Flag = "HitDelay",
+	Callback = function(value)
+		Settings.hitDelay = value
+	end,
+})
+
+BattleInfo:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local phase = battleStats.phase
+		if phase == "fighting" then
+			return "<Success>fighting</Success> " .. tostring(battleStats.opponent and battleStats.opponent.Name or "")
+		elseif phase == "queueing" then
+			return "<Warning>waiting</Warning> " .. math.max(0, math.floor(Settings.waitForMatch - (os.clock() - battleStats.since))) .. "s"
+		end
+		return "<Muted>idle</Muted>"
+	end,
+})
+
+BattleInfo:CreateStatus({
+	Name = "Result",
+	Style = "Row",
+	Update = function()
+		return string.format("<Success>%d</Success> won, <Error>%d</Error> lost", battleStats.wins, battleStats.losses)
+	end,
+})
+
+BattleInfo:CreateStatus({
+	Name = "Health",
+	Style = "Row",
+	Update = function()
+		return math.floor(myHealth()) .. " / 100"
+	end,
+})
+
+BattleInfo:CreateParagraph({
+	Title = "How battles work",
+	Content = "Touching a coloured pad joins that ring. When both sides fill up the game moves you in and "
+		.. "you punch with the mouse. The script does the queueing, keeps you above your opponent and "
+		.. "punches for you, then starts the next match.",
+})
+
+----------------------------------------------------------------------
+-- ROTATION TAB
+----------------------------------------------------------------------
+
+local RotationTab = Window:CreateTab({ Name = "Rotation", Icon = "refresh-cw" })
+local RotationMain = RotationTab:CreateGroupbox({ Name = "Timer", Side = "Left" })
+local RotationPhases = RotationTab:CreateGroupbox({ Name = "Phases", Side = "Right" })
+local RotationInfo = RotationTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+UiRefs.rotationToggle = RotationMain:CreateToggle({
+	Name = "Rotation",
+	Desc = "Switches between the phases below on a timer",
+	Flag = "RotationOn",
+	CurrentValue = false,
+	Callback = function(on)
+		rotationSet(on)
+	end,
+})
+
+RotationMain:CreateSlider({
+	Name = "Money minutes",
+	Range = { 1, 60 },
+	Increment = 1,
+	Suffix = " min",
+	CurrentValue = 5,
+	Flag = "MoneyMinutes",
+	Callback = function(value)
+		Settings.moneyMinutes = value
+	end,
+})
+
+RotationMain:CreateSlider({
+	Name = "Battle minutes",
+	Range = { 1, 60 },
+	Increment = 1,
+	Suffix = " min",
+	CurrentValue = 10,
+	Flag = "BattleMinutes",
+	Callback = function(value)
+		Settings.battleMinutes = value
+	end,
+})
+
+RotationMain:CreateSlider({
+	Name = "Training minutes",
+	Range = { 1, 60 },
+	Increment = 1,
+	Suffix = " min",
+	CurrentValue = 5,
+	Flag = "TrainingMinutes",
+	Callback = function(value)
+		Settings.trainingMinutes = value
+	end,
+})
+
+RotationPhases:CreateToggle({
+	Name = "Include money",
+	Flag = "RotateMoney",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.rotateMoney = on
+	end,
+})
+
+RotationPhases:CreateToggle({
+	Name = "Include battles",
+	Flag = "RotateBattle",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.rotateBattle = on
+	end,
+})
+
+RotationPhases:CreateToggle({
+	Name = "Include training",
+	Flag = "RotateTraining",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.rotateTraining = on
+	end,
+})
+
+RotationInfo:CreateStatus({
+	Name = "Phase",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		if not Settings.rotationOn then
+			return "<Muted>off</Muted>"
+		end
+		local left = math.max(0, math.floor(rotationStats.untilAt - os.clock()))
+		return string.format("<Accent>%s</Accent> %d:%02d", rotationStats.phase, math.floor(left / 60), left % 60)
+	end,
+})
+
+RotationInfo:CreateParagraph({
+	Title = "How the rotation works",
+	Content = "Pick how long each phase should last and which phases take part. The script then spends that "
+		.. "time on the AFK pad, in rings or at the gym, and switches by itself. Turning rotation off leaves "
+		.. "whatever phase was running switched off too.",
+})
+
+----------------------------------------------------------------------
+-- SETTINGS TAB
+----------------------------------------------------------------------
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local HelpBox = SettingsTab:CreateGroupbox({ Name = "Quick guide", Side = "Right" })
+HelpBox:CreateParagraph({
+	Title = "Boxing Battles Hub",
+	Content = "Training: keeps the free auto train running at the dumbbell racks and buys better weights.\n"
+		.. "Money: sits on the AFK pad for free cash.\n"
+		.. "Battles: queues, flies over your opponent and punches for you.\n"
+		.. "Rotation: alternates money, battles and training on a timer.\n\n"
+		.. "Everything starts off. RightControl hides the window.",
+})
+
+----------------------------------------------------------------------
+-- Start
+----------------------------------------------------------------------
+
+task.spawn(function()
+	pcall(function()
+		Window:LoadAutoload()
+	end)
+	log("<Success>Loaded</Success> - " .. short(money()) .. " cash, " .. short(strength()) .. " strength")
+end)
+
+print("[Boxing Battles Hub] loaded")
