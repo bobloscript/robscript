@@ -1,0 +1,1862 @@
+--[[
+=====================================================================
+  Build The Great Wall - autofarm hub (Airflow UI)
+=====================================================================
+  1) Auto farm: quarry (Fill) -> wall (Place)
+  2) Auto upgrade purchase at the shrine
+  3) Auto Bench (Strength)
+  4) Auto Treadmill (Speed)
+  5) Hot Spring stay (only while the springs are open)
+
+  QoL:
+  * Task priorities (OrderList + "Priority" mode)
+  * Timed rotation: 30s farm -> 30s run -> 30s gym -> repeat
+  * Upgrade autobuy between tasks
+
+  Run: paste into Potassium -> Execute. Toggle the window: RightControl.
+=====================================================================
+--]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local player = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- UI library
+---------------------------------------------------------------------
+local LIBRARY_URL = "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau"
+
+local Airflow
+do
+	local ok, result = pcall(function()
+		return loadstring(game:HttpGet(LIBRARY_URL))()
+	end)
+	if not ok or type(result) ~= "table" then
+		error("[GreatWallHub] failed to load Airflow UI: " .. tostring(result))
+	end
+	Airflow = result
+end
+
+---------------------------------------------------------------------
+-- Game objects
+---------------------------------------------------------------------
+local GreatWall = ReplicatedStorage:WaitForChild("GreatWall", 60)
+local Remotes = GreatWall:WaitForChild("Remotes", 60)
+local FillRemote = Remotes:WaitForChild("Fill", 60)
+local PlaceRemote = Remotes:WaitForChild("Place", 60)
+local UpgradeRemote = Remotes:WaitForChild("Upgrade", 60)
+
+local Config = require(GreatWall:WaitForChild("Config"))
+
+local UPGRADE_LIST = (Config.Upgrades and Config.Upgrades.List) or {}
+local UPGRADE_BY_ID = {}
+for _, info in ipairs(UPGRADE_LIST) do
+	UPGRADE_BY_ID[info.Id] = info
+end
+
+---------------------------------------------------------------------
+-- Utilities
+---------------------------------------------------------------------
+local function attribute(name, default)
+	local value = player:GetAttribute(name)
+	if value == nil then
+		return default
+	end
+	return value
+end
+
+local function coins()
+	return tonumber(attribute("Coins", 0)) or 0
+end
+
+local function blocksInBag()
+	return tonumber(attribute("Blocks", 0)) or 0
+end
+
+local function capacity()
+	return tonumber(attribute("Capacity", Config.CarryCapacity or 25)) or 25
+end
+
+local function serverNow()
+	return workspace:GetServerTimeNow()
+end
+
+local function character()
+	return player.Character
+end
+
+local function humanoid()
+	local char = character()
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function rootPart()
+	local char = character()
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function formatNumber(value)
+	local text = tostring(math.floor(tonumber(value) or 0))
+	return text:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+end
+
+local function logger(...)
+	local parts = {}
+	for index = 1, select("#", ...) do
+		table.insert(parts, tostring(select(index, ...)))
+	end
+	print("[GreatWallHub] " .. table.concat(parts, " "))
+end
+
+---------------------------------------------------------------------
+-- State (declared before every function that reads it)
+---------------------------------------------------------------------
+local State = {
+	running = true,
+	generation = 0,
+	taskUntil = 0,
+	taskDuration = 0,
+	task = "Idle",
+	sequence = math.random(100000, 900000),
+	unsticking = false,
+	sectionCooldown = {},
+	sectionRejects = {},
+	ghostFailures = {},
+	rateSamples = {},
+	manualUntil = 0,
+	options = {
+		autoFarm = false,
+		section = "Auto",
+		placeDelay = 0.06,
+		autoDelay = true,
+		autoUnstuck = true,
+
+		autoBench = false,
+		autoTreadmill = false,
+		autoSprings = false,
+		springsPreempt = true,
+
+		autoUpgrades = false,
+		upgradeStrategy = "In order",
+		upgradeOrder = { "Quarry", "Swift", "Mason", "Reach", "Golden", "Fortune", "Combo", "Trowel", "Blitz" },
+
+		autopilot = true,
+		mode = "Rotation",
+		order = { "Farm", "Treadmill", "Bench", "Springs" },
+		farmSeconds = 30,
+		runSeconds = 30,
+		gymSeconds = 30,
+		springsSeconds = 20,
+	},
+	stats = {
+		placed = 0,
+		coinsEarned = 0,
+		stages = 0,
+		upgrades = 0,
+		startedAt = os.clock(),
+	},
+	debug = {
+		fires = 0,
+		accepted = 0,
+		rejected = 0,
+		moves = 0,
+		moveFails = 0,
+		loops = 0,
+		timeSearch = 0,
+		timeAnchor = 0,
+		timeMove = 0,
+	},
+}
+
+local TASK_LABELS = {
+	Farm = "Farm: quarry + wall",
+	Treadmill = "Treadmill",
+	Bench = "Bench press",
+	Springs = "Hot spring",
+	Upgrades = "Upgrades",
+	Idle = "Idle",
+}
+
+---------------------------------------------------------------------
+-- Movement
+---------------------------------------------------------------------
+local function quarrySpot()
+	local quarry = workspace:FindFirstChild("Quarry")
+	local pit = quarry and quarry:FindFirstChild("Pit")
+	local floor = pit and pit:FindFirstChild("Floor")
+	if floor then
+		return floor.Position + Vector3.new(0, 10, 0)
+	end
+	return Vector3.new(0, 2, -362)
+end
+
+local function standUp()
+	local hum = humanoid()
+	if hum and hum.Sit then
+		hum.Sit = false
+		pcall(function()
+			hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end)
+	end
+end
+
+local function teleport(position)
+	local hrp = rootPart()
+	if not hrp then
+		return false
+	end
+	standUp()
+	hrp.CFrame = CFrame.new(position)
+	task.wait(0.12)
+	local current = rootPart()
+	if current and (current.Position - position).Magnitude <= 25 then
+		return true
+	end
+
+	-- the write did not stick: the character is most likely pinned (e.g. shrine pose)
+	if State.unsticking then
+		return false
+	end
+	if unstick() then
+		local fresh = rootPart()
+		if fresh then
+			fresh.CFrame = CFrame.new(position)
+			task.wait(0.15)
+			return true
+		end
+	end
+	return false
+end
+
+--- The character is pinned in a pose/geometry: a respawn clears the lock.
+function unstick()
+	if State.unsticking then
+		return false
+	end
+	State.unsticking = true
+	local hum = humanoid()
+	if hum then
+		logger("resetting character (pinned)")
+		hum.Health = 0
+		task.wait(0.6)
+		local spot = quarrySpot() + Vector3.new(0, 10, 0)
+		for _ = 1, 20 do
+			local hrp = rootPart()
+			if hrp then
+				hrp.CFrame = CFrame.new(spot)
+			end
+			task.wait(0.1)
+		end
+	end
+	State.unsticking = false
+	return true
+end
+
+--- Check whether CFrame writes still apply (i.e. we are not pinned).
+local function isPinned()
+	local hrp = rootPart()
+	if not hrp then
+		return false
+	end
+	local probe = hrp.Position + Vector3.new(0, 8, 0)
+	hrp.CFrame = CFrame.new(probe)
+	task.wait(0.15)
+	local current = rootPart()
+	if not current then
+		return false
+	end
+	return (current.Position - probe).Magnitude > 5
+end
+
+---------------------------------------------------------------------
+-- Map points
+---------------------------------------------------------------------
+local PLOT_TIERS = {
+	{ Name = "Free", Multiplier = 1 },
+	{ Name = "2x", Multiplier = 2 },
+	{ Name = "5x", Multiplier = 5 },
+	{ Name = "10x", Multiplier = 10 },
+	{ Name = "25x", Multiplier = 25 },
+	{ Name = "50x", Multiplier = 50 },
+	{ Name = "75x", Multiplier = 75 },
+	{ Name = "100x", Multiplier = 100 },
+	{ Name = "500x", Multiplier = 500 },
+}
+
+local function bestGymPlot()
+	local area = workspace:FindFirstChild("TrainingArea")
+	local plots = area and area:FindFirstChild("Plots")
+	if not plots then
+		return nil, 1
+	end
+	local best, bestMultiplier = nil, 0
+	for _, tier in ipairs(PLOT_TIERS) do
+		local model = plots:FindFirstChild("Plot_" .. tier.Name)
+		if model then
+			local unlocked = (tier.Name == "Free") or attribute("Gym_" .. tier.Name, false) == true
+			if unlocked and tier.Multiplier > bestMultiplier then
+				best, bestMultiplier = model, tier.Multiplier
+			end
+		end
+	end
+	return best, bestMultiplier
+end
+
+local function benchTarget()
+	local plot = bestGymPlot()
+	if not plot then
+		return nil, nil
+	end
+	local bench = plot:FindFirstChild("BenchPress")
+	local prompt = bench and bench:FindFirstChild("BenchPrompt", true)
+	if not prompt or not prompt:IsA("ProximityPrompt") then
+		return nil, nil
+	end
+	local seat = prompt.Parent and prompt.Parent.Parent
+	if not seat or not seat:IsA("BasePart") then
+		return nil, nil
+	end
+	return seat, prompt
+end
+
+local function treadmillSpot()
+	local plot = bestGymPlot()
+	if not plot then
+		return nil
+	end
+	local treadmill = plot:FindFirstChild("Treadmill")
+	if not treadmill then
+		return nil
+	end
+	local best
+	for _, part in ipairs(treadmill:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name == "Belt" then
+			if not best or (part.Size.X * part.Size.Z) > (best.Size.X * best.Size.Z) then
+				best = part
+			end
+		end
+	end
+	return best
+end
+
+local function springsOpen()
+	return (GreatWall:GetAttribute("WallBoostEnd") or 0) > serverNow()
+end
+
+local function springsTimeLeft()
+	return math.max(0, (GreatWall:GetAttribute("WallBoostEnd") or 0) - serverNow())
+end
+
+local function springsSpot()
+	local model = workspace:FindFirstChild("HotSprings")
+	local zone = model and model:FindFirstChild("RelaxZone")
+	if zone and zone:IsA("BasePart") then
+		return zone.Position + Vector3.new(0, 2, 0)
+	end
+	return nil
+end
+
+local function shrineSpot()
+	local shrine = workspace:FindFirstChild("UpgradeShrine")
+	if not shrine then
+		return nil
+	end
+	local zone = shrine:FindFirstChild("Zone")
+	if zone and zone:IsA("BasePart") then
+		-- standing closer than ~9 studs locks the character into the praying pose,
+		-- so we keep 10 studs away (the purchase radius is 11)
+		return zone.Position + Vector3.new(0, -1, 10)
+	end
+	local altar = shrine:FindFirstChild("Altar")
+	if altar then
+		local part = altar:FindFirstChildWhichIsA("BasePart")
+		if part then
+			return part.Position + Vector3.new(0, 2, 12)
+		end
+	end
+	return nil
+end
+
+local function shrineZone()
+	local shrine = workspace:FindFirstChild("UpgradeShrine")
+	local zone = shrine and shrine:FindFirstChild("Zone")
+	if zone and zone:IsA("BasePart") then
+		return zone
+	end
+	return nil
+end
+
+---------------------------------------------------------------------
+-- Upgrades
+---------------------------------------------------------------------
+local function upgradeLevel(id)
+	return tonumber(attribute("Up_" .. id, 0)) or 0
+end
+
+local function upgradeCost(id)
+	local info = UPGRADE_BY_ID[id]
+	if not info then
+		return nil
+	end
+	local level = upgradeLevel(id)
+	if level >= (info.Max or 0) then
+		return nil
+	end
+	local costs = info.Costs or {}
+	return costs[level + 1]
+end
+
+local function upgradeUnlocked(id)
+	local info = UPGRADE_BY_ID[id]
+	if not info then
+		return false
+	end
+	local required = info.RequiresWalls
+	if required and (tonumber(attribute("Walls", 0)) or 0) < required then
+		return false
+	end
+	return true
+end
+
+local function upgradePlan()
+	local best
+	for _, id in ipairs(State.options.upgradeOrder) do
+		if upgradeUnlocked(id) then
+			local cost = upgradeCost(id)
+			if cost then
+				if State.options.upgradeStrategy == "Cheapest first" then
+					if not best or cost < best.cost then
+						best = { id = id, cost = cost }
+					end
+				else
+					return { id = id, cost = cost }
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function hasUpgradeOpportunity()
+	if not State.options.autoUpgrades then
+		return false
+	end
+	local plan = upgradePlan()
+	if not plan then
+		return false
+	end
+	return coins() >= plan.cost
+end
+
+---------------------------------------------------------------------
+-- Wall: slots and placement
+---------------------------------------------------------------------
+local ghostCache = {
+	list = {},
+	fetchedAt = 0,
+}
+
+local function refreshGhosts()
+	if os.clock() - ghostCache.fetchedAt < 1.0 then
+		return ghostCache.list
+	end
+	ghostCache.fetchedAt = os.clock()
+	local list = {}
+	for _, part in ipairs(CollectionService:GetTagged("WallGhost")) do
+		if part:IsA("BasePart") and part.Parent and part.Name == "Ghost" and part:GetAttribute("S") then
+			table.insert(list, part)
+		end
+	end
+	table.sort(list, function(a, b)
+		local layerA, layerB = a:GetAttribute("L") or 0, b:GetAttribute("L") or 0
+		if layerA ~= layerB then
+			return layerA < layerB
+		end
+		local sectionA, sectionB = a:GetAttribute("S") or 0, b:GetAttribute("S") or 0
+		if sectionA ~= sectionB then
+			return sectionA < sectionB
+		end
+		return (a:GetAttribute("I") or 0) < (b:GetAttribute("I") or 0)
+	end)
+	ghostCache.list = list
+	return list
+end
+
+local function ghostTotal()
+	return #refreshGhosts()
+end
+
+--- Distance the server lets us build from (Reach upgrade raises PlaceRange).
+local function currentReach()
+	return math.max(18, (tonumber(attribute("PlaceRange", 28)) or 28) - 4)
+end
+
+--- Delay between two Place calls. The game's own cooldown is the fastest safe value:
+--- PlaceCooldown is a player attribute that already includes Swift/Blitz upgrades.
+local function currentDelay()
+	if State.options.autoDelay then
+		local cooldown = tonumber(attribute("PlaceCooldown", 0.1)) or 0.1
+		return math.clamp(cooldown, 0.03, 0.3)
+	end
+	return State.options.placeDelay
+end
+
+local function ghostUsable(ghost, now)
+	local section = tostring(ghost:GetAttribute("S"))
+	local cooldown = State.sectionCooldown[section]
+	if cooldown and now < cooldown then
+		return false
+	end
+	local stamp = State.ghostFailures[ghost]
+	if stamp and now - stamp < 20 then
+		return false
+	end
+	if State.options.section ~= "Auto" and section ~= tostring(State.options.section) then
+		return false
+	end
+	return true
+end
+
+local function ghostInReach(position, reach)
+	local now = os.clock()
+	for _, ghost in ipairs(refreshGhosts()) do
+		if ghost.Parent and ghost.Name == "Ghost" and (ghost.Position - position).Magnitude <= reach then
+			if ghostUsable(ghost, now) then
+				return ghost
+			end
+		end
+	end
+	return nil
+end
+
+--- Pick a slot with the most neighbours: standing next to it gives dozens of
+--- placeable slots at once, so we teleport once per cluster instead of per block.
+local function anchorGhost(reach)
+	local now = os.clock()
+	local candidates = {}
+	for _, ghost in ipairs(refreshGhosts()) do
+		if ghost.Parent and ghost.Name == "Ghost" and ghostUsable(ghost, now) then
+			table.insert(candidates, ghost)
+			if #candidates >= 260 then
+				break
+			end
+		end
+	end
+	if #candidates == 0 then
+		return nil, 0
+	end
+
+	local radius = reach * 0.8
+	local best, bestCount = nil, 0
+	for _, ghost in ipairs(candidates) do
+		local count = 0
+		for _, other in ipairs(candidates) do
+			if (other.Position - ghost.Position).Magnitude <= radius then
+				count = count + 1
+			end
+		end
+		if count > bestCount then
+			best, bestCount = ghost, count
+		end
+	end
+	return best, bestCount
+end
+
+--- Move the character without the pin machinery: used per cluster, where a
+--- failed hop must not trigger a respawn.
+local function placeCharacterAt(position)
+	local hrp = rootPart()
+	if not hrp then
+		return false
+	end
+	standUp()
+	hrp.CFrame = CFrame.new(position)
+	task.wait(0.1)
+	local current = rootPart()
+	return current ~= nil and (current.Position - position).Magnitude <= 30
+end
+
+--- Stand within reach of the anchor slot, preferring the front side of the wall.
+local function moveToCluster(anchor, reach)
+	local distance = math.min(reach * 0.5, 18)
+	local offsets = {
+		Vector3.new(0, 4, distance),
+		Vector3.new(0, 4, -distance),
+		Vector3.new(distance, 4, 0),
+		Vector3.new(-distance, 4, 0),
+	}
+	for _, offset in ipairs(offsets) do
+		if placeCharacterAt(anchor.Position + offset) then
+			return true
+		end
+	end
+	return false
+end
+
+local function firePlace(ghost)
+	State.sequence = State.sequence + 1
+	PlaceRemote:FireServer(ghost:GetAttribute("S"), ghost:GetAttribute("L"), ghost:GetAttribute("I"), State.sequence)
+end
+
+local function fillBag()
+	local spot = quarrySpot()
+	if not teleport(spot + Vector3.new(0, 6, 0)) then
+		return 0
+	end
+	task.wait(0.4)
+
+	local started = os.clock()
+	local stagnant = 0
+
+	while os.clock() - started < 12 do
+		if blocksInBag() >= capacity() then
+			break
+		end
+
+		local before = blocksInBag()
+		FillRemote:FireServer(14, false)
+		task.wait(0.07)
+
+		if blocksInBag() <= before then
+			stagnant = stagnant + 1
+			if stagnant > 14 then
+				teleport(spot)
+				task.wait(0.4)
+				stagnant = 0
+			end
+		else
+			stagnant = 0
+		end
+	end
+
+	return blocksInBag()
+end
+
+---------------------------------------------------------------------
+-- Scheduler primitives
+---------------------------------------------------------------------
+local function beginTask(name, seconds)
+	State.generation = State.generation + 1
+	State.task = name
+	State.taskDuration = seconds
+	State.taskUntil = os.clock() + seconds
+	return State.generation
+end
+
+local function isActive(generation)
+	return State.running and State.generation == generation and os.clock() < State.taskUntil
+end
+
+local function stopTask()
+	State.generation = State.generation + 1
+	State.task = "Idle"
+end
+
+local function taskEnabled(name)
+	if name == "Farm" then
+		return State.options.autoFarm
+	elseif name == "Bench" then
+		return State.options.autoBench
+	elseif name == "Treadmill" then
+		return State.options.autoTreadmill
+	elseif name == "Springs" then
+		return State.options.autoSprings
+	elseif name == "Upgrades" then
+		return State.options.autoUpgrades
+	end
+	return false
+end
+
+local function taskAvailable(name)
+	if name == "Springs" then
+		return springsOpen() and springsSpot() ~= nil
+	elseif name == "Bench" then
+		return benchTarget() ~= nil
+	elseif name == "Treadmill" then
+		return treadmillSpot() ~= nil
+	end
+	return true
+end
+
+local function durationOf(name)
+	if name == "Farm" then
+		return State.options.farmSeconds
+	elseif name == "Bench" then
+		return State.options.gymSeconds
+	elseif name == "Treadmill" then
+		return State.options.runSeconds
+	elseif name == "Springs" then
+		return State.options.springsSeconds
+	end
+	return 10
+end
+
+---------------------------------------------------------------------
+-- Tasks
+---------------------------------------------------------------------
+local function runFarm(generation)
+	local idleSince = os.clock()
+	local stuckMoves = 0
+
+	while isActive(generation) do
+		local hrp = rootPart()
+
+		if ghostTotal() == 0 then
+			-- wall finished / waiting for the next one: nothing to place
+			if os.clock() - idleSince > 5 then
+				break
+			end
+			task.wait(0.4)
+		elseif blocksInBag() <= 0 then
+			fillBag()
+			if not isActive(generation) then
+				break
+			end
+			idleSince = os.clock()
+		elseif not hrp then
+			task.wait(0.2)
+		else
+			local reach = currentReach()
+			State.debug.loops = State.debug.loops + 1
+
+			local searchStart = os.clock()
+			local ghost = ghostInReach(hrp.Position, reach)
+			State.debug.timeSearch = State.debug.timeSearch + (os.clock() - searchStart)
+
+			if ghost then
+				State.debug.fires = State.debug.fires + 1
+				firePlace(ghost)
+				task.wait(currentDelay())
+
+				local section = tostring(ghost:GetAttribute("S"))
+				if ghost.Name == "Block" then
+					State.stats.placed = State.stats.placed + 1
+					State.debug.accepted = State.debug.accepted + 1
+					State.sectionRejects[section] = 0
+					State.sectionCooldown[section] = nil
+					idleSince = os.clock()
+				else
+					State.debug.rejected = State.debug.rejected + 1
+					State.ghostFailures[ghost] = os.clock()
+					State.sectionRejects[section] = (State.sectionRejects[section] or 0) + 1
+					if State.sectionRejects[section] >= 5 then
+						State.sectionCooldown[section] = os.clock() + 8
+						State.sectionRejects[section] = 0
+					end
+				end
+			else
+				-- nothing left within reach: hop to the densest cluster once
+				local anchorStart = os.clock()
+				local anchor, neighbours = anchorGhost(reach)
+				State.debug.timeAnchor = State.debug.timeAnchor + (os.clock() - anchorStart)
+
+				local moved = false
+				if anchor then
+					local moveStart = os.clock()
+					moved = moveToCluster(anchor, reach) and neighbours > 0
+					State.debug.timeMove = State.debug.timeMove + (os.clock() - moveStart)
+					State.debug.moves = State.debug.moves + 1
+				end
+
+				if moved then
+					idleSince = os.clock()
+					stuckMoves = 0
+				else
+					State.debug.moveFails = State.debug.moveFails + 1
+					stuckMoves = stuckMoves + 1
+					if stuckMoves >= 6 and State.options.autoUnstuck and isPinned() then
+						local hum = humanoid()
+						if hum then
+							logger("cannot reach the wall - respawning")
+							hum.Health = 0
+							stuckMoves = 0
+							task.wait(3)
+						end
+					end
+				end
+
+				if os.clock() - idleSince > 4 then
+					break
+				end
+				task.wait(0.15)
+			end
+		end
+	end
+end
+
+local function runBench(generation)
+	local seat, prompt = benchTarget()
+	if not seat or not prompt then
+		return
+	end
+
+	local function press()
+		local hrp = rootPart()
+		if not hrp then
+			return
+		end
+		if (hrp.Position - seat.Position).Magnitude > 8 then
+			hrp.CFrame = CFrame.new(seat.Position + Vector3.new(0, 3, 0))
+			task.wait(0.3)
+		end
+		pcall(function()
+			prompt:InputHoldBegin()
+		end)
+		task.wait(0.12)
+		pcall(function()
+			prompt:InputHoldEnd()
+		end)
+	end
+
+	press()
+	task.wait(0.6)
+
+	local misses = 0
+	while isActive(generation) do
+		if tostring(attribute("Training", "")) ~= "Strength" then
+			press()
+			task.wait(0.5)
+			if tostring(attribute("Training", "")) ~= "Strength" then
+				misses = misses + 1
+				if misses >= 3 and isPinned() then
+					unstick()
+					misses = 0
+					press()
+				end
+			else
+				misses = 0
+			end
+		end
+		task.wait(0.35)
+	end
+
+	standUp()
+end
+
+local function runTreadmill(generation)
+	local belt = treadmillSpot()
+	if not belt then
+		return
+	end
+	local spot = belt.Position + Vector3.new(0, 1.4, 0)
+
+	local function stand()
+		local hrp = rootPart()
+		if hrp then
+			hrp.CFrame = CFrame.new(spot)
+		end
+	end
+
+	stand()
+	task.wait(0.6)
+
+	local misses = 0
+	while isActive(generation) do
+		local hrp = rootPart()
+		if hrp and (hrp.Position - spot).Magnitude > 6 then
+			stand()
+			misses = misses + 1
+			if misses >= 3 and isPinned() then
+				unstick()
+				misses = 0
+				stand()
+			end
+		else
+			misses = 0
+		end
+		task.wait(0.5)
+	end
+end
+
+local function runSprings(generation)
+	local spot = springsSpot()
+	if not spot or not springsOpen() then
+		return
+	end
+
+	local function soak()
+		local hrp = rootPart()
+		if not hrp then
+			return
+		end
+		hrp.CFrame = CFrame.new(spot)
+		task.wait(0.2)
+		local hum = humanoid()
+		if hum then
+			hum.Sit = true
+		end
+	end
+
+	soak()
+
+	local misses = 0
+	while isActive(generation) and springsOpen() do
+		local hrp = rootPart()
+		if hrp and (hrp.Position - spot).Magnitude > 8 then
+			soak()
+			misses = misses + 1
+			if misses >= 3 and isPinned() then
+				unstick()
+				misses = 0
+				soak()
+			end
+		else
+			misses = 0
+		end
+		local hum = humanoid()
+		if hum and not hum.Sit then
+			hum.Sit = true
+		end
+		task.wait(0.6)
+	end
+
+	standUp()
+end
+
+local function buyUpgrade(id)
+	local ok, result = pcall(function()
+		return UpgradeRemote:InvokeServer("Buy", id)
+	end)
+	if not ok then
+		return false, tostring(result)
+	end
+	if type(result) == "table" then
+		if result.ok then
+			return true
+		end
+		return false, tostring(result.reason or "unknown")
+	end
+	return false, "unknown"
+end
+
+local function runUpgrades(generation)
+	local plan = upgradePlan()
+	if not plan or coins() < plan.cost then
+		return
+	end
+	local spot = shrineSpot()
+	if not spot then
+		return
+	end
+
+	teleport(spot)
+	task.wait(0.5)
+
+	while isActive(generation) do
+		local nextPlan = upgradePlan()
+		if not nextPlan then
+			break
+		end
+		if coins() < nextPlan.cost then
+			break
+		end
+
+		local ok, reason = buyUpgrade(nextPlan.id)
+		if ok then
+			State.stats.upgrades = State.stats.upgrades + 1
+			logger("bought upgrade: " .. nextPlan.id)
+		elseif reason == "far" then
+			-- step closer, but not so close that we get pinned in the praying pose
+			local zone = shrineZone()
+			local moved = false
+			if zone then
+				for _, offset in ipairs({ 8.5, 7, 5.5 }) do
+					teleport(zone.Position + Vector3.new(0, -1, offset))
+					task.wait(0.35)
+					if buyUpgrade(nextPlan.id) then
+						State.stats.upgrades = State.stats.upgrades + 1
+						moved = true
+						break
+					end
+				end
+			end
+			if not moved then
+				break
+			end
+		else
+			logger("upgrade " .. nextPlan.id .. " rejected: " .. reason)
+			break
+		end
+		task.wait(0.25)
+	end
+
+	if isPinned() then
+		unstick()
+	end
+end
+
+local TASK_FUNCTIONS = {
+	Farm = runFarm,
+	Bench = runBench,
+	Treadmill = runTreadmill,
+	Springs = runSprings,
+	Upgrades = runUpgrades,
+}
+
+local function runTask(name, seconds, manual)
+	local fn = TASK_FUNCTIONS[name]
+	if not fn then
+		return
+	end
+	local generation = beginTask(name, seconds)
+	if manual then
+		-- let a hand-started task finish before the scheduler takes over again
+		State.manualUntil = State.taskUntil
+	end
+	local started = os.clock()
+	local ok, err = pcall(fn, generation)
+	if not ok then
+		logger("task " .. name .. " failed: " .. tostring(err))
+	elseif os.clock() - started < seconds - 1 then
+		logger(string.format("task %s ended early: %.1fs of %.1fs (generation %d -> %d)",
+			name, os.clock() - started, seconds, generation, State.generation))
+	end
+	if State.generation == generation then
+		State.task = "Idle"
+	end
+	if manual and State.manualUntil <= os.clock() then
+		State.manualUntil = 0
+	end
+end
+
+local function enabledTasks()
+	local list = {}
+	for _, name in ipairs(State.options.order) do
+		if taskEnabled(name) and taskAvailable(name) then
+			table.insert(list, name)
+		end
+	end
+	-- the springs may be missing from the order list; add them if they are open
+	if State.options.autoSprings and springsOpen() and springsSpot() then
+		local found = false
+		for _, name in ipairs(list) do
+			if name == "Springs" then
+				found = true
+			end
+		end
+		if not found then
+			table.insert(list, "Springs")
+		end
+	end
+	return list
+end
+
+--- Which task the rotation will switch to after the current one finishes.
+local function nextTaskName()
+	local list = enabledTasks()
+	if #list == 0 then
+		return nil
+	end
+	for index, name in ipairs(list) do
+		if name == State.task then
+			return list[(index % #list) + 1]
+		end
+	end
+	return list[1]
+end
+
+--- Seconds left before the scheduler switches tasks (0 when idle).
+local function taskRemaining()
+	if State.task == "Idle" then
+		return 0
+	end
+	return math.max(0, State.taskUntil - os.clock())
+end
+
+--- Fraction of the current time slice already spent (0..1).
+local function taskProgress()
+	local duration = State.taskDuration or 0
+	if duration <= 0 or duration > 1e6 then
+		return 0
+	end
+	local remaining = taskRemaining()
+	return math.clamp(1 - remaining / duration, 0, 1)
+end
+
+local function schedulerLoop()
+	while true do
+		if not State.running then
+			task.wait(0.3)
+		elseif State.manualUntil > os.clock() then
+			-- a task started by hand (button / API) owns the character right now
+			task.wait(0.2)
+		else
+			local springOverride = State.options.springsPreempt
+				and State.options.autoSprings
+				and springsOpen()
+				and springsSpot() ~= nil
+
+			if springOverride then
+				local seconds = math.max(5, math.min(State.options.springsSeconds, springsTimeLeft()))
+				runTask("Springs", seconds)
+			else
+				local list = enabledTasks()
+				if #list == 0 then
+					State.task = "Idle"
+					task.wait(0.4)
+				elseif not State.options.autopilot then
+					runTask(list[1], 20)
+				elseif State.options.mode == "Priority" then
+					runTask(list[1], 25)
+				else
+					for _, name in ipairs(list) do
+						if not State.running then
+							break
+						end
+						-- a manual task (button / API) must not be preempted
+						if State.manualUntil > os.clock() then
+							break
+						end
+						if hasUpgradeOpportunity() then
+							runTask("Upgrades", 12)
+						end
+						runTask(name, durationOf(name))
+					end
+				end
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Statistics
+---------------------------------------------------------------------
+local lastCoins = coins()
+
+player:GetAttributeChangedSignal("Coins"):Connect(function()
+	local current = coins()
+	if current > lastCoins then
+		State.stats.coinsEarned = State.stats.coinsEarned + (current - lastCoins)
+	end
+	lastCoins = current
+end)
+
+task.spawn(function()
+	local previous = {}
+	while true do
+		local current = {}
+		for _, ghost in ipairs(refreshGhosts()) do
+			local section = ghost:GetAttribute("S")
+			current[section] = (current[section] or 0) + 1
+		end
+		for section, count in pairs(previous) do
+			if count > 0 and (current[section] or 0) == 0 then
+				State.stats.stages = State.stats.stages + 1
+			end
+		end
+		previous = current
+		task.wait(2)
+	end
+end)
+
+-- rolling placement speed (blocks per second over the last few seconds)
+task.spawn(function()
+	while true do
+		table.insert(State.rateSamples, { at = os.clock(), placed = State.stats.placed })
+		while #State.rateSamples > 6 do
+			table.remove(State.rateSamples, 1)
+		end
+		task.wait(1)
+	end
+end)
+
+local function placementRate()
+	local samples = State.rateSamples
+	if #samples < 2 then
+		return 0
+	end
+	local first = samples[1]
+	local last = samples[#samples]
+	local span = last.at - first.at
+	if span <= 0 then
+		return 0
+	end
+	return (last.placed - first.placed) / span
+end
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
+-- shut down a previously loaded instance, if any
+local previousInstance = getgenv().GreatWallHub
+if previousInstance and type(previousInstance.destroy) == "function" then
+	pcall(previousInstance.destroy)
+end
+
+local Window = Airflow:CreateWindow({
+	Name = "Great Wall Hub",
+	LoadingSubtitle = "autofarm + rotation",
+	ToggleUIKeybind = "RightControl",
+	ConfigurationSaving = { Enabled = true, FolderName = "GreatWallHub" },
+	Home = false,
+})
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "pickaxe" })
+local GymTab = Window:CreateTab({ Name = "Gym", Icon = "dumbbell" })
+local UpgradeTab = Window:CreateTab({ Name = "Upgrades", Icon = "trending-up" })
+local RotationTab = Window:CreateTab({ Name = "Rotation", Icon = "refresh-cw" })
+local InfoTab = Window:CreateTab({ Name = "Info", Icon = "info" })
+
+---------------------------------------------------------------------
+-- Farm
+---------------------------------------------------------------------
+local farmLeft = FarmTab:CreateGroupbox({ Name = "Quarry and wall", Side = "Left" })
+local farmRight = FarmTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+local toggleAutoFarm = farmLeft:CreateToggle({
+	Name = "Auto farm",
+	Desc = "Mine stones in the quarry and place them on the wall",
+	Flag = "AutoFarm",
+	CurrentValue = false,
+	Callback = function(value)
+		State.options.autoFarm = value
+		stopTask()
+	end,
+})
+
+local sectionOptions = { "Auto" }
+for index = 1, 16 do
+	table.insert(sectionOptions, tostring(index))
+end
+
+farmLeft:CreateDropdown({
+	Name = "Wall section",
+	Desc = "Auto - any available slot",
+	Options = sectionOptions,
+	CurrentOption = "Auto",
+	Flag = "WallSection",
+	Callback = function(value)
+		State.options.section = tostring(value)
+		State.ghostFailures = {}
+		State.sectionCooldown = {}
+	end,
+})
+
+farmLeft:CreateToggle({
+	Name = "Auto delay",
+	Desc = "Use the game's own PlaceCooldown (includes Swift/Blitz upgrades)",
+	Flag = "AutoDelay",
+	CurrentValue = true,
+	Callback = function(value)
+		State.options.autoDelay = value
+	end,
+})
+
+farmLeft:CreateSlider({
+	Name = "Place delay",
+	Desc = "Manual pacing, used only when auto delay is off",
+	Range = { 20, 300 },
+	Increment = 5,
+	CurrentValue = 60,
+	Suffix = " ms",
+	Flag = "PlaceDelay",
+	DependsOn = function()
+		return State.options.autoDelay == false
+	end,
+	DependsMode = "Disable",
+	Callback = function(value)
+		State.options.placeDelay = value / 1000
+	end,
+})
+
+farmLeft:CreateButton({
+	Name = "Fill bag now",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			fillBag()
+		end)
+	end,
+})
+
+farmLeft:CreateButton({
+	Name = "Place everything in the bag",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			runTask("Farm", 30, true)
+		end)
+	end,
+})
+
+farmLeft:CreateToggle({
+	Name = "Auto respawn when pinned",
+	Desc = "If the teleport to a slot does not apply, respawn the character",
+	Flag = "AutoUnstuck",
+	CurrentValue = true,
+	Callback = function(value)
+		State.options.autoUnstuck = value
+	end,
+})
+
+local bagProgress = farmRight:CreateProgress({
+	Name = "Bag",
+	CurrentValue = 0,
+	Format = function()
+		return tostring(blocksInBag()) .. " / " .. tostring(capacity())
+	end,
+})
+
+farmRight:CreateStatus({
+	Name = "Wallet",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return "<Success>" .. formatNumber(coins()) .. "</Success>"
+	end,
+})
+
+farmRight:CreateStatus({
+	Name = "Open slots",
+	Style = "Row",
+	Update = function()
+		return "<Accent>" .. tostring(ghostTotal()) .. "</Accent>"
+	end,
+})
+
+farmRight:CreateStatus({
+	Name = "Placed",
+	Style = "Row",
+	Update = function()
+		return formatNumber(State.stats.placed)
+	end,
+})
+
+farmRight:CreateStatus({
+	Name = "Speed",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local rate = placementRate()
+		local tone = rate >= 8 and "Success" or (rate >= 3 and "Accent" or "Muted")
+		return string.format("<%s>%.1f blk/s</%s>", tone, rate, tone)
+	end,
+})
+
+farmRight:CreateStatus({
+	Name = "Stages done",
+	Style = "Row",
+	Update = function()
+		return formatNumber(State.stats.stages)
+	end,
+})
+
+task.spawn(function()
+	while true do
+		local total = math.max(1, capacity())
+		local current = math.min(total, blocksInBag())
+		pcall(function()
+			bagProgress:Set(current / total)
+		end)
+		task.wait(0.5)
+	end
+end)
+
+---------------------------------------------------------------------
+-- Gym
+---------------------------------------------------------------------
+local gymLeft = GymTab:CreateGroupbox({ Name = "Machines", Side = "Left" })
+local gymRight = GymTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+local toggleAutoBench = gymLeft:CreateToggle({
+	Name = "Auto Bench",
+	Desc = "Bench press -> Strength (bag size)",
+	Flag = "AutoBench",
+	CurrentValue = false,
+	Callback = function(value)
+		State.options.autoBench = value
+		stopTask()
+	end,
+})
+
+local toggleAutoTreadmill = gymLeft:CreateToggle({
+	Name = "Auto Treadmill",
+	Desc = "Treadmill -> Speed (run speed)",
+	Flag = "AutoTreadmill",
+	CurrentValue = false,
+	Callback = function(value)
+		State.options.autoTreadmill = value
+		stopTask()
+	end,
+})
+
+local toggleAutoSprings = gymLeft:CreateToggle({
+	Name = "Hot Spring stay",
+	Desc = "Soak in the spring, only while it is open (2x training)",
+	Flag = "AutoSprings",
+	CurrentValue = false,
+	Callback = function(value)
+		State.options.autoSprings = value
+		stopTask()
+	end,
+})
+
+gymLeft:CreateToggle({
+	Name = "Spring priority",
+	Desc = "While the spring is open, go there before the queue",
+	Flag = "SpringsPreempt",
+	CurrentValue = true,
+	Callback = function(value)
+		State.options.springsPreempt = value
+	end,
+})
+
+gymRight:CreateStatus({
+	Name = "Training",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local training = tostring(attribute("Training", ""))
+		if training == "Strength" then
+			return "<Success>Strength</Success>"
+		elseif training == "Speed" then
+			return "<Accent>Speed</Accent>"
+		end
+		return "<Muted>none</Muted>"
+	end,
+})
+
+gymRight:CreateStatus({
+	Name = "Gym plot",
+	Style = "Row",
+	Update = function()
+		local _, multiplier = bestGymPlot()
+		return "x" .. tostring(multiplier)
+	end,
+})
+
+gymRight:CreateStatus({
+	Name = "Hot Spring",
+	Style = "Row",
+	Update = function()
+		if springsOpen() then
+			return "<Success>open " .. tostring(math.floor(springsTimeLeft())) .. "s</Success>"
+		end
+		return "<Muted>closed</Muted>"
+	end,
+})
+
+gymRight:CreateStatus({
+	Name = "Strength",
+	Style = "Row",
+	Update = function()
+		return formatNumber(attribute("Strength", 0))
+	end,
+})
+
+gymRight:CreateStatus({
+	Name = "Speed",
+	Style = "Row",
+	Update = function()
+		return formatNumber(attribute("Speed", 0))
+	end,
+})
+
+---------------------------------------------------------------------
+-- Upgrades
+---------------------------------------------------------------------
+local upgradeLeft = UpgradeTab:CreateGroupbox({ Name = "Autobuy", Side = "Left" })
+local upgradeRight = UpgradeTab:CreateGroupbox({ Name = "Plan", Side = "Right" })
+
+local toggleAutoUpgrades = upgradeLeft:CreateToggle({
+	Name = "Auto buy upgrades",
+	Desc = "Buys at the altar whenever there are enough coins",
+	Flag = "AutoUpgrades",
+	CurrentValue = false,
+	Callback = function(value)
+		State.options.autoUpgrades = value
+		stopTask()
+	end,
+})
+
+upgradeLeft:CreateDropdown({
+	Name = "Strategy",
+	Options = { "In order", "Cheapest first" },
+	CurrentOption = "In order",
+	Flag = "UpgradeStrategy",
+	Callback = function(value)
+		State.options.upgradeStrategy = tostring(value)
+	end,
+})
+
+upgradeLeft:CreateOrderList({
+	Name = "Upgrade priority",
+	Items = State.options.upgradeOrder,
+	Flag = "UpgradeOrder",
+	Callback = function(order)
+		State.options.upgradeOrder = order
+	end,
+})
+
+upgradeLeft:CreateButton({
+	Name = "Buy one upgrade",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			runTask("Upgrades", 15, true)
+		end)
+	end,
+})
+
+upgradeRight:CreateStatus({
+	Name = "Next purchase",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local plan = upgradePlan()
+		if not plan then
+			return "<Muted>everything is maxed</Muted>"
+		end
+		local enough = coins() >= plan.cost
+		local color = enough and "Success" or "Muted"
+		return "<" .. color .. ">" .. plan.id .. " - " .. formatNumber(plan.cost) .. "</" .. color .. ">"
+	end,
+})
+
+local upgradeTable
+upgradeTable = upgradeRight:CreateTable({
+	Name = "Levels",
+	Columns = {
+		{ Name = "Upgrade", Key = "id", Width = 110 },
+		{ Name = "Lvl", Key = "level", Width = 55, Align = "Center" },
+		{ Name = "Price", Key = "cost", Width = 80, Align = "Right" },
+	},
+	Rows = {},
+	MaxRows = 9,
+})
+
+task.spawn(function()
+	while true do
+		local rows = {}
+		for _, info in ipairs(UPGRADE_LIST) do
+			local cost = upgradeCost(info.Id)
+			table.insert(rows, {
+				id = info.Id,
+				level = tostring(upgradeLevel(info.Id)) .. "/" .. tostring(info.Max or 0),
+				cost = cost and formatNumber(cost) or "MAX",
+			})
+		end
+		pcall(function()
+			upgradeTable:SetRows(rows)
+		end)
+		task.wait(2)
+	end
+end)
+
+---------------------------------------------------------------------
+-- Rotation
+---------------------------------------------------------------------
+local rotationLeft = RotationTab:CreateGroupbox({ Name = "Autopilot", Side = "Left" })
+local rotationRight = RotationTab:CreateGroupbox({ Name = "Timings", Side = "Right" })
+
+local ROTATION_HANDLES = {
+	Farm = toggleAutoFarm,
+	Treadmill = toggleAutoTreadmill,
+	Bench = toggleAutoBench,
+	Springs = toggleAutoSprings,
+}
+
+local ROTATION_OPTIONS = {
+	Farm = "autoFarm",
+	Treadmill = "autoTreadmill",
+	Bench = "autoBench",
+	Springs = "autoSprings",
+}
+
+--- Autopilot is a master switch: it turns every rotation task on, and turns
+--- them all off again when it is cancelled. State and UI are updated directly
+--- (callback skipped) so the result never depends on the toggle's stored value.
+local function setRotationTasks(enabled)
+	for name, handle in pairs(ROTATION_HANDLES) do
+		State.options[ROTATION_OPTIONS[name]] = enabled
+		pcall(function()
+			handle:Set(enabled, true)
+		end)
+	end
+	logger("autopilot " .. (enabled and "on" or "off") .. " - rotation tasks " .. (enabled and "enabled" or "disabled"))
+end
+
+local toggleAutopilot = rotationLeft:CreateToggle({
+	Name = "Autopilot",
+	Desc = "Enables every rotation task and cycles them; turning it off disables them",
+	Flag = "Autopilot",
+	CurrentValue = false,
+	Callback = function(value)
+		State.options.autopilot = value
+		setRotationTasks(value)
+		stopTask()
+	end,
+})
+
+rotationLeft:CreateDropdown({
+	Name = "Mode",
+	Desc = "Rotation - round robin; Priority - top task only",
+	Options = { "Rotation", "Priority" },
+	CurrentOption = "Rotation",
+	Flag = "SchedulerMode",
+	Callback = function(value)
+		State.options.mode = tostring(value)
+		stopTask()
+	end,
+})
+
+rotationLeft:CreateOrderList({
+	Name = "Task priority",
+	Desc = "The order the rotation walks through",
+	Items = State.options.order,
+	Flag = "TaskOrder",
+	Callback = function(order)
+		State.options.order = order
+		stopTask()
+	end,
+})
+
+rotationRight:CreateSlider({
+	Name = "Farm",
+	Range = { 5, 300 },
+	Increment = 5,
+	CurrentValue = 30,
+	Suffix = " s",
+	Flag = "FarmSeconds",
+	Callback = function(value)
+		State.options.farmSeconds = value
+	end,
+})
+
+rotationRight:CreateSlider({
+	Name = "Run (Speed)",
+	Range = { 5, 300 },
+	Increment = 5,
+	CurrentValue = 30,
+	Suffix = " s",
+	Flag = "RunSeconds",
+	Callback = function(value)
+		State.options.runSeconds = value
+	end,
+})
+
+rotationRight:CreateSlider({
+	Name = "Gym (Strength)",
+	Range = { 5, 300 },
+	Increment = 5,
+	CurrentValue = 30,
+	Suffix = " s",
+	Flag = "GymSeconds",
+	Callback = function(value)
+		State.options.gymSeconds = value
+	end,
+})
+
+rotationRight:CreateSlider({
+	Name = "Hot spring",
+	Range = { 5, 120 },
+	Increment = 5,
+	CurrentValue = 20,
+	Suffix = " s",
+	Flag = "SpringsSeconds",
+	Callback = function(value)
+		State.options.springsSeconds = value
+	end,
+})
+
+rotationRight:CreateStatus({
+	Name = "Now",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return "<Accent>" .. (TASK_LABELS[State.task] or tostring(State.task)) .. "</Accent>"
+	end,
+})
+
+rotationRight:CreateStatus({
+	Name = "Next switch",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local remaining = taskRemaining()
+		if State.task == "Idle" or remaining <= 0 then
+			return "<Muted>waiting</Muted>"
+		end
+		local nextName = nextTaskName()
+		local nextLabel = nextName and (TASK_LABELS[nextName] or nextName) or "-"
+		return string.format("<Warning>%ds</Warning> <Muted>-></Muted> %s", math.ceil(remaining), nextLabel)
+	end,
+})
+
+local sliceProgress = rotationRight:CreateProgress({
+	Name = "Current slice",
+	CurrentValue = 0,
+	Format = function()
+		return string.format("%d%%", math.floor(taskProgress() * 100))
+	end,
+})
+
+task.spawn(function()
+	while true do
+		pcall(function()
+			sliceProgress:Set(taskProgress())
+		end)
+		task.wait(0.25)
+	end
+end)
+
+---------------------------------------------------------------------
+-- Info
+---------------------------------------------------------------------
+local infoLeft = InfoTab:CreateGroupbox({ Name = "Statistics", Side = "Left" })
+local infoRight = InfoTab:CreateGroupbox({ Name = "Controls", Side = "Right" })
+
+infoLeft:CreateLabel({
+	Text = "Session",
+	Update = function()
+		local minutes = math.floor((os.clock() - State.stats.startedAt) / 60)
+		return "Running for: " .. tostring(minutes) .. " min"
+	end,
+})
+
+infoLeft:CreateStatus({
+	Name = "Coins earned",
+	Style = "Row",
+	Update = function()
+		return formatNumber(State.stats.coinsEarned)
+	end,
+})
+
+infoLeft:CreateStatus({
+	Name = "Upgrades bought",
+	Style = "Row",
+	Update = function()
+		return tostring(State.stats.upgrades)
+	end,
+})
+
+infoLeft:CreateStatus({
+	Name = "Walls built",
+	Style = "Row",
+	Update = function()
+		return tostring(attribute("Walls", 0))
+	end,
+})
+
+infoRight:CreateButton({
+	Name = "Stop: disable every task",
+	Style = "Danger",
+	Confirm = true,
+	Callback = function()
+		State.options.autoFarm = false
+		State.options.autoBench = false
+		State.options.autoTreadmill = false
+		State.options.autoSprings = false
+		State.options.autoUpgrades = false
+		stopTask()
+		logger("all tasks stopped")
+	end,
+})
+
+infoRight:CreateParagraph({
+	Title = "How it works",
+	Content = "Farm: teleport to the quarry, spam Fill (about 2 stones per call), then place blocks into free wall slots. "
+		.. "The server rejects some slots, so the script walks the list and remembers rejections. "
+		.. "Gym: bench press through its ProximityPrompt; run by standing on the belt. "
+		.. "The spring only works while it is open (GreatWall.WallBoostEnd). "
+		.. "Upgrades are bought at the altar when the coins are there and the level is unlocked.",
+})
+
+infoRight:CreateStatus({
+	Name = "Task",
+	Style = "Row",
+	Update = function()
+		return TASK_LABELS[State.task] or tostring(State.task)
+	end,
+})
+
+---------------------------------------------------------------------
+-- Public API (console and automation)
+-- Example: GreatWallHub.farm(20); GreatWallHub.option("autoBench", true)
+---------------------------------------------------------------------
+getgenv().GreatWallHub = {
+	State = State,
+	stats = State.stats,
+	debug = State.debug,
+	option = function(name, value)
+		State.options[name] = value
+		return State.options[name]
+	end,
+	stop = stopTask,
+	farm = function(seconds)
+		runTask("Farm", seconds or 30, true)
+	end,
+	bench = function(seconds)
+		runTask("Bench", seconds or 30, true)
+	end,
+	treadmill = function(seconds)
+		runTask("Treadmill", seconds or 30, true)
+	end,
+	springs = function(seconds)
+		runTask("Springs", seconds or 20, true)
+	end,
+	upgrades = function(seconds)
+		runTask("Upgrades", seconds or 15, true)
+	end,
+	fillBag = fillBag,
+	ghostCount = ghostTotal,
+	springsOpen = springsOpen,
+	plan = upgradePlan,
+	unstick = unstick,
+	remaining = taskRemaining,
+	nextTask = nextTaskName,
+	rate = placementRate,
+	rotationTasks = setRotationTasks,
+	window = Window,
+	ui = {
+		autoFarm = toggleAutoFarm,
+		autoBench = toggleAutoBench,
+		autoTreadmill = toggleAutoTreadmill,
+		autoSprings = toggleAutoSprings,
+		autoUpgrades = toggleAutoUpgrades,
+		autopilot = toggleAutopilot,
+	},
+	destroy = function()
+		State.running = false
+		State.options.autoFarm = false
+		State.options.autoBench = false
+		State.options.autoTreadmill = false
+		State.options.autoSprings = false
+		State.options.autoUpgrades = false
+		stopTask()
+		pcall(function()
+			Window:Destroy()
+		end)
+		if getgenv().GreatWallHub and getgenv().GreatWallHub.window == Window then
+			getgenv().GreatWallHub = nil
+		end
+	end,
+}
+
+---------------------------------------------------------------------
+-- Start
+---------------------------------------------------------------------
+Window:LoadAutoload()
+
+-- A restored "Autopilot = true" must also restore its meaning (all tasks on);
+-- config application skips callbacks, so sync it once here.
+if State.options.autopilot then
+	setRotationTasks(true)
+	pcall(function()
+		toggleAutopilot:Set(true, true)
+	end)
+end
+
+task.spawn(schedulerLoop)
+
+logger("loaded. RightControl - show/hide the window")
+pcall(function()
+	Window:Notify({
+		Title = "Great Wall Hub",
+		Content = "Started. RightControl hides the window.",
+		Type = "Success",
+		Duration = 6,
+	})
+end)
