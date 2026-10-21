@@ -1,0 +1,1861 @@
+--!nonstrict
+--[[
+	Collect Cards Hub
+	-----------------
+	A single-file helper for [Collect Cards] with five tools:
+
+	  1. Tycoon  - buys your shop upgrade pads for you (instant by default, walking if needed)
+	  2. Shop    - buys card packs and Building furniture, with pick-lists and a spend priority
+	  3. Tower   - plays the Battle Tower for you on the tower you choose
+	  4. Packs   - opens every pack in your inventory
+	  5. Dupes   - sells extra copies of cards you already own
+
+	Press RightControl to hide or show the window.
+	Every switch is off when the script starts, so nothing happens until you turn it on.
+	Settings, theme and toggles are saved in the CollectCardsHub folder.
+]]
+
+----------------------------------------------------------------------
+-- UI library
+----------------------------------------------------------------------
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, lib = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
+		Airflow = lib
+		break
+	end
+end
+if not Airflow then
+	error("[Collect Cards Hub] The UI library could not be loaded. Check your internet connection and try again.")
+end
+
+----------------------------------------------------------------------
+-- Game access
+----------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+local LocalPlayer = Players.LocalPlayer
+
+local Modules = ReplicatedStorage:WaitForChild("Modules", 30)
+local Gameplay = Modules and Modules:WaitForChild("Gameplay", 30)
+local Game = Gameplay and require(Gameplay:WaitForChild("TGC_Client", 30))
+if not Game then
+	error("[Collect Cards Hub] This script only works in Collect Cards.")
+end
+
+----------------------------------------------------------------------
+-- Small helpers
+----------------------------------------------------------------------
+
+local function money(value)
+	if type(value) ~= "number" then
+		return "-"
+	end
+	local text = tostring(math.floor(value))
+	local grouped = text:reverse():gsub("(%d%d%d)", "%1 "):reverse()
+	return (grouped:gsub("^%s+", ""))
+end
+
+local function gameState()
+	return Game.State
+end
+
+local function catalog()
+	return Game.Catalog
+end
+
+local function vendor()
+	return Game.Vendor
+end
+
+local function cash()
+	local s = gameState()
+	return (s and tonumber(s.cash)) or 0
+end
+
+local function busy()
+	local s = gameState()
+	return Game.Busy == true or (s ~= nil and s.pending == true)
+end
+
+local function waitIdle(timeout)
+	local deadline = os.clock() + (timeout or 10)
+	while busy() and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	return not busy()
+end
+
+--- Sends one purchase/menu action and waits for the game to answer it.
+--- Returns the answer and a short reason when it failed.
+local function runAction(action, payload, timeout)
+	if busy() then
+		waitIdle(timeout)
+	end
+	if busy() then
+		return nil, "The game is busy"
+	end
+
+	local answer
+	local connection = Game.CommandFinished.Event:Connect(function(finishedAction, finishedAnswer)
+		if finishedAction == action then
+			answer = finishedAnswer
+		end
+	end)
+
+	local sent = Game.Command(action, payload)
+	if not sent then
+		connection:Disconnect()
+		return nil, "Not ready yet"
+	end
+
+	local deadline = os.clock() + (timeout or 10)
+	while not answer and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	connection:Disconnect()
+
+	if not answer then
+		return nil, "No answer from the game"
+	end
+	return answer, answer.code or answer.status
+end
+
+local function ask(action, payload)
+	local ok, answer = pcall(function()
+		return Game.Query(action, payload)
+	end)
+	if not ok or type(answer) ~= "table" then
+		return nil
+	end
+	return answer
+end
+
+local function flatDistance(a, b)
+	return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
+
+----------------------------------------------------------------------
+-- Moving to a pad
+----------------------------------------------------------------------
+
+--- Puts the character straight on the pad. Instant, no walking.
+local function jumpTo(position)
+	local character = LocalPlayer.Character
+	if not character then
+		return false
+	end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+	local ok = pcall(function()
+		character:PivotTo(CFrame.new(position + Vector3.new(0, 4, 0)))
+	end)
+	if not ok then
+		return false
+	end
+	task.wait(0.15)
+	return flatDistance(root.Position, position) < 5
+end
+
+--- Walks the character to the pad along a path. Slower, but always allowed.
+local function walkTo(targetPosition, timeout)
+	timeout = timeout or 20
+	local character = LocalPlayer.Character
+	if not character then
+		return false, -1
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root) or humanoid.Health <= 0 then
+		return false, -1
+	end
+
+	local waypoints
+	local ok = pcall(function()
+		local path = PathfindingService:CreatePath({
+			AgentRadius = 2,
+			AgentHeight = 5,
+			AgentCanJump = true,
+			WaypointSpacing = 5,
+		})
+		path:ComputeAsync(root.Position, targetPosition)
+		if path.Status == Enum.PathStatus.Success then
+			waypoints = path:GetWaypoints()
+		end
+	end)
+	if not ok or not waypoints then
+		waypoints = { { Position = targetPosition, Action = Enum.PathWaypointAction.Walk } }
+	end
+
+	local deadline = os.clock() + timeout
+	for index, waypoint in ipairs(waypoints) do
+		if index > 1 then
+			if waypoint.Action == Enum.PathWaypointAction.Jump then
+				humanoid.Jump = true
+			end
+			humanoid:MoveTo(waypoint.Position)
+			local stepDeadline = os.clock() + 3.5
+			while os.clock() < stepDeadline and os.clock() < deadline do
+				if flatDistance(root.Position, waypoint.Position) < 2.5 then
+					break
+				end
+				task.wait(0.08)
+			end
+			if os.clock() >= deadline then
+				break
+			end
+		end
+	end
+
+	local finishDeadline = os.clock() + 4
+	while os.clock() < finishDeadline and os.clock() < deadline do
+		if flatDistance(root.Position, targetPosition) < 1.6 then
+			break
+		end
+		humanoid:MoveTo(targetPosition)
+		task.wait(0.08)
+	end
+	humanoid:MoveTo(root.Position)
+
+	local distance = flatDistance(root.Position, targetPosition)
+	return distance < 3.5, distance
+end
+
+----------------------------------------------------------------------
+-- Window
+----------------------------------------------------------------------
+
+-- Colours taken from robscript.com: near-black surfaces and the pink from the logo.
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+local Window = Airflow:CreateWindow({
+	Name = "Collect Cards Hub",
+	LoadingSubtitle = "tycoon, shop, tower",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "CollectCardsHub" },
+	Home = {
+		Title = "Collect Cards Hub",
+		Welcome = "Welcome back,",
+		Tier = "v1.1",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogBox = LogTab:CreateGroupbox({ Name = "What the script is doing", Side = "Left" })
+local Log = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+local function log(message, color)
+	Log:Push(tostring(message), color)
+end
+
+local function notify(title, content, kind)
+	pcall(function()
+		Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = 4 })
+	end)
+end
+
+----------------------------------------------------------------------
+-- Settings (the switches write here, the loops read from here)
+----------------------------------------------------------------------
+
+local Settings = {
+	-- Tycoon
+	tycoonAuto = false,
+	tycoonMethod = "Teleport", -- "Teleport" | "Walk" | "Teleport then walk"
+	tycoonOrder = "Cheapest", -- "Cheapest" | "Game order"
+	tycoonReserve = 0,
+	tycoonDelay = 0.5,
+
+	-- Shop
+	shopPriority = "Furniture", -- "Furniture" | "Packs" | "Balanced"
+	shopReserve = 0,
+	shopBuyFurniture = false,
+	shopBuyPacks = false,
+	shopPackFilter = {},
+	shopFurnitureFilter = {},
+
+	-- Tower
+	battleAuto = false,
+	battleTower = "EmberOrigins",
+	battleDelay = 1.2,
+	battleStopOnLoss = true,
+	battleStopFloor = 0,
+	battleAutoDeck = true,
+	battleClaimPacks = true,
+
+	-- Packs
+	packsAuto = false,
+	packsDelay = 0.8,
+	packsFilter = {},
+	packsPerBatch = 3,
+
+	-- Dupes
+	dupesAuto = false,
+	dupesKeep = 1,
+	dupesMinValue = 0,
+	dupesRarities = {},
+	dupesDryRun = true,
+	dupesSkipDeck = true,
+}
+
+-- A switching element starts a loop, and stopping it (or running the script
+-- again) ends that loop cleanly.
+getgenv().__CollectCardsHubGen = (getgenv().__CollectCardsHubGen or 0) + 1
+local SCRIPT_GENERATION = getgenv().__CollectCardsHubGen
+
+local function scriptAlive()
+	return getgenv().__CollectCardsHubGen == SCRIPT_GENERATION
+end
+
+local runners = {}
+local function runner(name, step)
+	runners[name] = runners[name] or { generation = 0 }
+	local entry = runners[name]
+	return function(enabled)
+		entry.generation += 1
+		local myGeneration = entry.generation
+		if not enabled then
+			return
+		end
+		task.spawn(function()
+			while entry.generation == myGeneration and scriptAlive() do
+				local ok, err = pcall(step)
+				if not ok then
+					log("<Error>" .. name .. " stopped: " .. tostring(err) .. "</Error>")
+				end
+				if entry.generation ~= myGeneration or not scriptAlive() then
+					break
+				end
+				task.wait(0.25)
+			end
+		end)
+	end
+end
+
+local function runOnce(name, step)
+	task.spawn(function()
+		local ok, err = pcall(step)
+		if not ok then
+			log("<Error>" .. name .. ": " .. tostring(err) .. "</Error>")
+		end
+	end)
+end
+
+----------------------------------------------------------------------
+-- 1. TYCOON: buying upgrade pads
+----------------------------------------------------------------------
+
+local padCooldown = {}
+
+local function myPads()
+	local result = {}
+	local lobby = workspace:FindFirstChild("Lobby")
+	local plots = lobby and lobby:FindFirstChild("Plots")
+	if not plots then
+		return result
+	end
+	for _, plot in ipairs(plots:GetChildren()) do
+		local tycoon = plot:FindFirstChild("Tycoon")
+		if tycoon then
+			for _, model in ipairs(tycoon:GetChildren()) do
+				local button = model:FindFirstChild("Button", true)
+				if
+					button
+					and button:IsA("BasePart")
+					and button:GetAttribute("TycoonOwner") == LocalPlayer.UserId
+					and button:GetAttribute("TycoonAvailable") == true
+				then
+					table.insert(result, {
+						name = model.Name,
+						button = button,
+						id = button:GetAttribute("TycoonUpgrade"),
+						price = tonumber(button:GetAttribute("TycoonPrice")) or 0,
+						floor = tonumber(button:GetAttribute("TycoonFloor")) or 1,
+					})
+				end
+			end
+		end
+	end
+	return result
+end
+
+--- Standing on a pad is enough: the game buys it by itself. If it does not,
+--- we ask for the upgrade directly. Returns "Bought" or a short reason.
+local function usePad(pad)
+	if busy() then
+		waitIdle(8)
+	end
+
+	local deadline = os.clock() + 2
+	while os.clock() < deadline do
+		local button = pad.button
+		if not button or not button.Parent or button:GetAttribute("TycoonAvailable") ~= true then
+			return "Bought"
+		end
+		task.wait(0.1)
+	end
+
+	local answer, reason = runAction("BuyTycoonUpgrade", {
+		upgradeId = pad.id,
+		floor = pad.floor,
+	}, 12)
+
+	if answer and answer.status == "Completed" then
+		return "Bought"
+	end
+	return tostring(reason)
+end
+
+--- One attempt to buy the next upgrade we can afford.
+local function buyNextUpgrade()
+	if not gameState() then
+		return "Still loading your shop"
+	end
+
+	local pads = myPads()
+	if #pads == 0 then
+		return "No upgrades left to buy"
+	end
+
+	if Settings.tycoonOrder == "Cheapest" then
+		table.sort(pads, function(a, b)
+			return a.price < b.price
+		end)
+	end
+
+	local affordable = 0
+	local cheapest
+	for _, pad in ipairs(pads) do
+		if pad.price <= cash() - Settings.tycoonReserve then
+			affordable += 1
+			cheapest = cheapest or pad
+		end
+	end
+	if affordable == 0 then
+		table.sort(pads, function(a, b)
+			return a.price < b.price
+		end)
+		return "Waiting for cash (next one costs " .. money(pads[1].price) .. ")"
+	end
+
+	for _, pad in ipairs(pads) do
+		local blockedUntil = padCooldown[pad.id]
+		if blockedUntil and os.clock() < blockedUntil then
+			continue
+		end
+		if pad.price > cash() - Settings.tycoonReserve then
+			continue
+		end
+
+		local reason
+
+		if Settings.tycoonMethod ~= "Walk" then
+			log("Going to <Accent>" .. tostring(pad.name) .. "</Accent> (" .. money(pad.price) .. ")")
+			if jumpTo(pad.button.Position) then
+				reason = usePad(pad)
+				if reason == "Bought" then
+					return "Bought " .. tostring(pad.name)
+				end
+				if Settings.tycoonMethod == "Teleport" then
+					padCooldown[pad.id] = os.clock() + 10
+					return "Could not buy " .. tostring(pad.name) .. " (" .. reason .. ")"
+				end
+				log("<Warning>" .. reason .. " - walking there instead</Warning>")
+			elseif Settings.tycoonMethod == "Teleport" then
+				padCooldown[pad.id] = os.clock() + 10
+				return "Could not reach " .. tostring(pad.name)
+			end
+		else
+			log("Walking to <Accent>" .. tostring(pad.name) .. "</Accent> (" .. money(pad.price) .. ")")
+		end
+
+		local reached, distance = walkTo(pad.button.Position, 22)
+		if not reached then
+			padCooldown[pad.id] = os.clock() + 20
+			return "Could not walk to " .. tostring(pad.name) .. " (" .. string.format("%.1f", distance) .. " studs away)"
+		end
+
+		reason = usePad(pad)
+		if reason == "Bought" then
+			return "Bought " .. tostring(pad.name)
+		end
+
+		padCooldown[pad.id] = os.clock() + 15
+		return "Could not buy " .. tostring(pad.name) .. " (" .. reason .. ")"
+	end
+
+	return "All affordable pads are cooling down"
+end
+
+local tycoonAutoStep
+tycoonAutoStep = runner("Tycoon", function()
+	if not Settings.tycoonAuto then
+		return
+	end
+	local outcome = buyNextUpgrade()
+	if string.find(outcome, "Waiting for cash", 1, true) then
+		task.wait(2)
+	elseif string.find(outcome, "cooling down", 1, true) then
+		task.wait(2)
+	elseif string.find(outcome, "Could not", 1, true) then
+		log("<Warning>" .. outcome .. "</Warning>")
+		task.wait(1.5)
+	elseif string.find(outcome, "No upgrades", 1, true) then
+		log("<Muted>" .. outcome .. "</Muted>")
+		Settings.tycoonAuto = false
+		tycoonAutoStep(false)
+	else
+		log("<Success>" .. outcome .. "</Success>")
+		task.wait(Settings.tycoonDelay)
+	end
+end)
+
+----------------------------------------------------------------------
+-- 2. SHOP: packs and furniture
+----------------------------------------------------------------------
+
+local function packAllowed(id)
+	if next(Settings.shopPackFilter) == nil then
+		return true
+	end
+	return Settings.shopPackFilter[id] == true
+end
+
+local function furnitureAllowed(id)
+	if next(Settings.shopFurnitureFilter) == nil then
+		return true
+	end
+	return Settings.shopFurnitureFilter[id] == true
+end
+
+local function buyCheapestPack()
+	local cat, ven, s = catalog(), vendor(), gameState()
+	if not (cat and ven and s and cat.packs and ven.offers) then
+		return false
+	end
+	if s.capacity and s.capacity.ownedPacks >= s.capacity.packs then
+		log("<Warning>Pack storage is full</Warning>")
+		return false
+	end
+
+	local best, bestPrice
+	for id, offer in pairs(ven.offers) do
+		local definition = cat.packs[id]
+		if definition and packAllowed(id) and type(offer.price) == "number" and (offer.remaining or 0) >= 1 then
+			if offer.price <= cash() - Settings.shopReserve then
+				if not bestPrice or offer.price < bestPrice then
+					best, bestPrice = id, offer.price
+				end
+			end
+		end
+	end
+	if not best then
+		return false
+	end
+
+	local answer, reason = runAction("BuyPack", {
+		quantity = 1,
+		skuId = best,
+		offerId = ven.offers[best].offerId,
+	}, 12)
+
+	if answer and answer.status == "Completed" then
+		local entry = cat.packs[best]
+		local name = ((entry.definition or entry).name or best)
+		log("<Success>Pack: " .. name .. " for " .. money(bestPrice) .. "</Success>")
+		Game.Refresh()
+		return true
+	end
+	log("<Warning>Pack " .. tostring(best) .. ": " .. tostring(reason) .. "</Warning>")
+	return false
+end
+
+local function buyCheapestFurniture()
+	local cat, ven = catalog(), vendor()
+	if not (cat and ven and cat.furniture and ven.furniture) then
+		return false
+	end
+
+	local placed = 0
+	if gameState() and gameState().furniture then
+		for _ in pairs(gameState().furniture) do
+			placed += 1
+		end
+	end
+	if placed >= (tonumber(cat.maxFurniture) or 400) then
+		log("<Warning>You own the maximum amount of furniture</Warning>")
+		return false
+	end
+
+	local best, bestPrice
+	for id, offer in pairs(ven.furniture) do
+		local definition = cat.furniture[id]
+		if definition and furnitureAllowed(id) and type(offer.price) == "number" and (offer.remaining or 0) >= 1 then
+			if offer.price <= cash() - Settings.shopReserve then
+				if not bestPrice or offer.price < bestPrice then
+					best, bestPrice = id, offer.price
+				end
+			end
+		end
+	end
+	if not best then
+		return false
+	end
+
+	local answer, reason = runAction("BuyFurniture", {
+		definitionId = best,
+		offerId = ven.furniture[best].offerId,
+	}, 12)
+
+	if answer and answer.status == "Completed" then
+		local entry = cat.furniture[best]
+		local name = ((entry.definition or entry).name or best)
+		log("<Success>Furniture: " .. name .. " for " .. money(bestPrice) .. "</Success>")
+		Game.Refresh()
+		return true
+	end
+	log("<Warning>Furniture " .. tostring(best) .. ": " .. tostring(reason) .. "</Warning>")
+	return false
+end
+
+local shopFlip = false
+local shopAutoStep
+shopAutoStep = runner("Shop", function()
+	if not (Settings.shopBuyPacks or Settings.shopBuyFurniture) then
+		return
+	end
+
+	local kinds = {}
+	if Settings.shopBuyFurniture then
+		table.insert(kinds, "Furniture")
+	end
+	if Settings.shopBuyPacks then
+		table.insert(kinds, "Packs")
+	end
+
+	if #kinds == 2 then
+		if Settings.shopPriority == "Packs" then
+			kinds = { "Packs", "Furniture" }
+		elseif Settings.shopPriority == "Balanced" then
+			shopFlip = not shopFlip
+			kinds = shopFlip and { "Furniture", "Packs" } or { "Packs", "Furniture" }
+		end
+	end
+
+	for _, kind in ipairs(kinds) do
+		if kind == "Furniture" then
+			if buyCheapestFurniture() then
+				task.wait(0.3)
+				return
+			end
+		elseif kind == "Packs" then
+			if buyCheapestPack() then
+				task.wait(0.3)
+				return
+			end
+		end
+	end
+end)
+
+--- Keeps the shop loop running while at least one category is switched on.
+local function syncShop()
+	shopAutoStep(Settings.shopBuyPacks or Settings.shopBuyFurniture)
+end
+
+----------------------------------------------------------------------
+-- 3. TOWER: auto battle
+----------------------------------------------------------------------
+
+local TOWERS = {
+	{ id = "EmberOrigins", name = "Ember Origins" },
+	{ id = "HydraAwakening", name = "Hydra Awakening" },
+	{ id = "PocketPandemonium", name = "Pocket Pandemonium" },
+	{ id = "RealmCollision", name = "Realm Collision" },
+	{ id = "PrismaticWonders", name = "Prismic Wonders" },
+}
+
+local battleStats = {
+	floor = 0,
+	runs = 0,
+	wins = 0,
+	losses = 0,
+	lastRunId = nil,
+	stuckAttempts = 0,
+	deckReady = false,
+	deckAt = 0,
+}
+
+local function ensureDeck()
+	local deck = ask("GetBattleDeck")
+	if not deck or deck.status ~= "Completed" or not deck.battle then
+		return false
+	end
+	if #(deck.battle.deck or {}) > 0 then
+		return true
+	end
+
+	local cards = deck.cards or {}
+	table.sort(cards, function(a, b)
+		return (tonumber(a.score) or 0) > (tonumber(b.score) or 0)
+	end)
+	local ids = {}
+	for index = 1, math.min(4, #cards) do
+		ids[index] = cards[index].assetId
+	end
+	if #ids == 0 then
+		return false
+	end
+
+	local answer = runAction("SaveBattleDeck", { assetIds = ids }, 10)
+	if answer and answer.status == "Completed" then
+		log("<Success>Deck filled with your best " .. #ids .. " cards</Success>")
+		return true
+	end
+	return false
+end
+
+local function collectTowerRewards()
+	local answer = runAction("ClaimBattlePacks", {}, 10)
+	if answer and answer.status == "Completed" and answer.result and answer.result.packIds and #answer.result.packIds > 0 then
+		log("<Success>Collected " .. #answer.result.packIds .. " tower reward pack(s)</Success>")
+	end
+end
+
+local battleAutoStep
+battleAutoStep = runner("Tower", function()
+	if not Settings.battleAuto then
+		return
+	end
+
+	if Settings.battleStopFloor > 0 and battleStats.floor >= Settings.battleStopFloor then
+		log("<Warning>Reached floor " .. Settings.battleStopFloor .. ", battle stopped</Warning>")
+		Settings.battleAuto = false
+		battleAutoStep(false)
+		return
+	end
+
+	if busy() then
+		waitIdle(10)
+	end
+
+	if Settings.battleAutoDeck and (not battleStats.deckReady or (os.clock() - battleStats.deckAt) > 60) then
+		battleStats.deckReady = ensureDeck()
+		battleStats.deckAt = os.clock()
+	end
+
+	local run = ask("StartBattle", { towerId = Settings.battleTower, continue = true })
+	if not run then
+		log("<Error>No answer from the tower</Error>")
+		return
+	end
+
+	if run.status ~= "Completed" or not run.runId then
+		local code = tostring(run.code or run.status)
+
+		if code == "BattleActive" then
+			-- A battle is still open somewhere, usually left over from a reload.
+			-- Cancel the one we know about; if that fails, respawn clears it.
+			battleStats.stuckAttempts = (battleStats.stuckAttempts or 0) + 1
+
+			if battleStats.lastRunId then
+				ask("CancelBattle", { runId = battleStats.lastRunId })
+				battleStats.lastRunId = nil
+				log("<Warning>Cancelling the old battle</Warning>")
+			elseif battleStats.stuckAttempts >= 3 then
+				log("<Warning>Resetting the stuck battle</Warning>")
+				local character = LocalPlayer.Character
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				if humanoid then
+					humanoid.Health = 0
+				end
+				battleStats.stuckAttempts = 0
+			end
+
+			task.wait(2)
+			return
+		end
+
+		log("<Error>Tower said: " .. code .. "</Error>")
+		Settings.battleAuto = false
+		battleAutoStep(false)
+		return
+	end
+
+	battleStats.stuckAttempts = 0
+	battleStats.lastRunId = run.runId
+	battleStats.floor = tonumber(run.floor) or battleStats.floor
+
+	local waitTime = math.max(tonumber(run.minSeconds) or 1.8, 1.4) + Settings.battleDelay
+	task.wait(waitTime)
+
+	local answer, reason = runAction("FinishBattle", { runId = run.runId }, 15)
+	battleStats.lastRunId = nil
+
+	if not answer then
+		log("<Warning>Battle did not finish: " .. tostring(reason) .. "</Warning>")
+		ask("CancelBattle", { runId = run.runId })
+		return
+	end
+
+	if answer.status ~= "Completed" then
+		log("<Warning>Battle: " .. tostring(answer.code or answer.status) .. "</Warning>")
+		return
+	end
+
+	local result = answer.result or {}
+	battleStats.runs += 1
+	local earned = tonumber(result.cash) or 0
+
+	if result.winner == "Player" then
+		battleStats.wins += 1
+		battleStats.floor = tonumber(result.nextFloor) or battleStats.floor
+		log("<Success>Floor " .. tostring(result.floor) .. " cleared, +" .. money(earned) .. "</Success>")
+	else
+		battleStats.losses += 1
+		log("<Warning>Floor " .. tostring(result.floor) .. " lost</Warning>")
+		if Settings.battleStopOnLoss then
+			Settings.battleAuto = false
+			battleAutoStep(false)
+			notify("Auto battle", "Lost on floor " .. tostring(result.floor) .. ", stopped", "Warning")
+			return
+		end
+	end
+
+	if Settings.battleClaimPacks then
+		if (result.packIds and #result.packIds > 0) or (result.winner == "Player" and battleStats.runs % 5 == 0) then
+			collectTowerRewards()
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- 4. PACKS: opening
+----------------------------------------------------------------------
+
+local packStats = { opened = 0, cards = 0, duplicates = 0 }
+
+local function packTypeAllowed(id)
+	if next(Settings.packsFilter) == nil then
+		return true
+	end
+	return Settings.packsFilter[id] == true
+end
+
+local packsAutoStep
+packsAutoStep = runner("Packs", function()
+	if not Settings.packsAuto then
+		return
+	end
+	local s = gameState()
+	if not s or not s.capacity then
+		return
+	end
+
+	local inventory = ask("GetInventory", { kind = "Pack", limit = 100, offset = 0 })
+	if not inventory or inventory.status ~= "Completed" or not inventory.result then
+		return
+	end
+
+	local owned = {}
+	for _, item in ipairs(inventory.result.items or {}) do
+		if item.kind == "Pack" and packTypeAllowed(item.skuId) then
+			table.insert(owned, item)
+		end
+	end
+	if #owned == 0 then
+		return
+	end
+
+	if s.capacity.ownedCards + 3 > s.capacity.cards then
+		log("<Warning>Card storage is full, packs stay closed</Warning>")
+		return
+	end
+
+	local batch = {}
+	for index = 1, math.min(Settings.packsPerBatch, #owned) do
+		batch[index] = owned[index].id
+	end
+
+	local answer, reason = runAction("OpenPack", (#batch == 1) and { assetId = batch[1] } or { assetIds = batch }, 20)
+	if answer and answer.status == "Completed" then
+		local cards = (answer.result and answer.result.cards) or {}
+		packStats.opened += #batch
+		packStats.cards += #cards
+
+		local seen, duplicates = {}, 0
+		for _, card in ipairs(cards) do
+			local id = card.definitionId or card.id
+			if seen[id] then
+				duplicates += 1
+			else
+				seen[id] = true
+			end
+		end
+		packStats.duplicates += duplicates
+
+		log("<Success>Opened " .. #batch .. " pack(s): " .. #cards .. " cards"
+			.. (duplicates > 0 and (", " .. duplicates .. " duplicates") or "") .. "</Success>")
+		Game.Refresh()
+	else
+		log("<Warning>Could not open a pack: " .. tostring(reason) .. "</Warning>")
+	end
+
+	task.wait(Settings.packsDelay)
+end)
+
+----------------------------------------------------------------------
+-- 5. DUPES: selling spare copies
+----------------------------------------------------------------------
+
+local dupeStats = { sold = 0, earned = 0, batches = 0 }
+
+local function allCards()
+	local all = {}
+	local offset = 0
+	for _ = 1, 40 do
+		local answer = ask("GetInventory", { kind = "Card", limit = 100, offset = offset })
+		if not answer or answer.status ~= "Completed" or not answer.result then
+			break
+		end
+		for _, item in ipairs(answer.result.items or {}) do
+			table.insert(all, item)
+		end
+		local nextOffset = answer.result.nextOffset
+		if type(nextOffset) ~= "number" or nextOffset <= offset then
+			break
+		end
+		offset = nextOffset
+	end
+	return all
+end
+
+local function rarityAllowed(rarity)
+	if next(Settings.dupesRarities) == nil then
+		return true
+	end
+	return Settings.dupesRarities[rarity] == true
+end
+
+local function spareCopies()
+	local cat = catalog()
+	if not cat or not cat.cards then
+		return {}
+	end
+
+	local inDeck = {}
+	if Settings.dupesSkipDeck and gameState() and gameState().battle and gameState().battle.deck then
+		for _, assetId in ipairs(gameState().battle.deck) do
+			inDeck[assetId] = true
+		end
+	end
+
+	local groups = {}
+	for _, item in ipairs(allCards()) do
+		if item.kind == "Card" and item.state == "Available" and not item.favorite and item.grade == nil then
+			groups[item.definitionId] = groups[item.definitionId] or {}
+			table.insert(groups[item.definitionId], item)
+		end
+	end
+
+	local candidates = {}
+	for definitionId, items in pairs(groups) do
+		local definition = cat.cards[definitionId]
+		if
+			#items > Settings.dupesKeep
+			and definition
+			and definition.dealerEnabled ~= false
+			and type(definition.dealerValue) == "number"
+			and definition.dealerValue >= Settings.dupesMinValue
+			and rarityAllowed(definition.rarity)
+		then
+			table.sort(items, function(a, b)
+				return tostring(a.id) < tostring(b.id)
+			end)
+			for index = Settings.dupesKeep + 1, #items do
+				if not inDeck[items[index].id] then
+					table.insert(candidates, items[index].id)
+				end
+				if #candidates >= 50 then
+					break
+				end
+			end
+		end
+		if #candidates >= 50 then
+			break
+		end
+	end
+	return candidates
+end
+
+local function sellBatch()
+	local ids = spareCopies()
+	if #ids == 0 then
+		return 0
+	end
+
+	local batch = {}
+	for index = 1, math.min(25, #ids) do
+		batch[index] = ids[index]
+	end
+
+	if Settings.dupesDryRun then
+		log("[dry run] Would sell " .. #batch .. " spare card(s)")
+		task.wait(1)
+		return 0
+	end
+
+	local quote = ask("QuoteDealer", { assetIds = batch })
+	if not quote or quote.status ~= "Completed" or type(quote.quoteId) ~= "string" then
+		log("<Warning>The dealer is not buying right now</Warning>")
+		return 0
+	end
+
+	local answer, reason = runAction("SellCards", { confirm = true, quoteId = quote.quoteId }, 15)
+	if answer and answer.status == "Completed" then
+		local received = tonumber(answer.result and answer.result.received) or 0
+		dupeStats.sold += #batch
+		dupeStats.earned += received
+		dupeStats.batches += 1
+		log("<Success>Sold " .. #batch .. " spare card(s) for " .. money(received) .. "</Success>")
+		Game.Refresh()
+		return #batch
+	end
+
+	log("<Warning>Could not sell: " .. tostring(reason) .. "</Warning>")
+	return 0
+end
+
+local dupesAutoStep
+dupesAutoStep = runner("Dupes", function()
+	if not Settings.dupesAuto then
+		return
+	end
+	sellBatch()
+	task.wait(0.6)
+end)
+
+----------------------------------------------------------------------
+-- TABS
+----------------------------------------------------------------------
+
+----------------------------------------------------------------------
+-- TYCOON
+----------------------------------------------------------------------
+local TycoonTab = Window:CreateTab({ Name = "Tycoon", Icon = "building-2" })
+local TycoonMain = TycoonTab:CreateGroupbox({ Name = "Auto buy", Side = "Left" })
+local TycoonInfo = TycoonTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+TycoonMain:CreateToggle({
+	Name = "Auto buy upgrades",
+	Desc = "Buys the next upgrade pad in your shop as soon as you can afford it",
+	Flag = "TycoonAuto",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.tycoonAuto = on
+		tycoonAutoStep(on)
+		if on then
+			log("Auto buy is on (" .. Settings.tycoonMethod .. ")")
+		end
+	end,
+})
+
+TycoonMain:CreateDropdown({
+	Name = "How to reach the pad",
+	Desc = "Teleport is instant; walking is slower but never fails",
+	Options = { "Teleport", "Walk", "Teleport then walk" },
+	CurrentOption = "Teleport",
+	Flag = "TycoonMethod",
+	Callback = function(value)
+		Settings.tycoonMethod = type(value) == "table" and (value[1] or "Teleport") or value or "Teleport"
+	end,
+})
+
+TycoonMain:CreateDropdown({
+	Name = "Buy order",
+	Options = { "Cheapest", "Game order" },
+	CurrentOption = "Cheapest",
+	Flag = "TycoonOrder",
+	Callback = function(value)
+		Settings.tycoonOrder = type(value) == "table" and (value[1] or "Cheapest") or value or "Cheapest"
+	end,
+})
+
+TycoonMain:CreateSlider({
+	Name = "Keep this much cash",
+	Desc = "Never spend below this balance",
+	Range = { 0, 500000 },
+	Increment = 100,
+	Suffix = " $",
+	CurrentValue = 0,
+	Flag = "TycoonReserve",
+	Callback = function(value)
+		Settings.tycoonReserve = value
+	end,
+})
+
+TycoonMain:CreateSlider({
+	Name = "Pause between buys",
+	Range = { 0.2, 5 },
+	Increment = 0.1,
+	Suffix = " s",
+	CurrentValue = 0.5,
+	Flag = "TycoonDelay",
+	Callback = function(value)
+		Settings.tycoonDelay = value
+	end,
+})
+
+TycoonMain:CreateButton({
+	Name = "Buy the next upgrade now",
+	Icon = "hand-coins",
+	Style = "Primary",
+	Callback = function()
+		runOnce("Tycoon once", function()
+			log(buyNextUpgrade())
+		end)
+	end,
+})
+
+TycoonMain:CreateButton({
+	Name = "Forget skipped pads",
+	Icon = "refresh-cw",
+	Desc = "Try pads again that were skipped earlier",
+	Callback = function()
+		table.clear(padCooldown)
+		log("Skipped pads will be tried again")
+	end,
+})
+
+TycoonInfo:CreateStatus({
+	Name = "Pads to buy",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local pads = myPads()
+		if #pads == 0 then
+			return "<Muted>none left</Muted>"
+		end
+		table.sort(pads, function(a, b)
+			return a.price < b.price
+		end)
+		return #pads .. " left, from " .. money(pads[1].price)
+	end,
+})
+
+TycoonInfo:CreateStatus({
+	Name = "Next upgrade",
+	Style = "Row",
+	Update = function()
+		local pads = myPads()
+		if #pads == 0 then
+			return "<Muted>-</Muted>"
+		end
+		table.sort(pads, function(a, b)
+			return a.price < b.price
+		end)
+		return tostring(pads[1].name) .. " - " .. money(pads[1].price)
+	end,
+})
+
+TycoonInfo:CreateStatus({
+	Name = "Shop floors",
+	Style = "Row",
+	Update = function()
+		local s = gameState()
+		local floors = s and s.tycoon and s.tycoon.floors
+		return floors and tostring(floors) or "<Muted>-</Muted>"
+	end,
+})
+
+TycoonInfo:CreateParagraph({
+	Title = "How this works",
+	Content = "The script looks at the buy pads standing in your shop, picks the next one you can afford and goes there. "
+		.. "By default it jumps straight onto the pad, which is instant; the game then buys the upgrade. "
+		.. "If the game will not accept the jump, pick \"Teleport then walk\" or \"Walk\" and the character will go there on foot. "
+		.. "Pads that fail are skipped for a few seconds so the script does not get stuck on one of them.",
+})
+
+----------------------------------------------------------------------
+-- SHOP
+----------------------------------------------------------------------
+local ShopTab = Window:CreateTab({ Name = "Shop", Icon = "shopping-cart" })
+local ShopPacks = ShopTab:CreateGroupbox({ Name = "Card packs", Side = "Left" })
+local ShopBuilding = ShopTab:CreateGroupbox({ Name = "Building (furniture)", Side = "Right" })
+local ShopPriority = ShopTab:CreateGroupbox({ Name = "Where money goes first", Side = "Right" })
+
+ShopPacks:CreateToggle({
+	Name = "Auto buy packs",
+	Desc = "Buys the cheapest pack you allow below",
+	Flag = "ShopAutoPacks",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.shopBuyPacks = on
+		syncShop()
+		log(on and "Auto buy packs is on" or "Auto buy packs is off")
+	end,
+})
+
+local ShopPackFilter = ShopPacks:CreateDropdown({
+	Name = "Packs allowed",
+	Desc = "Leave empty to allow every pack",
+	Options = {},
+	MultipleOptions = true,
+	Searchable = true,
+	Flag = "ShopPackFilter",
+	Callback = function(selected)
+		local map = {}
+		for _, label in ipairs(selected or {}) do
+			local id = tostring(label):match("%[([^%]]+)%]$")
+			if id then
+				map[id] = true
+			end
+		end
+		Settings.shopPackFilter = map
+	end,
+})
+
+ShopBuilding:CreateToggle({
+	Name = "Auto buy furniture",
+	Desc = "Buys the cheapest item you allow below",
+	Flag = "ShopAutoFurniture",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.shopBuyFurniture = on
+		syncShop()
+		log(on and "Auto buy furniture is on" or "Auto buy furniture is off")
+	end,
+})
+
+local ShopFurnitureFilter = ShopBuilding:CreateDropdown({
+	Name = "Furniture allowed",
+	Desc = "Leave empty to allow every item",
+	Options = {},
+	MultipleOptions = true,
+	Searchable = true,
+	Flag = "ShopFurnitureFilter",
+	Callback = function(selected)
+		local map = {}
+		for _, label in ipairs(selected or {}) do
+			local id = tostring(label):match("%[([^%]]+)%]$")
+			if id then
+				map[id] = true
+			end
+		end
+		Settings.shopFurnitureFilter = map
+	end,
+})
+
+ShopPriority:CreateDropdown({
+	Name = "Spend on first",
+	Desc = "Only matters when both categories are on",
+	Options = { "Furniture", "Packs", "Balanced" },
+	CurrentOption = "Furniture",
+	Flag = "ShopPriority",
+	Callback = function(value)
+		Settings.shopPriority = type(value) == "table" and (value[1] or "Furniture") or value or "Furniture"
+	end,
+})
+
+ShopPriority:CreateSlider({
+	Name = "Keep this much cash",
+	Range = { 0, 500000 },
+	Increment = 100,
+	Suffix = " $",
+	CurrentValue = 0,
+	Flag = "ShopReserve",
+	Callback = function(value)
+		Settings.shopReserve = value
+	end,
+})
+
+ShopPriority:CreateStatus({
+	Name = "Buying",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local parts = {}
+		if Settings.shopBuyFurniture then
+			table.insert(parts, "furniture")
+		end
+		if Settings.shopBuyPacks then
+			table.insert(parts, "packs")
+		end
+		if #parts == 0 then
+			return "<Muted>nothing</Muted>"
+		end
+		return "<Success>" .. table.concat(parts, " + ") .. "</Success>"
+	end,
+})
+
+ShopPriority:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	Update = function()
+		return "<Success>" .. money(cash()) .. "</Success>"
+	end,
+})
+
+ShopPriority:CreateStatus({
+	Name = "Storage",
+	Style = "Row",
+	Update = function()
+		local s = gameState()
+		if not s or not s.capacity then
+			return "<Muted>-</Muted>"
+		end
+		return string.format("packs %d/%d, cards %d/%d", s.capacity.ownedPacks, s.capacity.packs, s.capacity.ownedCards, s.capacity.cards)
+	end,
+})
+
+-- Fill the pick-lists once the shop catalogue is loaded.
+task.spawn(function()
+	local deadline = os.clock() + 60
+	while os.clock() < deadline do
+		local cat = catalog()
+		if cat and cat.packs and cat.furniture then
+			local packs = {}
+			for id, entry in pairs(cat.packs) do
+				local definition = entry.definition or entry
+				if type(definition.price) == "number" then
+					table.insert(packs, { label = (definition.name or id) .. " [" .. id .. "]", price = definition.price })
+				end
+			end
+			table.sort(packs, function(a, b)
+				return a.price < b.price
+			end)
+			local packLabels = {}
+			for _, entry in ipairs(packs) do
+				table.insert(packLabels, entry.label)
+			end
+			ShopPackFilter:SetOptions(packLabels, { KeepSelection = true })
+
+			local furniture = {}
+			for id, definition in pairs(cat.furniture) do
+				if type(definition.price) == "number" and id ~= "Cashier" then
+					table.insert(furniture, { label = (definition.name or id) .. " [" .. id .. "]", price = definition.price })
+				end
+			end
+			table.sort(furniture, function(a, b)
+				return a.price < b.price
+			end)
+			local furnitureLabels = {}
+			for _, entry in ipairs(furniture) do
+				table.insert(furnitureLabels, entry.label)
+			end
+			ShopFurnitureFilter:SetOptions(furnitureLabels, { KeepSelection = true })
+			return
+		end
+		task.wait(0.5)
+	end
+end)
+
+----------------------------------------------------------------------
+-- TOWER
+----------------------------------------------------------------------
+local BattleTab = Window:CreateTab({ Name = "Tower", Icon = "swords" })
+local BattleMain = BattleTab:CreateGroupbox({ Name = "Auto battle", Side = "Left" })
+local BattleInfo = BattleTab:CreateGroupbox({ Name = "Progress", Side = "Right" })
+
+local towerOptions = {}
+for _, tower in ipairs(TOWERS) do
+	table.insert(towerOptions, tower.id)
+end
+
+BattleMain:CreateDropdown({
+	Name = "Tower",
+	Options = towerOptions,
+	CurrentOption = "EmberOrigins",
+	Flag = "BattleTower",
+	Callback = function(value)
+		Settings.battleTower = type(value) == "table" and (value[1] or "EmberOrigins") or value or "EmberOrigins"
+	end,
+})
+
+BattleMain:CreateToggle({
+	Name = "Auto battle",
+	Desc = "Fights floor after floor on the tower above",
+	Flag = "BattleAuto",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.battleAuto = on
+		battleAutoStep(on)
+		if on then
+			log("Auto battle is on: " .. Settings.battleTower)
+		end
+	end,
+})
+
+BattleMain:CreateToggle({
+	Name = "Use my best cards",
+	Desc = "Fills an empty deck with your four strongest cards",
+	Flag = "BattleAutoDeck",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.battleAutoDeck = on
+	end,
+})
+
+BattleMain:CreateToggle({
+	Name = "Stop when I lose",
+	Flag = "BattleStopOnLoss",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.battleStopOnLoss = on
+	end,
+})
+
+BattleMain:CreateToggle({
+	Name = "Collect tower rewards",
+	Flag = "BattleClaimPacks",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.battleClaimPacks = on
+	end,
+})
+
+BattleMain:CreateSlider({
+	Name = "Extra wait per floor",
+	Desc = "Raise it if floors finish too fast to count",
+	Range = { 0, 6 },
+	Increment = 0.1,
+	Suffix = " s",
+	CurrentValue = 1.2,
+	Flag = "BattleDelay",
+	Callback = function(value)
+		Settings.battleDelay = value
+	end,
+})
+
+BattleMain:CreateSlider({
+	Name = "Stop at floor",
+	Desc = "0 means no limit",
+	Range = { 0, 120 },
+	Increment = 1,
+	CurrentValue = 0,
+	Flag = "BattleStopFloor",
+	Callback = function(value)
+		Settings.battleStopFloor = value
+	end,
+})
+
+BattleMain:CreateButton({
+	Name = "Collect rewards now",
+	Icon = "gift",
+	Callback = function()
+		runOnce("Rewards", collectTowerRewards)
+	end,
+})
+
+BattleInfo:CreateStatus({
+	Name = "Floor",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local s = gameState()
+		local best = s and s.battle and s.battle.floors and s.battle.floors[Settings.battleTower]
+		return tostring(battleStats.floor) .. " (best " .. tostring(best or 0) .. ")"
+	end,
+})
+
+BattleInfo:CreateStatus({
+	Name = "Record",
+	Style = "Row",
+	Update = function()
+		return string.format("<Success>%d</Success> won, <Error>%d</Error> lost, %d fought", battleStats.wins, battleStats.losses, battleStats.runs)
+	end,
+})
+
+BattleInfo:CreateStatusList({
+	MaxRows = 6,
+	Update = function()
+		local rows = {}
+		local s = gameState()
+		for _, tower in ipairs(TOWERS) do
+			local best = s and s.battle and s.battle.floors and s.battle.floors[tower.id] or 0
+			local pending = s and s.battle and s.battle.pendingPacks and s.battle.pendingPacks[tower.id] or 0
+			table.insert(rows, {
+				Text = tower.name,
+				Value = "floor " .. tostring(best) .. (pending > 0 and (" - " .. pending .. " pack(s)") or ""),
+			})
+		end
+		return rows
+	end,
+})
+
+----------------------------------------------------------------------
+-- PACKS
+----------------------------------------------------------------------
+local PacksTab = Window:CreateTab({ Name = "Packs", Icon = "package-open" })
+local PacksMain = PacksTab:CreateGroupbox({ Name = "Auto open", Side = "Left" })
+local PacksInfo = PacksTab:CreateGroupbox({ Name = "Numbers", Side = "Right" })
+
+PacksMain:CreateToggle({
+	Name = "Auto open packs",
+	Desc = "Opens every pack in your inventory",
+	Flag = "PacksAuto",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.packsAuto = on
+		packsAutoStep(on)
+		if on then
+			log("Auto open is on")
+		end
+	end,
+})
+
+local PacksFilter = PacksMain:CreateDropdown({
+	Name = "Packs to open",
+	Desc = "Leave empty to open every pack",
+	Options = {},
+	MultipleOptions = true,
+	Searchable = true,
+	Flag = "PacksFilter",
+	Callback = function(selected)
+		local map = {}
+		for _, label in ipairs(selected or {}) do
+			local id = tostring(label):match("%[([^%]]+)%]$")
+			if id then
+				map[id] = true
+			end
+		end
+		Settings.packsFilter = map
+	end,
+})
+
+PacksMain:CreateSlider({
+	Name = "Packs at a time",
+	Range = { 1, 4 },
+	Increment = 1,
+	CurrentValue = 3,
+	Flag = "PacksPerBatch",
+	Callback = function(value)
+		Settings.packsPerBatch = value
+	end,
+})
+
+PacksMain:CreateSlider({
+	Name = "Pause between openings",
+	Range = { 0.2, 5 },
+	Increment = 0.1,
+	Suffix = " s",
+	CurrentValue = 0.8,
+	Flag = "PacksDelay",
+	Callback = function(value)
+		Settings.packsDelay = value
+	end,
+})
+
+PacksMain:CreateButton({
+	Name = "Open one pack now",
+	Icon = "package",
+	Callback = function()
+		runOnce("Open one", function()
+			local inventory = ask("GetInventory", { kind = "Pack", limit = 100, offset = 0 })
+			local item = inventory and inventory.result and inventory.result.items and inventory.result.items[1]
+			if not item then
+				log("You have no packs to open")
+				return
+			end
+			local answer, reason = runAction("OpenPack", { assetId = item.id }, 20)
+			if answer and answer.status == "Completed" then
+				local cards = (answer.result and answer.result.cards) or {}
+				packStats.opened += 1
+				packStats.cards += #cards
+				log("<Success>Opened one pack: " .. #cards .. " cards</Success>")
+				Game.Refresh()
+			else
+				log("<Warning>Could not open the pack: " .. tostring(reason) .. "</Warning>")
+			end
+		end)
+	end,
+})
+
+PacksInfo:CreateStatus({
+	Name = "Opened so far",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return packStats.opened .. " pack(s), " .. packStats.cards .. " cards"
+	end,
+})
+
+PacksInfo:CreateStatus({
+	Name = "In inventory",
+	Style = "Row",
+	Update = function()
+		local s = gameState()
+		if not s or not s.capacity then
+			return "<Muted>-</Muted>"
+		end
+		return string.format("%d pack(s), cards %d/%d", s.capacity.ownedPacks, s.capacity.ownedCards, s.capacity.cards)
+	end,
+})
+
+task.spawn(function()
+	local deadline = os.clock() + 60
+	while os.clock() < deadline do
+		local cat = catalog()
+		if cat and cat.packs then
+			local entries = {}
+			for id, entry in pairs(cat.packs) do
+				local definition = entry.definition or entry
+				table.insert(entries, {
+					label = (definition.name or id) .. " [" .. id .. "]",
+					price = tonumber(definition.price) or 0,
+				})
+			end
+			table.sort(entries, function(a, b)
+				return a.price < b.price
+			end)
+			local labels = {}
+			for _, entry in ipairs(entries) do
+				table.insert(labels, entry.label)
+			end
+			PacksFilter:SetOptions(labels, { KeepSelection = true })
+			return
+		end
+		task.wait(0.5)
+	end
+end)
+
+----------------------------------------------------------------------
+-- DUPES
+----------------------------------------------------------------------
+local DupesTab = Window:CreateTab({ Name = "Dupes", Icon = "copy" })
+local DupesMain = DupesTab:CreateGroupbox({ Name = "Sell spares", Side = "Left" })
+local DupesInfo = DupesTab:CreateGroupbox({ Name = "Numbers", Side = "Right" })
+
+DupesMain:CreateToggle({
+	Name = "Sell duplicate cards",
+	Desc = "Sells copies you do not need for extra cash",
+	Flag = "DupesAuto",
+	CurrentValue = false,
+	Callback = function(on)
+		Settings.dupesAuto = on
+		dupesAutoStep(on)
+		if on then
+			log("Selling duplicates is on" .. (Settings.dupesDryRun and " (dry run)" or ""))
+		end
+	end,
+})
+
+DupesMain:CreateToggle({
+	Name = "Dry run only",
+	Desc = "Shows what it would sell without selling",
+	Flag = "DupesDryRun",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.dupesDryRun = on
+	end,
+})
+
+DupesMain:CreateSlider({
+	Name = "Keep copies of each card",
+	Range = { 1, 5 },
+	Increment = 1,
+	CurrentValue = 1,
+	Flag = "DupesKeep",
+	Callback = function(value)
+		Settings.dupesKeep = value
+	end,
+})
+
+DupesMain:CreateSlider({
+	Name = "Only sell cards worth more than",
+	Range = { 0, 5000 },
+	Increment = 10,
+	Suffix = " $",
+	CurrentValue = 0,
+	Flag = "DupesMinValue",
+	Callback = function(value)
+		Settings.dupesMinValue = value
+	end,
+})
+
+DupesMain:CreateToggle({
+	Name = "Never sell my battle deck",
+	Flag = "DupesSkipDeck",
+	CurrentValue = true,
+	Callback = function(on)
+		Settings.dupesSkipDeck = on
+	end,
+})
+
+local DupesRarityFilter = DupesMain:CreateDropdown({
+	Name = "Rarities to sell",
+	Desc = "Leave empty to allow every rarity",
+	Options = {},
+	MultipleOptions = true,
+	Searchable = true,
+	Flag = "DupesRarities",
+	Callback = function(selected)
+		local map = {}
+		for _, rarity in ipairs(selected or {}) do
+			map[tostring(rarity)] = true
+		end
+		Settings.dupesRarities = map
+	end,
+})
+
+DupesMain:CreateButton({
+	Name = "Sell one batch now",
+	Icon = "coins",
+	Style = "Primary",
+	Callback = function()
+		runOnce("Sell once", function()
+			if sellBatch() == 0 and not Settings.dupesDryRun then
+				log("Nothing to sell right now")
+			end
+		end)
+	end,
+})
+
+DupesInfo:CreateStatus({
+	Name = "Sold so far",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		return dupeStats.sold .. " card(s) for " .. money(dupeStats.earned)
+	end,
+})
+
+DupesInfo:CreateStatus({
+	Name = "Mode",
+	Style = "Row",
+	Update = function()
+		return Settings.dupesDryRun and "<Warning>dry run</Warning>" or "<Success>selling</Success>"
+	end,
+})
+
+DupesInfo:CreateStatusList({
+	MaxRows = 8,
+	UpdateRate = 5,
+	Update = function()
+		local cat = catalog()
+		if not cat or not cat.cards then
+			return {}
+		end
+		local counts, definitions = {}, {}
+		for _, item in ipairs(allCards()) do
+			if item.state == "Available" then
+				local definition = cat.cards[item.definitionId]
+				if definition then
+					counts[item.definitionId] = (counts[item.definitionId] or 0) + 1
+					definitions[item.definitionId] = definition
+				end
+			end
+		end
+		local list = {}
+		for definitionId, count in pairs(counts) do
+			if count > 1 then
+				table.insert(list, { id = definitionId, count = count, definition = definitions[definitionId] })
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.count > b.count
+		end)
+		local rows = {}
+		for index = 1, math.min(8, #list) do
+			local entry = list[index]
+			table.insert(rows, {
+				Text = (entry.definition.name or entry.id) .. " x" .. entry.count,
+				Value = money((entry.definition.dealerValue or 0) * (entry.count - Settings.dupesKeep)),
+				Tone = entry.count > 3 and "Warning" or "Muted",
+			})
+		end
+		return rows
+	end,
+})
+
+-- Rarity list comes from the card catalogue.
+task.spawn(function()
+	local deadline = os.clock() + 60
+	while os.clock() < deadline do
+		local cat = catalog()
+		if cat and cat.cards then
+			local seen = {}
+			for _, definition in pairs(cat.cards) do
+				if definition.rarity then
+					seen[definition.rarity] = true
+				end
+			end
+			local list = {}
+			for rarity in pairs(seen) do
+				table.insert(list, rarity)
+			end
+			table.sort(list)
+			DupesRarityFilter:SetOptions(list, { KeepSelection = true })
+			return
+		end
+		task.wait(0.5)
+	end
+end)
+
+----------------------------------------------------------------------
+-- SETTINGS
+----------------------------------------------------------------------
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local HelpBox = SettingsTab:CreateGroupbox({ Name = "Quick guide", Side = "Right" })
+HelpBox:CreateParagraph({
+	Title = "Collect Cards Hub",
+	Content = "Tycoon: turns your cash into shop upgrades automatically.\n"
+		.. "Shop: buys packs and Building furniture that you allow.\n"
+		.. "Tower: keeps fighting the tower you pick.\n"
+		.. "Packs: opens everything in your pack inventory.\n"
+		.. "Dupes: sells the extra copies of cards you already own.\n\n"
+		.. "Every switch starts off. Use Configs to save your setup.\n"
+		.. "RightControl hides the window.",
+})
+
+----------------------------------------------------------------------
+-- Start
+----------------------------------------------------------------------
+
+task.spawn(function()
+	pcall(function()
+		Window:LoadAutoload()
+	end)
+	log("<Success>Loaded</Success> - you have " .. money(cash()) .. " cash")
+end)
+
+print("[Collect Cards Hub] loaded")
