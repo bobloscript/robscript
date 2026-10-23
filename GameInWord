@@ -1,0 +1,1365 @@
+--!nonstrict
+--[[
+	╔══════════════════════════════════════════════════╗
+	║                                                  ║
+	║            R O B S C R I P T . C O M             ║
+	║                                                  ║
+	╚══════════════════════════════════════════════════╝
+
+	Решатель слов
+	-------------
+	Авто-ответы для игры в слова (Кот → Тигр → Рыба):
+
+	  1. Решатель - отвечает за тебя и выбирает первую букву
+	  2. Слова    - словарь, свои слова, выученное
+	  3. Журнал   - что делает скрипт (по желанию)
+
+	RightShift - ответить один раз, RightControl - показать или скрыть окно.
+]]
+
+----------------------------------------------------------------------
+-- Библиотека интерфейса
+----------------------------------------------------------------------
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = getgenv().__WordSolverLibrary
+if type(Airflow) ~= "table" then
+	for _, url in ipairs(UI_SOURCES) do
+		local ok, lib = pcall(function()
+			return loadstring(game:HttpGet(url))()
+		end)
+		if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
+			Airflow = lib
+			break
+		end
+	end
+end
+if not Airflow then
+	error("[RobScript.com] Не удалось загрузить библиотеку интерфейса. Проверь соединение и запусти снова.")
+end
+getgenv().__WordSolverLibrary = Airflow
+
+----------------------------------------------------------------------
+-- Сервисы
+----------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local WordGame = ReplicatedStorage:WaitForChild("WordGame", 30)
+local Action = WordGame and WordGame:WaitForChild("Action", 15)
+local State = WordGame and WordGame:WaitForChild("State", 15)
+if not (Action and State) then
+	error("[RobScript.com] Скрипт работает только в игре в слова.")
+end
+
+----------------------------------------------------------------------
+-- Вспомогательное
+----------------------------------------------------------------------
+
+local Settings
+
+local function charCount(text)
+	local ok, count = pcall(utf8.len, text)
+	return ok and count or 0
+end
+
+--- Только русские слова разумной длины.
+local function cleanWord(raw)
+	if type(raw) ~= "string" then
+		return nil
+	end
+	local word = string.lower((string.gsub(raw, "%s+", "")))
+	if word == "" then
+		return nil
+	end
+	local count = 0
+	for _, code in utf8.codes(word) do
+		local isRussian = (code >= 0x0430 and code <= 0x044F) or code == 0x0451
+		if not isRussian then
+			return nil
+		end
+		count += 1
+		if count > 29 then
+			return nil
+		end
+	end
+	if count < 3 then
+		return nil
+	end
+	return word
+end
+
+--- Первая буква русского слова (два байта UTF-8).
+local function firstChar(word)
+	return string.sub(word, 1, 2)
+end
+
+--- Последняя буква русского слова.
+local function lastChar(word)
+	return string.sub(word, -2)
+end
+
+--- Слово без первой буквы - именно это ждёт поле ввода игры.
+local function restOfWord(word)
+	return string.sub(word, 3)
+end
+
+local function httpGet(url)
+	for attempt = 1, 2 do
+		local ok, body = pcall(function()
+			return game:HttpGet(url)
+		end)
+		if ok and type(body) == "string" and #body > 200 then
+			return body
+		end
+		if attempt == 1 then
+			task.wait(0.4)
+		end
+	end
+	return nil
+end
+
+local function readFileSafe(path)
+	if type(readfile) ~= "function" then
+		return nil
+	end
+	local ok, data = pcall(readfile, path)
+	if ok and type(data) == "string" and #data > 0 then
+		return data
+	end
+	return nil
+end
+
+--- Пишем на диск только в режиме «Хранить историю».
+local function writeFileSafe(path, data)
+	if not Settings.keepHistory then
+		return false
+	end
+	if type(writefile) ~= "function" or type(data) ~= "string" then
+		return false
+	end
+	pcall(function()
+		if type(makefolder) == "function" then
+			makefolder("WordSolver")
+		end
+	end)
+	return pcall(writefile, path, data)
+end
+
+--- Элементы игры, которые читает решатель.
+local function canvas()
+	local gui = LocalPlayer:FindFirstChild("PlayerGui")
+	local main = gui and gui:FindFirstChild("WordGameUI")
+	return main and main:FindFirstChild("Canvas")
+end
+
+local function matchFrame()
+	local root = canvas()
+	return root and root:FindFirstChild("Match")
+end
+
+local function lobbyFrame()
+	local root = canvas()
+	return root and root:FindFirstChild("Lobby")
+end
+
+local function typingBox()
+	local match = matchFrame()
+	return match and match:FindFirstChild("TypingCapture")
+end
+
+----------------------------------------------------------------------
+-- Настройки
+----------------------------------------------------------------------
+
+Settings = {
+	solve = true,
+	autoChoose = true,
+	autoPractice = false,
+	showTyping = true,
+	safeEndings = true,
+	learn = true,
+	keepHistory = false,
+	delay = 0.10,
+	attempts = 6,
+}
+local Window, Log
+local UiRefs = {}
+
+local function log(message, color)
+	if not Log or not Settings.keepHistory then
+		return
+	end
+	Log:Push(tostring(message), color)
+end
+
+local function notify(title, content, kind)
+	pcall(function()
+		Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = 4 })
+	end)
+end
+
+getgenv().__WordSolverGen = (getgenv().__WordSolverGen or 0) + 1
+local SCRIPT_GENERATION = getgenv().__WordSolverGen
+
+local function scriptAlive()
+	return getgenv().__WordSolverGen == SCRIPT_GENERATION
+end
+
+----------------------------------------------------------------------
+-- 1. СЛОВАРЬ
+----------------------------------------------------------------------
+
+local DICTIONARY_URLS = {
+	nouns = "https://raw.githubusercontent.com/Harrix/Russian-Nouns/main/dist/russian_nouns.txt",
+	freq = "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/ru/ru_50k.txt",
+}
+
+local DICTIONARY_FILES = {
+	nouns = "WordSolver/dictionary-nouns.txt",
+	freq = "WordSolver/dictionary-freq.txt",
+	learned = "WordSolver/learned.txt",
+}
+
+--- С такими окончаниями цепочка обрывается: на эти буквы слов почти нет.
+--- Мягкий и твёрдый знаки и «ы» - не тупик, игра берёт букву перед ними.
+local BAD_ENDINGS = {
+	["й"] = true,
+}
+
+local FALLBACK_WORDS = table.concat({
+	"автобус адрес аист актер алмаз ананас ангел аптека арбуз армия артист архив асфальт атлас афиша аэропорт август адвокат академия аквариум акция аллея альбом апельсин аренда",
+	"бабушка багаж базар балкон банан банк бант барабан барон бассейн батарея батон бегемот белка берег береза беседа библиотека билет блин блок блокнот бобр богатырь бокал больница бомба борт бочка браслет брат бревно бриз бровь бронза брошка брусника брюки бублик будильник буква букет бумага буран бутерброд бутылка буфет бухта бык",
+	"вагон ваза валенки валюта ванна вариант варенье вата вафля ведро веер веник венок веранда верблюд веревка вес весло ветер ветка вечер вешалка взгляд взрыв вилка вино виноград вирус витрина вкус власть вода водитель водопад вождь воздух война вокзал волк волна волос воробей ворона воск восток восторг врач время всадник вход вывод выдра вызов выход вышивка вьюга вязание",
+	"газ газета газон гайка галстук гамак гараж гвоздь гвоздика генерал гений герб герой гитара глава глаз глина глубина гнездо гном гобелен голос голубь гора горло горох город горошек гостиница гость государство грабли градус граница график гребень грелка гриб грива грим гроза гром груз груша группа грусть грядка губка гудок гусь",
+	"дача дверь движение двор девочка дед дедушка декабрь дело дельфин день деньги деревня дерево держава десерт дети деталь джинсы диван диета дизайн диктор диплом диск дневник дно дождь доктор документ доллар дом дорога доска досуг дочь дракон драма дрель дробь друг дружба дуб дуга дудка дупло душа дым дыня дядя",
+	"еда единство ежик езда елка емкость енот ералаш ерунда",
+	"ёж ёжик ёлка ёмкость ёрш",
+	"жаба жажда жакет жалоба жанр жара жвачка жезл железо жемчуг жених жена жест жетон живот жилет жилье жираф жир журнал журналист журавль жук жюри",
+	"забор забота завод завтрак загадка задача заказ закат закон залив замок запад запах запись заря заставка затылок заявка звезда звено зверь звон звук земля земляника зенит зеркало зерно зима змея знак знамя знание зонт зрачок зрение зубр зять",
+	"игла игра игрок идея изба избушка избыток известие изгиб издание изюм икра иллюзия имбирь имя индюк инжир интерес ирис искра искусство история исток итог июль июнь",
+	"йогурт йод",
+	"кабан кабинет каблук кадр кактус калач календарь калитка камень камин камыш канал канат капля карман карта картина картошка касса кастрюля катер каток кафе каша каюта квадрат кедр кекс кепка керамика килька кинжал кино киоск кирпич кисть кит клевер клетка клей клен клещ климат клоун клуб ключ клятва книга кнопка кобра ковер ковш код кожа коза козел койка кокос колбаса колдун колесо колено колодец колос колпак кольцо команда комар комбайн комета комната комод компот конверт конец концерт конь копейка копыто корень корзина корица корм корова король корпус космос костер кость костюм кот котел котлета кошка краб край кран краска кредит крепость крест крик кризис крыло крыша крюк кубик кувшин кукла кукуруза кулак купол курган курица курс куст кухня",
+	"лабиринт лаванда лавка лагерь ладонь лаз лайм лак лампа ландыш лапа лапша ларь ласка ластик лайнер лебедь лев легенда лед лезвие лейка лекция лента лепесток лес лестница лето летчик лещ лиса лист литера литр лицо лоб ловушка логика лодка ложка локоть лом лошадь лужа лук луна лупа луч лыжи любовь люк люстра лютик лягушка",
+	"магнит мазь майка мак макароны малина мальчик манеж мандарин мантия марка март маршрут маска масло масса массаж мат матч мать машина маяк мебель медаль медведь медь мель мельница мелодия мера метод метро мех меч мешок мечта миг микрофон миска митинг миф мишень мнение мода модель мозг мойка молекула момент монета монитор море морж морковь мороз мост мотив мотор мотоцикл мрамор мусор музей мука муравей музыка мысль мышь мяч мясо мята",
+	"набор навес навык награда надежда накидка налет налог намек напев напор народ наряд насос наука нация начало небо невеста неделя недра нейлон нежность нектар немец нефть нива никель нить ниша новость нога ноготь нож ножницы ноль номер нос носок нота ночь ноябрь нужда няня",
+	"обед обещание обида обзор облако область обман обмен обои оборона образ обруч обувь обход обычай овца огонь огород огурец одежда одеяло ожидание ожог озеро окно океан окоп округ олень олива омлет опера опора орден орех осень осетр остров отвага ответ отдых отец открытие отряд охота очаг очерк очки ошейник ошибка",
+	"павлин пагода палатка палец палка пальма панель папа папка парад парик парк пароль парта парус пасека паспорт паста пастух пауза паук пачка певец пекарня пение песня песок печать пещера пиала пижама пила пилот пирог письмо питон плавание плакат план плата платье плащ плечо плита плотина плот пляж победа повар повод погода подарок подвал подкова подушка поезд пожар поле полет полка полюс поляна порог порт портрет посуда поток потолок поход почта поэма правда праздник приз приказ пример природа проба провод прогноз проезд проект просо протез профессия пруд прыжок птица пудинг пузырь пульт пункт пурга пушка пчела пшеница пятно",
+	"работа радар радио радость радуга разбор размер разум рай рак ракета рамка рана ранец рапорт расчет редис режим резец рейс река реклама ремень ремонт репка ресурс рецепт речка решение ринг риск рис рисунок рог родина роза роман ромашка роса рот рубанок рубль рука рукав рулет руль ручей рыба рынок рысь рюкзак",
+	"сад садик сажа салат салют самовар самолет сани сапог сарай сахар сбор сварка свет свеча свисток свобода связь сезон секрет селедка село семья сено сердце серебро серия сеть сила сироп сирень система сито скала скарб сквер склад скорость скрипка слава слива слово слух смена смех смола смысл снег собор совет сок сокол сокровище солнце соль сом сон сорока сосна состав сотня спорт спрос спутник среда срок ссора стадо стакан станок старик статуя ствол стекло стена степь стиль стойка стол столица сторож страна струна студия стул сугроб судно судьба сумка суп сурок сустав суть сушка схема сцена счет съезд сыр",
+	"табак таблица табун таз тайна такси талант талисман танец танк тапки тара тарелка творог театр тезис текст телега телефон тема темнота тепло тень терем тесто тетрадь тигр титул ткань товар ток толпа томат тон топор торг торт тоска точка трава трактор трамвай трасса трение треск тропа труба труд трюк тряпка туман тундра тупик туча тыква тюбик тюлень тюльпан тяга",
+	"уборка убыток увоз уговор угол уголь удача удочка ужин узор указ улитка улица улов умение унисон упадок упор урожай урок усадьба успех устав утка утро ухо учитель ущелье уют",
+	"фабрика фазан факел факт фамилия фант фара фартук фасад февраль фейерверк фен фестиваль фиалка фигура физика филе фильм финал финик финиш флаг флакон флейта флот фокус фонарь фонд форма форт фото фраза фрукт футбол футляр",
+	"халат халва характер хвост хвоя химия хлеб хлопок хобот ход хозяин холод холст хомяк хор хребет хрип хруст художник хутор",
+	"цапля царь цвет цветок целина целлофан цена центр цепь цифра цоколь цунами цыпленок",
+	"чадо чай чайник часы часть чашка чемодан чемпион червь череп черешня черта чеснок честь четверг число чтение чувство чулан чулок чучело",
+	"шаг шайба шалаш шаль шапка шар шарф шасси шахта шахматы швабра шейка шелест шелк шепот шерсть шершень шест шествие шило шина шиповник шишка шкаф шкатулка шкура шланг шлем шлюпка шляпа шнур шов шок шоколад шорты шоссе шпага шпагат шпион шрам штаб штора штурм штык шуба шум шут шутка",
+	"щавель щека щенок щепка щетка щи щит щука щуп",
+	"экзамен экран экскаватор экспорт экипаж экскурсия электричество элемент элита эмаль эпоха эскиз эссе этаж этап этика эфир эхо",
+	"юбка юг юбилей юмор юность юнга юрист",
+	"яблоко яблоня явление ягода яд ядро язык яйцо якорь яма ямка январь ярмарка ярус ясень ясность яхта ячмень ящик",
+}, " ")
+
+--- Запасы слов по первой букве:
+---   learned  - слова, которые игра уже приняла
+---   freq     - частые слова, сначала самые употребительные
+---   nouns    - существительные, сначала короткие
+---   fallback - встроенный список на случай, если сети нет
+local Dictionary = {
+	learned = {},
+	freq = {},
+	nouns = {},
+	fallback = {},
+	total = 0,
+	loaded = false,
+	source = "-",
+	learnedDirty = false,
+}
+
+local function addWord(pool, word)
+	if type(word) ~= "string" or word == "" then
+		return false
+	end
+	local bucket = pool[firstChar(word)]
+	if not bucket then
+		bucket = {}
+		pool[firstChar(word)] = bucket
+	end
+	table.insert(bucket, word)
+	return true
+end
+
+local function fillPool(pool, text, sortByLength)
+	local added = 0
+	for line in string.gmatch(text, "[^\r\n]+") do
+		-- В частотном списке строка "слово число", в списке существительных - слово.
+		local word = cleanWord(line:match("^(%S+)") or line)
+		if word and addWord(pool, word) then
+			added += 1
+		end
+	end
+	if sortByLength then
+		for _, bucket in pairs(pool) do
+			table.sort(bucket, function(a, b)
+				return #a < #b
+			end)
+		end
+	end
+	return added
+end
+
+local function countPool(pool)
+	local total = 0
+	for _, bucket in pairs(pool) do
+		total += #bucket
+	end
+	return total
+end
+
+local function loadFallback()
+	if countPool(Dictionary.fallback) > 0 then
+		return
+	end
+	for word in string.gmatch(FALLBACK_WORDS, "%S+") do
+		local cleaned = cleanWord(word)
+		if cleaned then
+			addWord(Dictionary.fallback, cleaned)
+		end
+	end
+end
+
+local function rebuildTotal()
+	Dictionary.total = countPool(Dictionary.freq) + countPool(Dictionary.nouns)
+	if Dictionary.total == 0 then
+		Dictionary.total = countPool(Dictionary.fallback)
+	end
+end
+
+local function saveLearned()
+	if not Dictionary.learnedDirty then
+		return
+	end
+	Dictionary.learnedDirty = false
+	if not Settings.keepHistory then
+		return
+	end
+	local words = {}
+	for _, bucket in pairs(Dictionary.learned) do
+		for _, word in ipairs(bucket) do
+			table.insert(words, word)
+		end
+	end
+	if #words > 0 then
+		writeFileSafe(DICTIONARY_FILES.learned, table.concat(words, "\n"))
+	end
+end
+
+local function learnWord(raw)
+	local word = cleanWord(raw)
+	if not word then
+		return false
+	end
+	local bucket = Dictionary.learned[firstChar(word)]
+	if bucket then
+		for _, existing in ipairs(bucket) do
+			if existing == word then
+				return false
+			end
+		end
+	end
+	addWord(Dictionary.learned, word)
+	Dictionary.learnedDirty = true
+	return true
+end
+
+local function loadLearnedFile()
+	if countPool(Dictionary.learned) > 0 then
+		return
+	end
+	local data = readFileSafe(DICTIONARY_FILES.learned)
+	if not data then
+		return
+	end
+	for line in string.gmatch(data, "[^\r\n]+") do
+		learnWord(line)
+	end
+end
+
+local function loadPool(name, sortByLength)
+	local cached = readFileSafe(DICTIONARY_FILES[name])
+	if cached then
+		Dictionary[name] = {}
+		if fillPool(Dictionary[name], cached, sortByLength) > 0 then
+			return countPool(Dictionary[name])
+		end
+	end
+	local body = httpGet(DICTIONARY_URLS[name])
+	if not body then
+		return 0
+	end
+	Dictionary[name] = {}
+	local added = fillPool(Dictionary[name], body, sortByLength)
+	writeFileSafe(DICTIONARY_FILES[name], body)
+	return added
+end
+
+--- Загружает списки в своём потоке, в конце зовёт `done`.
+local function buildDictionary(force, done)
+	if Dictionary.loaded and not force then
+		if done then
+			done(true)
+		end
+		return
+	end
+
+	loadFallback()
+	loadLearnedFile()
+
+	local nounCount = loadPool("nouns", true)
+	local freqCount = loadPool("freq", false)
+
+	rebuildTotal()
+	Dictionary.loaded = true
+	Dictionary.source = string.format("%d частых + %d существительных", freqCount, nounCount)
+	getgenv().__WordSolverPools = {
+		freq = Dictionary.freq,
+		nouns = Dictionary.nouns,
+		learned = Dictionary.learned,
+		total = Dictionary.total,
+		loaded = true,
+	}
+	if done then
+		done(Dictionary.total > 0)
+	end
+end
+
+local cachedPools = getgenv().__WordSolverPools
+if type(cachedPools) == "table" and cachedPools.loaded then
+	Dictionary.freq = cachedPools.freq
+	Dictionary.nouns = cachedPools.nouns
+	Dictionary.learned = cachedPools.learned
+	Dictionary.total = cachedPools.total
+	Dictionary.loaded = true
+	Dictionary.source = "из памяти"
+end
+
+local function reloadDictionaries()
+	Dictionary.loaded = false
+	buildDictionary(true, function()
+		log("<Success>Словарь готов</Success> — " .. Dictionary.total .. " слов")
+		notify("Словарь готов", string.format("%d слов: %s", Dictionary.total, Dictionary.source), "Success")
+	end)
+end
+
+----------------------------------------------------------------------
+-- 2. СОСТОЯНИЕ
+----------------------------------------------------------------------
+
+local Game = {
+	snapshot = nil,
+	phase = "lobby",
+	letter = "",
+	you = nil,
+	turn = nil,
+	tableId = nil,
+	round = 0,
+	generation = 0,
+	deadline = 0,
+	turnDuration = 15,
+	turnRemaining = 15,
+	bot = false,
+	choices = nil,
+	chooser = nil,
+	notice = "",
+	history = {},
+	at = 0,
+	matches = 0,
+}
+
+local Solver = {
+	used = {},
+	bad = {},
+	requestId = 0,
+	attempts = 0,
+	turnKey = nil,
+	chooseKey = nil,
+	turnStarted = 0,
+	nextTry = 0,
+	solved = 0,
+	rejected = 0,
+	collisions = 0,
+	pending = nil,
+	lastWord = "",
+	practiceCooldown = 0,
+}
+
+--- Сколько секунд осталось на ход, считая от последнего состояния.
+local function timeLeft()
+	local total = Game.turnRemaining or Game.turnDuration or 0
+	return math.max(0, total - (os.clock() - Game.at))
+end
+
+local function markUsed(word)
+	if type(word) ~= "string" then
+		return
+	end
+	local cleaned = cleanWord(word)
+	if cleaned then
+		Solver.used[cleaned] = true
+	end
+end
+
+State.OnClientEvent:Connect(function(payload)
+	if not scriptAlive() or type(payload) ~= "table" then
+		return
+	end
+
+	local kind = payload.kind
+
+	if kind == "match" then
+		Game.snapshot = payload
+		Game.at = os.clock()
+		Game.phase = tostring(payload.phase or "lobby")
+		Game.letter = string.lower(tostring(payload.letter or ""))
+		Game.you = payload.you
+		Game.turn = payload.turn
+		Game.tableId = payload.tableId
+		Game.round = tonumber(payload.round) or 0
+		Game.generation = tonumber(payload.generation) or 0
+		Game.deadline = tonumber(payload.deadline) or 0
+		Game.turnDuration = tonumber(payload.turnDuration) or 15
+		Game.bot = payload.bot == true
+		Game.choices = payload.choices
+		Game.chooser = payload.chooser
+		Game.notice = tostring(payload.notice or "")
+		Game.history = payload.history or {}
+
+		-- Время на ход считаем от прихода состояния: если часы клиента врут,
+		-- это не помешает ответить.
+		local left = Game.turnDuration
+		if Game.deadline > 0 then
+			left = Game.deadline - os.time()
+			if left < 0 or left > Game.turnDuration + 10 then
+				left = Game.turnDuration
+			end
+		end
+		Game.turnRemaining = math.max(0, left)
+
+		-- Новый стол или новое поколение - новый матч: повторы запрещены
+		-- только внутри одного матча.
+		local matchKey = tostring(Game.tableId) .. ":" .. tostring(Game.generation)
+		if Game.matchKey ~= matchKey then
+			Game.matchKey = matchKey
+			-- Подключились посреди матча: слова из запаса уже частично сыграны.
+			Game.midMatch = Game.round > 1
+			Solver.used = {}
+			Solver.turnKey = nil
+			Solver.chooseKey = nil
+			Solver.pending = nil
+			if Game.phase == "countdown" then
+				Game.matches += 1
+			end
+		end
+
+		for _, word in ipairs(Game.history) do
+			markUsed(word)
+		end
+		if payload.lastWord and payload.lastWord ~= "" then
+			markUsed(payload.lastWord)
+		end
+		return
+	end
+
+	if kind == "accepted" then
+		local word = cleanWord(tostring(payload.word or ""))
+		if word then
+			-- Слова своего стола в этом матче больше не предлагаем.
+			if Game.tableId ~= nil and payload.tableId == Game.tableId then
+				markUsed(word)
+			end
+			if Settings.learn then
+				learnWord(word)
+			end
+			if Solver.pending and Solver.pending.word == word
+				and payload.tableId == Solver.pending.tableId
+				and tonumber(payload.round) == Solver.pending.round then
+				Solver.solved += 1
+				Solver.pending = nil
+				log("<Success>✓ " .. word .. "</Success>")
+			end
+		end
+		return
+	end
+
+	if kind == "invalid" then
+		local mine = Solver.pending
+			and payload.tableId == Solver.pending.tableId
+			and tonumber(payload.round) == Solver.pending.round
+		local reason = tostring(payload.reason or "")
+		local text = tostring(payload.text or "")
+		if mine then
+			local word = Solver.pending and Solver.pending.word
+			if reason == "used" then
+				-- Слово настоящее, но в этом матче уже было: пробуем следующее.
+				Solver.collisions += 1
+				if word then
+					markUsed(word)
+				end
+				log("<Muted>Уже было в матче, беру другое</Muted>")
+			else
+				Solver.rejected += 1
+				if word then
+					Solver.bad[word] = true
+				end
+				log("<Warning>✗ " .. (text ~= "" and text or reason) .. "</Warning>")
+			end
+			Solver.pending = nil
+		end
+		return
+	end
+
+	if kind == "wordRejected" then
+		local mine = Solver.pending and payload.requestId == Solver.pending.requestId
+		if mine then
+			Solver.rejected += 1
+			-- Ход уже прошёл: не долбим сервер до нового состояния.
+			Solver.attempts = Settings.attempts
+			Solver.pending = nil
+			log("<Warning>✗ " .. tostring(payload.text or payload.reason or "ход уже прошёл") .. "</Warning>")
+		end
+		return
+	end
+
+	if kind == "toast" then
+		local text = tostring(payload.text or "")
+		-- «Подожди, пока освободится твой персонаж»: отступаем, а не долбим.
+		if string.find(text, "Подожди") then
+			Solver.practiceCooldown = os.clock() + 10
+		end
+		return
+	end
+
+	if kind == "result" then
+		-- Результат чужого стола не закрывает текущий матч.
+		local resultTable = tonumber(string.match(tostring(payload.rewardId or ""), "^(%d+):"))
+		if resultTable and Game.tableId and resultTable ~= Game.tableId then
+			return
+		end
+		Game.phase = "finished"
+		Game.turn = nil
+		Solver.pending = nil
+		log(payload.won == true and "<Success>Матч выигран</Success>" or "<Warning>Матч окончен</Warning>")
+		return
+	end
+end)
+
+----------------------------------------------------------------------
+-- 3. РЕШАТЕЛЬ
+----------------------------------------------------------------------
+
+local function pickWord(letter)
+	local key = firstChar(letter)
+	-- Выученные слова надёжнее всего, но если мы подключились к матчу, который
+	-- уже давно идёт, они в основном уже сыграны.
+	local sources
+	if Game.midMatch then
+		sources = { Dictionary.freq, Dictionary.nouns, Dictionary.learned, Dictionary.fallback }
+	else
+		sources = { Dictionary.learned, Dictionary.freq, Dictionary.nouns, Dictionary.fallback }
+	end
+
+	local fallback = nil
+	for _, pool in ipairs(sources) do
+		local bucket = pool[key]
+		if bucket then
+			for _, word in ipairs(bucket) do
+				if not Solver.used[word] and not Solver.bad[word] then
+					if Settings.safeEndings and BAD_ENDINGS[lastChar(word)] then
+						fallback = fallback or word
+					else
+						return word
+					end
+				end
+			end
+		end
+	end
+	return fallback
+end
+
+local function bestChoice(choices)
+	local best, bestCount = nil, -1
+	for _, letter in ipairs(choices) do
+		local lowered = string.lower(tostring(letter))
+		local key = firstChar(lowered)
+		local count = #(Dictionary.freq[key] or {}) + #(Dictionary.nouns[key] or {}) + #(Dictionary.learned[key] or {})
+		if count > bestCount then
+			best, bestCount = lowered, count
+		end
+	end
+	return best
+end
+
+local function submitWord(word, snapshot)
+	local letter = string.lower(tostring(snapshot.letter or ""))
+	local rest = restOfWord(word)
+
+	Solver.requestId += 1
+	local payload = {
+		requestId = Solver.requestId,
+		tableId = snapshot.tableId,
+		round = snapshot.round,
+		generation = snapshot.generation or 0,
+	}
+
+	if Settings.showTyping then
+		local box = typingBox()
+		if box then
+			pcall(function()
+				box.Text = rest
+			end)
+		end
+	end
+
+	Solver.pending = {
+		word = word,
+		tableId = snapshot.tableId,
+		round = snapshot.round,
+		generation = snapshot.generation or 0,
+		requestId = payload.requestId,
+		at = os.clock(),
+	}
+
+	Action:FireServer("word", letter .. rest, payload)
+	Solver.lastWord = word
+	log(string.format("Ответ: <Accent>%s</Accent> (%d)", word, charCount(word)))
+end
+
+--- Один ход: выбрать букву или ответить.
+local function solverTick()
+	if not (Settings.solve and (os.clock() - Game.at) < 20) then
+		return
+	end
+
+	local now = os.clock()
+
+	if Game.phase == "choosing" and Game.chooser == Game.you and Game.choices then
+		if not Settings.autoChoose then
+			return
+		end
+		local key = table.concat({ Game.tableId, Game.round, Game.generation }, ":")
+		if Solver.chooseKey ~= key then
+			local letter = bestChoice(Game.choices)
+			if letter then
+				Solver.chooseKey = key
+				Action:FireServer("choose", letter)
+				log("Выбрана буква: <Accent>" .. string.upper(letter) .. "</Accent>")
+			end
+		end
+		return
+	end
+
+	if Game.phase ~= "playing" or Game.turn ~= Game.you then
+		return
+	end
+	-- Экран матча скрывается сразу после стола: в закрытый стол не отвечаем.
+	local frame = matchFrame()
+	if frame and not frame.Visible then
+		return
+	end
+	if not Dictionary.loaded then
+		return
+	end
+
+	-- Ждём ответ на уже отправленное слово: второе подряд сервер считает
+	-- ходом другого игрока. Если ответа нет три секунды - пробуем снова.
+	if Solver.pending then
+		if now - (Solver.pending.at or 0) < 3 then
+			return
+		end
+		Solver.pending = nil
+	end
+
+	local key = table.concat({ Game.tableId, Game.round, Game.generation }, ":")
+	if Solver.turnKey ~= key then
+		Solver.turnKey = key
+		Solver.attempts = 0
+		Solver.turnStarted = now
+		Solver.pending = nil
+	end
+
+	if Solver.attempts >= Settings.attempts or now < Solver.nextTry then
+		return
+	end
+	if now - Solver.turnStarted < Settings.delay then
+		return
+	end
+	if Game.deadline > 0 and timeLeft() < 0.6 then
+		return
+	end
+
+	local word = pickWord(Game.letter)
+	if not word then
+		Solver.attempts = Settings.attempts
+		log("<Warning>Нет слов на «" .. string.upper(Game.letter) .. "»</Warning>")
+		return
+	end
+
+	Solver.used[word] = true
+	Solver.attempts += 1
+	Solver.nextTry = now + 0.25
+	submitWord(word, Game.snapshot)
+end
+
+--- Один ответ прямо сейчас: кнопка и горячая клавиша.
+local function answerOnce()
+	if Game.phase ~= "playing" or Game.turn ~= Game.you then
+		log("<Warning>Сейчас не твой ход</Warning>")
+		return
+	end
+	if not Dictionary.loaded then
+		log("<Warning>Словарь ещё загружается</Warning>")
+		return
+	end
+	local word = pickWord(Game.letter)
+	if not word then
+		log("<Warning>Нет слов на «" .. string.upper(Game.letter) .. "»</Warning>")
+		return
+	end
+	Solver.used[word] = true
+	submitWord(word, Game.snapshot or Game)
+end
+
+local function setSolve(on)
+	Settings.solve = on
+	if UiRefs.solve then
+		UiRefs.solve:Set(on, true)
+	end
+	log(on and "Решатель включён" or "Решатель выключен")
+end
+
+local function setAutoChoose(on)
+	Settings.autoChoose = on
+	if UiRefs.autoChoose then
+		UiRefs.autoChoose:Set(on, true)
+	end
+end
+
+local function setSafeEndings(on)
+	Settings.safeEndings = on
+	if UiRefs.safeEndings then
+		UiRefs.safeEndings:Set(on, true)
+	end
+end
+
+local function setShowTyping(on)
+	Settings.showTyping = on
+	if UiRefs.showTyping then
+		UiRefs.showTyping:Set(on, true)
+	end
+end
+
+local function setLearn(on)
+	Settings.learn = on
+	if UiRefs.learn then
+		UiRefs.learn:Set(on, true)
+	end
+	saveLearned()
+end
+
+--- Журнал и запись на диск включаются только этим режимом.
+local function setKeepHistory(on)
+	Settings.keepHistory = on
+	if UiRefs.keepHistory then
+		UiRefs.keepHistory:Set(on, true)
+	end
+	if Log then
+		Log:Clear()
+		if on then
+			Log:Push("История включена")
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- 4. ТРЕНИРОВКА
+----------------------------------------------------------------------
+
+local lastLeave, lastPractice = 0, 0
+
+local function setAutoPractice(on)
+	Settings.autoPractice = on
+	if UiRefs.autoPractice then
+		UiRefs.autoPractice:Set(on, true)
+	end
+	log(on and "Тренировка после матча включена" or "Тренировка после матча выключена")
+end
+
+--- Сам запускает тренировку, когда скрипт сидит в лобби.
+local function practiceTick()
+	if not Settings.autoPractice then
+		return
+	end
+	local now = os.clock()
+	if now < (Solver.practiceCooldown or 0) then
+		return
+	end
+
+	local playing = Game.phase == "playing"
+		or Game.phase == "choosing"
+		or Game.phase == "countdown"
+	local fresh = (now - Game.at) < 12
+
+	-- Идущий матч не трогаем.
+	if playing and fresh then
+		return
+	end
+
+	local match = matchFrame()
+	local lobby = lobbyFrame()
+
+	if match and match.Visible then
+		if now - lastLeave > 4 then
+			lastLeave = now
+			Action:FireServer("leave")
+		end
+		return
+	end
+
+	if lobby and lobby.Visible then
+		if now - lastPractice > 7 then
+			lastPractice = now
+			Action:FireServer("practice")
+		end
+		return
+	end
+
+	-- Застряли на переходном экране: просим выйти, чтобы вернулось лобби.
+	if now - lastLeave > 6 then
+		lastLeave = now
+		Action:FireServer("leave")
+	end
+end
+
+----------------------------------------------------------------------
+-- Горячие клавиши
+----------------------------------------------------------------------
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed or not scriptAlive() then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		answerOnce()
+	end
+end)
+
+----------------------------------------------------------------------
+-- Основные циклы
+----------------------------------------------------------------------
+
+RunService.Heartbeat:Connect(function()
+	if not scriptAlive() then
+		return
+	end
+	pcall(solverTick)
+end)
+
+task.spawn(function()
+	while scriptAlive() do
+		pcall(practiceTick)
+		task.wait(0.25)
+	end
+end)
+
+task.spawn(function()
+	while scriptAlive() do
+		saveLearned()
+		task.wait(10)
+	end
+end)
+
+----------------------------------------------------------------------
+-- ОКНО
+----------------------------------------------------------------------
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+local previousWindow = getgenv().__WordSolverWindow
+if previousWindow then
+	pcall(function()
+		previousWindow:Destroy()
+	end)
+end
+
+--- Окно от прерванного запуска могло остаться без ручки: убираем по имени.
+pcall(function()
+	local holders = { LocalPlayer:FindFirstChild("PlayerGui") }
+	local ok, hui = pcall(gethui)
+	if ok and hui then
+		table.insert(holders, hui)
+	end
+	for _, holder in ipairs(holders) do
+		local stale = holder and holder:FindFirstChild("RobScript.com")
+		if stale then
+			stale:Destroy()
+		end
+	end
+end)
+
+Window = Airflow:CreateWindow({
+	Name = "RobScript.com",
+	LoadingSubtitle = "Решатель слов",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "WordSolver" },
+	Home = {
+		Name = "Главная",
+		Title = "RobScript.com",
+		Welcome = "С возвращением,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+getgenv().__WordSolverWindow = Window
+
+local LogTab = Window:CreateTab({ Name = "Журнал", Icon = "scroll-text" })
+local LogBox = LogTab:CreateGroupbox({ Name = "Что делает скрипт", Side = "Left" })
+
+UiRefs.keepHistory = LogBox:CreateToggle({
+	Name = "Хранить историю",
+	Desc = "Журнал и сохранение слов на диск. Выключено — ничего не копится",
+	Flag = "KeepHistory",
+	CurrentValue = false,
+	Callback = function(on)
+		setKeepHistory(on)
+	end,
+})
+
+Log = LogBox:CreateLog({
+	Name = "Действия",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Пока пусто",
+})
+
+----------------------------------------------------------------------
+-- ВКЛАДКА «РЕШАТЕЛЬ»
+----------------------------------------------------------------------
+
+local SolverTab = Window:CreateTab({ Name = "Решатель", Icon = "brain" })
+local SolveMain = SolverTab:CreateGroupbox({ Name = "Решатель", Side = "Left" })
+local SolveInfo = SolverTab:CreateGroupbox({ Name = "Состояние", Side = "Right" })
+local SolveTune = SolverTab:CreateGroupbox({ Name = "Настройка", Side = "Right" })
+
+UiRefs.solve = SolveMain:CreateToggle({
+	Name = "Отвечать автоматически",
+	Desc = "Отправляет слово на каждом твоём ходу",
+	Flag = "SolveOn",
+	CurrentValue = true,
+	Callback = function(on)
+		setSolve(on)
+	end,
+})
+
+UiRefs.autoChoose = SolveMain:CreateToggle({
+	Name = "Выбирать первую букву",
+	Desc = "Когда игра отдаёт выбор, берёт букву, на которую больше всего слов",
+	Flag = "AutoChoose",
+	CurrentValue = true,
+	Callback = function(on)
+		setAutoChoose(on)
+	end,
+})
+
+UiRefs.autoPractice = SolveMain:CreateToggle({
+	Name = "Тренировка после матча",
+	Desc = "Работает только в лобби: выходит с результата и запускает матч с Буквоедом",
+	Flag = "AutoPractice",
+	CurrentValue = false,
+	Callback = function(on)
+		setAutoPractice(on)
+	end,
+})
+
+UiRefs.safeEndings = SolveMain:CreateToggle({
+	Name = "Удачные окончания",
+	Desc = "Не берёт слова, после которых нечем ответить",
+	Flag = "SafeEndings",
+	CurrentValue = true,
+	Callback = function(on)
+		setSafeEndings(on)
+	end,
+})
+
+UiRefs.showTyping = SolveMain:CreateToggle({
+	Name = "Показывать ответ в поле игры",
+	Desc = "Соперники видят, как ты печатаешь",
+	Flag = "ShowTyping",
+	CurrentValue = true,
+	Callback = function(on)
+		setShowTyping(on)
+	end,
+})
+
+UiRefs.learn = SolveMain:CreateToggle({
+	Name = "Запоминать принятые слова",
+	Desc = "Принятые игрой слова попадают в запас на этот запуск",
+	Flag = "LearnWords",
+	CurrentValue = true,
+	Callback = function(on)
+		setLearn(on)
+	end,
+})
+
+SolveMain:CreateButton({
+	Name = "Ответить один раз",
+	Desc = "То же самое делает RightShift",
+	Icon = "zap",
+	Style = "Primary",
+	Callback = function()
+		answerOnce()
+	end,
+})
+
+SolveTune:CreateSlider({
+	Name = "Пауза перед ответом",
+	Range = { 0, 1.5 },
+	Increment = 0.05,
+	Suffix = " с",
+	CurrentValue = 0.10,
+	Flag = "AnswerDelay",
+	Callback = function(value)
+		Settings.delay = value
+	end,
+})
+
+SolveTune:CreateSlider({
+	Name = "Попыток за ход",
+	Range = { 1, 12 },
+	Increment = 1,
+	CurrentValue = 6,
+	Flag = "MaxTries",
+	Callback = function(value)
+		Settings.attempts = math.floor(value)
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Сейчас",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		if not Settings.solve then
+			return "<Muted>выключено</Muted>"
+		end
+		if (os.clock() - Game.at) > 20 then
+			return "<Muted>в лобби</Muted>"
+		end
+		if Game.phase == "choosing" then
+			return Game.chooser == Game.you and "<Warning>выбираю букву</Warning>" or "<Muted>ждём букву</Muted>"
+		end
+		if Game.phase ~= "playing" then
+			return "<Muted>" .. Game.phase .. "</Muted>"
+		end
+		return Game.turn == Game.you and "<Success>мой ход</Success>" or "<Muted>ход соперника</Muted>"
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Буква",
+	Style = "Row",
+	Update = function()
+		if Game.letter == "" then
+			return "<Muted>-</Muted>"
+		end
+		return "<Accent>" .. string.upper(Game.letter) .. "</Accent>"
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Последний ответ",
+	Style = "Row",
+	Update = function()
+		return Solver.lastWord ~= "" and Solver.lastWord or "<Muted>-</Muted>"
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Время",
+	Style = "Bar",
+	Max = 15,
+	Update = function()
+		return math.min(Game.turnDuration or 15, timeLeft())
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Решено",
+	Style = "Row",
+	Update = function()
+		return "<Success>" .. Solver.solved .. "</Success>"
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Отказы",
+	Style = "Row",
+	Update = function()
+		return tostring(Solver.rejected)
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Раунд",
+	Style = "Row",
+	Update = function()
+		return tostring(Game.round)
+	end,
+})
+
+SolveInfo:CreateStatus({
+	Name = "Словарь",
+	Style = "Row",
+	Update = function()
+		if not Dictionary.loaded then
+			return "<Muted>загрузка…</Muted>"
+		end
+		return string.format("%d слов", Dictionary.total)
+	end,
+})
+
+----------------------------------------------------------------------
+-- ВКЛАДКА «СЛОВА»
+----------------------------------------------------------------------
+
+local WordsTab = Window:CreateTab({ Name = "Слова", Icon = "book-open" })
+local DataBox = WordsTab:CreateGroupbox({ Name = "Словарь", Side = "Left" })
+local NotesBox = WordsTab:CreateGroupbox({ Name = "Запас", Side = "Right" })
+
+DataBox:CreateLabel({
+	Text = "Загрузка…",
+	Update = function()
+		if not Dictionary.loaded then
+			return "Слова ещё загружаются…"
+		end
+		return string.format("%d слов (%s)", Dictionary.total, Dictionary.source)
+	end,
+})
+
+DataBox:CreateButton({
+	Name = "Обновить словарь",
+	Icon = "refresh-cw",
+	Callback = function()
+		task.spawn(reloadDictionaries)
+	end,
+})
+
+DataBox:CreateInput({
+	Name = "Добавить своё слово",
+	PlaceholderText = "слово",
+	Callback = function(text)
+		local word = cleanWord(string.lower(tostring(text)))
+		if not word then
+			log("<Warning>Нужно русское слово из 3–29 букв</Warning>")
+			return
+		end
+		if learnWord(word) then
+			log("Добавлено: <Accent>" .. word .. "</Accent>")
+		else
+			log("<Muted>Уже есть: " .. word .. "</Muted>")
+		end
+	end,
+})
+
+NotesBox:CreateStatus({
+	Name = "Выучено",
+	Style = "Row",
+	Update = function()
+		return tostring(countPool(Dictionary.learned))
+	end,
+})
+
+NotesBox:CreateButton({
+	Name = "Сохранить слова",
+	Icon = "save",
+	Callback = function()
+		Dictionary.learnedDirty = true
+		saveLearned()
+		log("Слова сохранены")
+	end,
+})
+
+----------------------------------------------------------------------
+-- ВКЛАДКА «НАСТРОЙКИ»
+----------------------------------------------------------------------
+
+local SettingsTab = Window:CreateTab({ Name = "Настройки", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Конфиги", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Тема", Side = "Right" })
+
+local HelpBox = SettingsTab:CreateGroupbox({ Name = "Горячие клавиши", Side = "Right" })
+HelpBox:CreateParagraph({
+	Title = "Управление",
+	Content = "RightShift — ответить один раз\nRightControl — показать или скрыть окно",
+})
+
+----------------------------------------------------------------------
+-- Старт
+----------------------------------------------------------------------
+
+task.spawn(function()
+	buildDictionary(false, function(ok)
+		if ok then
+			log(string.format("<Success>Словарь готов</Success> — %d слов", Dictionary.total))
+		else
+			log("<Warning>Словарь не загрузился, работает встроенный список</Warning>")
+		end
+	end)
+end)
+
+task.spawn(function()
+	Action:FireServer("sync")
+	task.wait(2)
+	pcall(function()
+		Window:LoadAutoload()
+	end)
+end)
+
+--- Пригодится в консоли и для отладки из другого скрипта.
+getgenv().__WordSolver = {
+	window = Window,
+	log = Log,
+	game = Game,
+	solver = Solver,
+	settings = Settings,
+	dictionary = Dictionary,
+	reload = reloadDictionaries,
+}
+
+print("[RobScript.com] Решатель слов загружен")
