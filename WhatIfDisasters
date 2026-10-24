@@ -1,0 +1,312 @@
+-- Robly Movement Hub (Airflow UI)
+-- WalkSpeed / JumpPower sliders, Fly, NoClip, Click TP + per-feature keybinds
+
+if _G.RoblyHubCleanup then
+    pcall(_G.RoblyHubCleanup)
+end
+
+local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau"))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local State = {
+    WalkSpeed = 16,
+    JumpPower = 50,
+    Fly = false,
+    FlySpeed = 60,
+    NoClip = false,
+    ClickTP = false,
+}
+
+local Connections = {}
+
+local function GetHumanoid()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function GetRoot()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+-- WalkSpeed / JumpPower: reapply every frame so the game cannot reset them
+table.insert(Connections, RunService.RenderStepped:Connect(function()
+    local hum = GetHumanoid()
+    if hum then
+        if hum.WalkSpeed ~= State.WalkSpeed then
+            hum.WalkSpeed = State.WalkSpeed
+        end
+        if hum.JumpPower ~= State.JumpPower then
+            hum.JumpPower = State.JumpPower
+        end
+    end
+end))
+
+-- Fly (LinearVelocity based, moves along camera direction)
+local FlyVelocity = nil
+local FlyAttachment = nil
+
+local function DestroyFly()
+    if FlyVelocity then
+        FlyVelocity:Destroy()
+        FlyVelocity = nil
+    end
+    if FlyAttachment then
+        FlyAttachment:Destroy()
+        FlyAttachment = nil
+    end
+    local hum = GetHumanoid()
+    if hum then
+        hum.PlatformStand = false
+    end
+end
+
+local function CreateFly()
+    local root = GetRoot()
+    local hum = GetHumanoid()
+    if not root or not hum then
+        return
+    end
+    DestroyFly()
+    FlyAttachment = Instance.new("Attachment")
+    FlyAttachment.Name = "RoblyFlyAttachment"
+    FlyAttachment.Parent = root
+    FlyVelocity = Instance.new("LinearVelocity")
+    FlyVelocity.Name = "RoblyFlyVelocity"
+    FlyVelocity.Attachment0 = FlyAttachment
+    FlyVelocity.MaxForce = math.huge
+    FlyVelocity.VectorVelocity = Vector3.zero
+    FlyVelocity.Parent = root
+    hum.PlatformStand = true
+end
+
+local function SetFly(on)
+    State.Fly = on
+    if on then
+        CreateFly()
+    else
+        DestroyFly()
+    end
+end
+
+table.insert(Connections, RunService.RenderStepped:Connect(function()
+    if not (State.Fly and FlyVelocity) then
+        return
+    end
+    local hum = GetHumanoid()
+    if not hum then
+        return
+    end
+    local dir = hum.MoveDirection
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+        dir = dir + Vector3.new(0, 1, 0)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+        dir = dir + Vector3.new(0, -1, 0)
+    end
+    FlyVelocity.VectorVelocity = dir.Magnitude > 0 and (dir.Unit * State.FlySpeed) or Vector3.zero
+end))
+
+-- NoClip
+local NoClipConnection = nil
+
+local function SetNoClip(on)
+    State.NoClip = on
+    if on then
+        NoClipConnection = RunService.Stepped:Connect(function()
+            local char = LocalPlayer.Character
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        part.CanCollide = false
+                    end
+                end
+            end
+        end)
+    else
+        if NoClipConnection then
+            NoClipConnection:Disconnect()
+            NoClipConnection = nil
+        end
+        local char = LocalPlayer.Character
+        if char then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end
+end
+
+-- Click TP
+table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or not State.ClickTP then
+        return
+    end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+        return
+    end
+    if UserInputService:GetFocusedTextBox() then
+        return
+    end
+    local root = GetRoot()
+    if not root then
+        return
+    end
+    local mousePos = UserInputService:GetMouseLocation()
+    local ray = Camera:ViewportPointToRay(mousePos.X, mousePos.Y)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local result = Workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
+    if result then
+        local target = result.Position + Vector3.new(0, 3, 0)
+        local look = root.CFrame.LookVector
+        root.CFrame = CFrame.new(target, target + Vector3.new(look.X, 0, look.Z))
+    end
+end))
+
+-- Reapply after respawn
+table.insert(Connections, LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    DestroyFly()
+    if State.Fly then
+        CreateFly()
+    end
+end))
+
+-- UI
+local Window = Airflow:CreateWindow({
+    Name = "Robly Hub",
+    LoadingSubtitle = "Movement & keybinds",
+    Icon = "wind",
+    ToggleUIKeybind = "RightShift",
+    ConfigurationSaving = { Enabled = true, FolderName = "RoblyHub" },
+    Home = {
+        Tier = "Free",
+        Stats = { "Players", "FPS", "Ping" },
+        SupportedExecutors = { "Potassium" },
+    },
+})
+
+local Movement = Window:CreateTab({ Name = "Movement", Icon = "person-standing", Desc = "Speed, flight and world" })
+local SpeedBox = Movement:AddLeftGroupbox({ Name = "Speed", Icon = "gauge" })
+local FlightBox = Movement:AddRightGroupbox({ Name = "Flight", Icon = "plane" })
+local WorldBox = Movement:AddLeftGroupbox({ Name = "World", Icon = "globe" })
+
+SpeedBox:CreateSlider({
+    Name = "Walk speed",
+    Desc = "Studs per second",
+    Range = { 16, 500 },
+    Increment = 1,
+    Suffix = " sps",
+    CurrentValue = 16,
+    Flag = "WalkSpeed",
+    Callback = function(value)
+        State.WalkSpeed = value
+    end,
+})
+
+SpeedBox:CreateSlider({
+    Name = "Jump power",
+    Desc = "Studs per second",
+    Range = { 50, 500 },
+    Increment = 1,
+    Suffix = " sps",
+    CurrentValue = 50,
+    Flag = "JumpPower",
+    Callback = function(value)
+        State.JumpPower = value
+    end,
+})
+
+local FlyToggle = FlightBox:CreateToggle({
+    Name = "Fly",
+    Desc = "WASD to move, Space up, Ctrl down",
+    Flag = "Fly",
+    Callback = function(on)
+        SetFly(on)
+    end,
+})
+
+FlightBox:CreateSlider({
+    Name = "Fly speed",
+    Range = { 10, 500 },
+    Increment = 1,
+    Suffix = " sps",
+    CurrentValue = 60,
+    Flag = "FlySpeed",
+    Callback = function(value)
+        State.FlySpeed = value
+    end,
+})
+
+local NoClipToggle = WorldBox:CreateToggle({
+    Name = "NoClip",
+    Desc = "Pass through walls",
+    Flag = "NoClip",
+    Callback = function(on)
+        SetNoClip(on)
+    end,
+})
+
+local ClickTPToggle = WorldBox:CreateToggle({
+    Name = "Click TP",
+    Desc = "Left click to teleport",
+    Flag = "ClickTP",
+    Callback = function(on)
+        State.ClickTP = on
+    end,
+})
+
+local Binds = Window:CreateTab({ Name = "Keybinds", Icon = "keyboard" })
+local KeyBox = Binds:AddLeftGroupbox({ Name = "Toggles", Icon = "keyboard" })
+
+KeyBox:CreateKeybind({
+    Name = "Fly",
+    CurrentKeybind = "F",
+    Flag = "FlyKey",
+    Callback = function()
+        FlyToggle:Set(not State.Fly)
+    end,
+})
+
+KeyBox:CreateKeybind({
+    Name = "NoClip",
+    CurrentKeybind = "N",
+    Flag = "NoClipKey",
+    Callback = function()
+        NoClipToggle:Set(not State.NoClip)
+    end,
+})
+
+KeyBox:CreateKeybind({
+    Name = "Click TP",
+    CurrentKeybind = "T",
+    Flag = "ClickTPKey",
+    Callback = function()
+        ClickTPToggle:Set(not State.ClickTP)
+    end,
+})
+
+_G.RoblyHubCleanup = function()
+    DestroyFly()
+    if NoClipConnection then
+        NoClipConnection:Disconnect()
+    end
+    for _, connection in ipairs(Connections) do
+        connection:Disconnect()
+    end
+    Window:Destroy()
+    _G.RoblyHubCleanup = nil
+end
+
+print("[RoblyHub] Loaded. RightShift hides the window.")
