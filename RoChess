@@ -1,0 +1,927 @@
+-- Robly Chess Bot for RoChess! (v7)
+-- Engine: built-in negamax + quiescence.
+-- Live games (online/bot): position from session.ucis, moves via App.onBoardMove
+--   (game coordinates: 1-based a1-first => gameSq = mirrorW(engineIdx) + 1).
+-- Other modes: board read from ChessUI piece ImageLabels (S1 = bottom-left).
+
+if _G.RoblyChessCleanup then pcall(_G.RoblyChessCleanup) end
+
+local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau"))()
+
+local Players = game:GetService("Players")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- The game's own client module (cached require = same table the app uses).
+local App
+do
+    local ok, mod = pcall(require, game:GetService("ReplicatedStorage"):WaitForChild("ChessClient"):WaitForChild("App"))
+    if ok and type(mod) == "table" then App = mod end
+end
+
+---------------------------------------------------------------
+-- Chess engine
+---------------------------------------------------------------
+local VALUES = { P = 100, N = 320, B = 330, R = 500, Q = 900, K = 0 }
+
+local PST = {
+    P = { 0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10,
+          5,5,10,25,25,10,5,5, 0,0,0,20,20,0,0,0, 5,-5,-10,0,0,-10,-5,5,
+          5,10,10,-20,-20,10,10,5, 0,0,0,0,0,0,0,0 },
+    N = { -50,-40,-30,-30,-30,-30,-40,-50, -40,-20,0,0,0,0,-20,-40,
+          -30,0,10,15,15,10,0,-30, -30,5,15,20,20,15,5,-30,
+          -30,0,15,20,20,15,0,-30, -30,5,10,15,15,10,5,-30,
+          -40,-20,0,5,5,0,-20,-40, -50,-40,-30,-30,-30,-30,-40,-50 },
+    B = { -20,-10,-10,-10,-10,-10,-10,-20, -10,0,0,0,0,0,0,-10,
+          -10,0,5,10,10,5,0,-10, -10,5,5,10,10,5,5,-10,
+          -10,0,10,10,10,10,0,-10, -10,10,10,10,10,10,10,-10,
+          -10,5,0,0,0,0,5,-10, -20,-10,-10,-10,-10,-10,-10,-20 },
+    R = { 0,0,0,0,0,0,0,0, 5,10,10,10,10,10,10,5,
+          -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5,
+          -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5,
+          -5,0,0,0,0,0,0,-5, 0,0,0,5,5,0,0,0 },
+    Q = { -20,-10,-10,-5,-5,-10,-10,-20, -10,0,0,0,0,0,0,-10,
+          -10,0,5,5,5,5,0,-10, -5,0,5,5,5,5,0,-5,
+          0,0,5,5,5,5,0,-5, -10,5,5,5,5,5,0,-10,
+          -10,0,5,0,0,0,0,-10, -20,-10,-10,-5,-5,-10,-10,-20 },
+    K = { -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+          -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+          -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10,
+          20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20 },
+}
+
+local KNIGHT_D = { {1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2} }
+local KING_D = { {1,0},{1,1},{0,1},{-1,1},{-1,0},{-1,-1},{0,-1},{1,-1} }
+local BISHOP_D = { {1,1},{1,-1},{-1,1},{-1,-1} }
+local ROOK_D = { {1,0},{-1,0},{0,1},{0,-1} }
+
+local function fileOf(i) return i % 8 end
+local function rankOf(i) return math.floor(i / 8) end
+local function sq(f, r) return r * 8 + f end
+local function isWhitePiece(p) return p ~= nil and p ~= "" and p:upper() == p end
+local function colorOf(p) return isWhitePiece(p) and "w" or "b" end
+local function enemySide(c) return c == "w" and "b" or "w" end
+
+local Engine = {}
+
+function Engine.NewState()
+    return { b = {}, side = "w", castling = "KQkq", ep = -1 }
+end
+
+function Engine.IsAttacked(st, target, bySide)
+    local b = st.b
+    local tf, tr = fileOf(target), rankOf(target)
+    -- engine row 0 = rank 8: white pawns advance toward row 0 (dir -1),
+    -- black pawns toward row 7 (dir +1)
+    local pr = bySide == "w" and (tr + 1) or (tr - 1)
+    if pr >= 0 and pr < 8 then
+        for _, df in ipairs({ -1, 1 }) do
+            local nf = tf + df
+            if nf >= 0 and nf < 8 and b[sq(nf, pr)] == (bySide == "w" and "P" or "p") then
+                return true
+            end
+        end
+    end
+    for _, d in ipairs(KNIGHT_D) do
+        local nf, nr = tf + d[1], tr + d[2]
+        if nf >= 0 and nf < 8 and nr >= 0 and nr < 8 and b[sq(nf, nr)] == (bySide == "w" and "N" or "n") then
+            return true
+        end
+    end
+    for _, d in ipairs(KING_D) do
+        local nf, nr = tf + d[1], tr + d[2]
+        if nf >= 0 and nf < 8 and nr >= 0 and nr < 8 and b[sq(nf, nr)] == (bySide == "w" and "K" or "k") then
+            return true
+        end
+    end
+    for _, d in ipairs(BISHOP_D) do
+        local nf, nr = tf + d[1], tr + d[2]
+        while nf >= 0 and nf < 8 and nr >= 0 and nr < 8 do
+            local p = b[sq(nf, nr)]
+            if p ~= "" then
+                if colorOf(p) == bySide then
+                    local u = p:upper()
+                    if u == "B" or u == "Q" then return true end
+                end
+                break
+            end
+            nf = nf + d[1]; nr = nr + d[2]
+        end
+    end
+    for _, d in ipairs(ROOK_D) do
+        local nf, nr = tf + d[1], tr + d[2]
+        while nf >= 0 and nf < 8 and nr >= 0 and nr < 8 do
+            local p = b[sq(nf, nr)]
+            if p ~= "" then
+                if colorOf(p) == bySide then
+                    local u = p:upper()
+                    if u == "R" or u == "Q" then return true end
+                end
+                break
+            end
+            nf = nf + d[1]; nr = nr + d[2]
+        end
+    end
+    return false
+end
+
+local function addMove(moves, from, to, captured, promo, flags)
+    table.insert(moves, { from = from, to = to, captured = captured or "", promo = promo or "", flags = flags or "" })
+end
+
+local function genPseudo(st, capturesOnly)
+    local b = st.b
+    local side = st.side
+    local moves = {}
+    for i = 0, 63 do
+        local p = b[i]
+        if p ~= "" and colorOf(p) == side then
+            local u = p:upper()
+            local f, r = fileOf(i), rankOf(i)
+            if u == "P" then
+                -- engine row 0 = rank 8: white advances toward row 0, black toward row 7
+                local dir = side == "w" and -1 or 1
+                local startRank = side == "w" and 6 or 1
+                local promoRank = side == "w" and 0 or 7
+                local oneR = r + dir
+                if oneR >= 0 and oneR < 8 then
+                    local one = sq(f, oneR)
+                    if b[one] == "" then
+                        if not capturesOnly then
+                            if oneR == promoRank then
+                                for _, pr in ipairs({ "Q", "R", "B", "N" }) do
+                                    addMove(moves, i, one, "", side == "w" and pr or pr:lower(), "promo")
+                                end
+                            else
+                                addMove(moves, i, one)
+                            end
+                        end
+                        if r == startRank then
+                            local two = sq(f, r + 2 * dir)
+                            if b[two] == "" then
+                                addMove(moves, i, two, "", "", "double")
+                            end
+                        end
+                    end
+                    for _, df in ipairs({ -1, 1 }) do
+                        local nf = f + df
+                        if nf >= 0 and nf < 8 then
+                            local t = sq(nf, oneR)
+                            local tp = b[t]
+                            if tp ~= "" and colorOf(tp) ~= side then
+                                if oneR == promoRank then
+                                    for _, pr in ipairs({ "Q", "R", "B", "N" }) do
+                                        addMove(moves, i, t, tp, side == "w" and pr or pr:lower(), "promo")
+                                    end
+                                else
+                                    addMove(moves, i, t, tp)
+                                end
+                            elseif t == st.ep and tp == "" then
+                                addMove(moves, i, t, side == "w" and "p" or "P", "", "ep")
+                            end
+                        end
+                    end
+                end
+            elseif u == "N" or u == "K" then
+                for _, d in ipairs(u == "N" and KNIGHT_D or KING_D) do
+                    local nf, nr = f + d[1], r + d[2]
+                    if nf >= 0 and nf < 8 and nr >= 0 and nr < 8 then
+                        local t = sq(nf, nr)
+                        local tp = b[t]
+                        if tp == "" then
+                            if not capturesOnly then addMove(moves, i, t) end
+                        elseif colorOf(tp) ~= side then
+                            addMove(moves, i, t, tp)
+                        end
+                    end
+                end
+            end
+            if u == "B" or u == "R" or u == "Q" then
+                local dirs = {}
+                if u == "B" or u == "Q" then for _, d in ipairs(BISHOP_D) do table.insert(dirs, d) end end
+                if u == "R" or u == "Q" then for _, d in ipairs(ROOK_D) do table.insert(dirs, d) end end
+                for _, d in ipairs(dirs) do
+                    local nf, nr = f + d[1], r + d[2]
+                    while nf >= 0 and nf < 8 and nr >= 0 and nr < 8 do
+                        local t = sq(nf, nr)
+                        local tp = b[t]
+                        if tp == "" then
+                            if not capturesOnly then addMove(moves, i, t) end
+                        else
+                            if colorOf(tp) ~= side then addMove(moves, i, t, tp) end
+                            break
+                        end
+                        nf = nf + d[1]; nr = nr + d[2]
+                    end
+                end
+            end
+        end
+    end
+    if not capturesOnly then
+        local b2 = st.b
+        local opp = enemySide(side)
+        -- board indexing: index 0 = a8, 63 = h1. White home rank = 56..63, black = 0..7.
+        if side == "w" and b2[60] == "K" then
+            if st.castling:find("K") and b2[61] == "" and b2[62] == "" and b2[63] == "R"
+                and not Engine.IsAttacked(st, 60, opp) and not Engine.IsAttacked(st, 61, opp) and not Engine.IsAttacked(st, 62, opp) then
+                addMove(moves, 60, 62, "", "", "castle")
+            end
+            if st.castling:find("Q") and b2[59] == "" and b2[58] == "" and b2[57] == "" and b2[56] == "R"
+                and not Engine.IsAttacked(st, 60, opp) and not Engine.IsAttacked(st, 59, opp) and not Engine.IsAttacked(st, 58, opp) then
+                addMove(moves, 60, 58, "", "", "castle")
+            end
+        elseif side == "b" and b2[4] == "k" then
+            if st.castling:find("k") and b2[5] == "" and b2[6] == "" and b2[7] == "r"
+                and not Engine.IsAttacked(st, 4, opp) and not Engine.IsAttacked(st, 5, opp) and not Engine.IsAttacked(st, 6, opp) then
+                addMove(moves, 4, 6, "", "", "castle")
+            end
+            if st.castling:find("q") and b2[3] == "" and b2[2] == "" and b2[1] == "" and b2[0] == "r"
+                and not Engine.IsAttacked(st, 4, opp) and not Engine.IsAttacked(st, 3, opp) and not Engine.IsAttacked(st, 2, opp) then
+                addMove(moves, 4, 2, "", "", "castle")
+            end
+        end
+    end
+    return moves
+end
+
+function Engine.Make(st, m)
+    local b = st.b
+    local undo = { captured = b[m.to], cf = -1, castling = st.castling, ep = st.ep, moved = b[m.from] }
+    local p = b[m.from]
+    if m.flags == "ep" then
+        local capSq = m.to + (st.side == "w" and 8 or -8)
+        undo.captured = b[capSq]
+        undo.cf = capSq
+        b[capSq] = ""
+    end
+    b[m.to] = m.promo ~= "" and m.promo or p
+    b[m.from] = ""
+    if m.flags == "castle" then
+        if m.to == 62 then b[61] = b[63]; b[63] = ""
+        elseif m.to == 58 then b[59] = b[56]; b[56] = ""
+        elseif m.to == 6 then b[5] = b[7]; b[7] = ""
+        elseif m.to == 2 then b[3] = b[0]; b[0] = "" end
+    end
+    local c = st.castling
+    if p == "K" then c = c:gsub("K", ""):gsub("Q", "")
+    elseif p == "k" then c = c:gsub("k", ""):gsub("q", "") end
+    if m.from == 56 or m.to == 56 then c = c:gsub("Q", "") end
+    if m.from == 63 or m.to == 63 then c = c:gsub("K", "") end
+    if m.from == 0 or m.to == 0 then c = c:gsub("q", "") end
+    if m.from == 7 or m.to == 7 then c = c:gsub("k", "") end
+    st.castling = c
+    st.ep = -1
+    if m.flags == "double" then st.ep = m.from + (st.side == "w" and -8 or 8) end
+    st.side = enemySide(st.side)
+    return undo
+end
+
+function Engine.Unmake(st, m, undo)
+    local b = st.b
+    st.side = enemySide(st.side)
+    b[m.from] = undo.moved
+    if undo.cf >= 0 then
+        b[undo.cf] = undo.captured
+        b[m.to] = ""
+    else
+        b[m.to] = undo.captured
+    end
+    if m.flags == "castle" then
+        if m.to == 62 then b[63] = b[61]; b[61] = ""
+        elseif m.to == 58 then b[56] = b[59]; b[59] = ""
+        elseif m.to == 6 then b[7] = b[5]; b[5] = ""
+        elseif m.to == 2 then b[0] = b[3]; b[3] = "" end
+    end
+    st.castling = undo.castling
+    st.ep = undo.ep
+end
+
+local function findKing(st, side)
+    local k = side == "w" and "K" or "k"
+    for i = 0, 63 do
+        if st.b[i] == k then return i end
+    end
+    return -1
+end
+
+function Engine.LegalMoves(st)
+    local pseudo = genPseudo(st, false)
+    local out = {}
+    local mySide = st.side
+    for _, m in ipairs(pseudo) do
+        local undo = Engine.Make(st, m)
+        if not Engine.IsAttacked(st, findKing(st, mySide), st.side) then
+            table.insert(out, m)
+        end
+        Engine.Unmake(st, m, undo)
+    end
+    return out
+end
+
+local function mirrorW(i) return (7 - math.floor(i / 8)) * 8 + (i % 8) end
+
+local function evaluate(st)
+    local score = 0
+    local b = st.b
+    for i = 0, 63 do
+        local p = b[i]
+        if p ~= "" then
+            local w = isWhitePiece(p)
+            local u = p:upper()
+            local tbl = PST[u]
+            local v = VALUES[u] + (tbl and tbl[w and mirrorW(i) or i] or 0)
+            if w then score = score + v else score = score - v end
+        end
+    end
+    return st.side == "w" and score or -score
+end
+
+local moveCounter = 0
+local maxNodes = 0
+
+local function quiesce(st, alpha, beta, qd)
+    moveCounter = moveCounter + 1
+    local stand = evaluate(st)
+    if qd >= 5 or stand >= beta then return stand end
+    if stand > alpha then alpha = stand end
+    local moves = genPseudo(st, true)
+    table.sort(moves, function(a, b2)
+        local va = a.captured ~= "" and VALUES[a.captured:upper()] or 0
+        local vb = b2.captured ~= "" and VALUES[b2.captured:upper()] or 0
+        return va > vb
+    end)
+    local mySide = st.side
+    for _, m in ipairs(moves) do
+        local undo = Engine.Make(st, m)
+        local ksq = findKing(st, mySide)
+        if not Engine.IsAttacked(st, ksq, st.side) then
+            local score = -quiesce(st, -beta, -alpha, qd + 1)
+            Engine.Unmake(st, m, undo)
+            if score >= beta then return beta end
+            if score > alpha then alpha = score end
+        else
+            Engine.Unmake(st, m, undo)
+        end
+        if moveCounter > maxNodes then return alpha end
+    end
+    return alpha
+end
+
+local function search(st, depth, alpha, beta, ply)
+    moveCounter = moveCounter + 1
+    if moveCounter > maxNodes then return evaluate(st) end
+    if depth <= 0 then return quiesce(st, alpha, beta, 0) end
+    local moves = genPseudo(st, false)
+    table.sort(moves, function(a, b2)
+        local va = (a.captured ~= "" and VALUES[a.captured:upper()] or 0) * 10 + (a.promo ~= "" and 900 or 0)
+        local vb = (b2.captured ~= "" and VALUES[b2.captured:upper()] or 0) * 10 + (b2.promo ~= "" and 900 or 0)
+        return va > vb
+    end)
+    local mySide = st.side
+    local anyLegal = false
+    for _, m in ipairs(moves) do
+        local undo = Engine.Make(st, m)
+        local legal = not Engine.IsAttacked(st, findKing(st, mySide), st.side)
+        if legal then
+            anyLegal = true
+            local score = -search(st, depth - 1, -beta, -alpha, ply + 1)
+            Engine.Unmake(st, m, undo)
+            if score >= beta then return beta end
+            if score > alpha then alpha = score end
+        else
+            Engine.Unmake(st, m, undo)
+        end
+        if moveCounter > maxNodes then break end
+    end
+    if not anyLegal then
+        if Engine.IsAttacked(st, findKing(st, mySide), enemySide(st.side)) then
+            return -100000 + ply
+        end
+        return 0
+    end
+    return alpha
+end
+
+function Engine.BestMove(st, maxDepth, nodeCap)
+    maxNodes = nodeCap or 200000
+    moveCounter = 0
+    local rootMoves = Engine.LegalMoves(st)
+    if #rootMoves == 0 then return nil end
+    if #rootMoves == 1 then return rootMoves[1] end
+    table.sort(rootMoves, function(a, b2)
+        local va = (a.captured ~= "" and VALUES[a.captured:upper()] or 0) * 10
+        local vb = (b2.captured ~= "" and VALUES[b2.captured:upper()] or 0) * 10
+        return va > vb
+    end)
+    local best = rootMoves[1]
+    local bestScore = -1000000
+    for depth = 1, maxDepth do
+        local localBest, localScore = best, -1000000
+        local alpha = -1000000
+        for _, m in ipairs(rootMoves) do
+            local undo = Engine.Make(st, m)
+            local score = -search(st, depth - 1, -1000000, -alpha, 1)
+            Engine.Unmake(st, m, undo)
+            if score > localScore then
+                localScore = score
+                localBest = m
+            end
+            if score > alpha then alpha = score end
+            if moveCounter > maxNodes then break end
+        end
+        if moveCounter <= maxNodes then
+            best, bestScore = localBest, localScore
+        end
+        if moveCounter > maxNodes then break end
+        if math.abs(bestScore) > 90000 then break end
+    end
+    return best, bestScore
+end
+
+---------------------------------------------------------------
+-- RoChess! adapter
+---------------------------------------------------------------
+local PIECE_BY_IMG = {
+    ["rbxassetid://108253639129512"] = "K",
+    ["rbxassetid://128494764910602"] = "Q",
+    ["rbxassetid://133288029788689"] = "R",
+    ["rbxassetid://85269847273836"] = "B",
+    ["rbxassetid://111025513068016"] = "N",
+    ["rbxassetid://130108347060797"] = "P",
+    ["rbxassetid://99364349373891"] = "k",
+    ["rbxassetid://87797543393819"] = "q",
+    ["rbxassetid://92908975354335"] = "r",
+    ["rbxassetid://72796651173850"] = "b",
+    ["rbxassetid://104573159846789"] = "n",
+    ["rbxassetid://71167246324478"] = "p",
+}
+
+local function getBoard()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    local chess = gui:FindFirstChild("ChessUI")
+    if not chess then return nil end
+    local root = chess:FindFirstChild("Root")
+    if not root then return nil end
+    local board = root:FindFirstChild("Board")
+    if not board then return nil end
+    return board
+end
+
+local Config = { AutoPlay = false, Depth = 3, NodeCap = 150000, MoveDelay = 1.5 }
+local Bot = { orientation = "w", ourSide = "w", state = nil, lastGrid = nil, pending = nil,
+    lastAttempt = 0, running = true, lastInfo = "idle", lastMove = "-", lastPly = -1, awaitingPly = nil }
+
+-- S-frames: S1 = visually BOTTOM-left. Engine row 0 = rank 8.
+local function squareToIndex(n)
+    local vn = math.floor((n - 1) / 8)
+    local col = (n - 1) % 8
+    if Bot.orientation == "w" then
+        return (7 - vn) * 8 + col
+    end
+    return vn * 8 + (7 - col)
+end
+
+local function indexToSquareFrame(board, idx)
+    local erow, f = math.floor(idx / 8), idx % 8
+    local n
+    if Bot.orientation == "w" then
+        n = (7 - erow) * 8 + f + 1
+    else
+        n = erow * 8 + (7 - f) + 1
+    end
+    return board.Squares:FindFirstChild("S" .. n)
+end
+
+local function readGrid(board)
+    local centers = {}
+    local sqSize = 100
+    for i = 1, 64 do
+        local fr = board.Squares:FindFirstChild("S" .. i)
+        if not fr then return nil end
+        local ap, as = fr.AbsolutePosition, fr.AbsoluteSize
+        centers[i] = Vector2.new(ap.X + as.X / 2, ap.Y + as.Y / 2)
+        sqSize = math.max(sqSize, as.X)
+    end
+    local sgrid = {}
+    for i = 0, 63 do sgrid[i] = "" end
+    local pieces = board:FindFirstChild("Pieces")
+    if not pieces then return nil end
+    for _, p in ipairs(pieces:GetChildren()) do
+        if p:IsA("ImageLabel") and p.Visible then
+            local piece = PIECE_BY_IMG[p.Image]
+            if piece then
+                local ap, as = p.AbsolutePosition, p.AbsoluteSize
+                local c = Vector2.new(ap.X + as.X / 2, ap.Y + as.Y / 2)
+                local bestN, bestD = 0, math.huge
+                for n = 1, 64 do
+                    local d = (centers[n] - c).Magnitude
+                    if d < bestD then bestD, bestN = d, n end
+                end
+                if bestN > 0 and bestD < sqSize * 0.75 then
+                    sgrid[bestN - 1] = piece
+                end
+            end
+        end
+    end
+    -- orientation: white king in the visual bottom half => white at bottom
+    for i = 0, 63 do
+        if sgrid[i] == "K" then
+            Bot.orientation = math.floor(i / 8) <= 3 and "w" or "b"
+            break
+        end
+    end
+    local grid = {}
+    for n = 1, 64 do grid[squareToIndex(n)] = sgrid[n - 1] end
+    return grid
+end
+
+local function inferCastling(grid)
+    local c = ""
+    if grid[60] == "K" then
+        if grid[63] == "R" then c = c .. "K" end
+        if grid[56] == "R" then c = c .. "Q" end
+    end
+    if grid[4] == "k" then
+        if grid[7] == "r" then c = c .. "k" end
+        if grid[0] == "r" then c = c .. "q" end
+    end
+    return c
+end
+
+local function resync(board, sideGuess)
+    local grid = readGrid(board)
+    if not grid then return false end
+    Bot.ourSide = Bot.orientation
+    local count = 0
+    for i = 0, 63 do if grid[i] ~= "" then count = count + 1 end end
+    if count < 2 then Bot.state = nil Bot.lastGrid = nil return false end
+    local st = Engine.NewState()
+    st.b = grid
+    st.castling = inferCastling(grid)
+    st.side = sideGuess or "w"
+    Bot.state = st
+    Bot.lastGrid = grid
+    Bot.lastInfo = "synced (" .. count .. " pieces, we play " .. Bot.ourSide .. ")"
+    return true
+end
+
+local function applyMove(st, m)
+    local legal = Engine.LegalMoves(st)
+    for _, lm in ipairs(legal) do
+        if lm.from == m.from and lm.to == m.to and (m.promo == "" or lm.promo:upper() == m.promo:upper()) then
+            Engine.Make(st, lm)
+            return lm
+        end
+    end
+    return nil
+end
+
+-- Build engine state from the game's move list (live sessions, ground truth).
+local START_BACK = "RNBQKBNR"
+
+local function newGameState()
+    local st = Engine.NewState()
+    for i = 0, 63 do st.b[i] = "" end
+    for f = 0, 7 do
+        st.b[f] = START_BACK:sub(f + 1, f + 1):lower()
+        st.b[8 + f] = "p"
+        st.b[48 + f] = "P"
+        st.b[56 + f] = START_BACK:sub(f + 1, f + 1)
+    end
+    return st
+end
+
+local function uciSquare(u, pos)
+    local f = string.byte(u, pos) - 97
+    local r = tonumber(u:sub(pos + 1, pos + 1))
+    if not f or not r or f < 0 or f > 7 or r < 1 or r > 8 then return nil end
+    return (8 - r) * 8 + f
+end
+
+local function stateFromUcis(ucis)
+    local st = newGameState()
+    for _, u in ipairs(ucis) do
+        if type(u) ~= "string" or #u < 4 then return nil end
+        local from, to = uciSquare(u, 1), uciSquare(u, 3)
+        if not from or not to then return nil end
+        local mv = { from = from, to = to, promo = #u >= 5 and u:sub(5, 5) or "" }
+        if not applyMove(st, mv) then return nil end
+    end
+    return st
+end
+
+local function diffToMove(oldG, newG)
+    local froms, tos = {}, {}
+    for i = 0, 63 do
+        local o, nw = oldG[i], newG[i]
+        if o ~= nw then
+            if o ~= "" and nw == "" then table.insert(froms, i)
+            elseif nw ~= "" then table.insert(tos, i) end
+        end
+    end
+    if #froms == 0 or #tos == 0 then return nil end
+    if #froms == 2 and #tos == 2 then
+        for _, fr in ipairs(froms) do
+            local p = oldG[fr]
+            if p == "K" or p == "k" then
+                for _, t in ipairs(tos) do
+                    if math.abs(fileOf(t) - fileOf(fr)) == 2 then
+                        return { from = fr, to = t, flags = "castle" }
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    if #froms == 1 and #tos == 1 then
+        local from, to = froms[1], tos[1]
+        local p = oldG[from]
+        local m = { from = from, to = to, flags = "" }
+        if p == "P" or p == "p" then
+            local moved = newG[to]
+            if moved:upper() ~= "P" then
+                m.promo = moved
+                m.flags = "promo"
+            elseif fileOf(from) ~= fileOf(to) and oldG[to] == "" then
+                m.flags = "ep"
+            end
+        end
+        return m
+    end
+    return nil
+end
+
+local function squareName(idx)
+    return string.char(97 + fileOf(idx)) .. tostring(8 - rankOf(idx))
+end
+
+local function clickSquare(board, idx)
+    local fr = indexToSquareFrame(board, idx)
+    if not fr then return false end
+    local ap, as = fr.AbsolutePosition, fr.AbsoluteSize
+    local x, y = ap.X + as.X / 2, ap.Y + as.Y / 2
+    VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+    task.wait(0.08)
+    VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    return true
+end
+
+local PROMO_TYPE_ID = { Q = 5, R = 4, B = 3, N = 2 }
+
+-- engine move (0-63, row0=rank8) -> game coords (1-64, 1=a1)
+local function toGameSquare(idx)
+    return mirrorW(idx) + 1
+end
+
+local function performMove(board, m)
+    local done = false
+    local s = App and App.session
+    if s and (s.kind == "online" or s.kind == "bot") and not s.over then
+        local promoId = m.promo ~= "" and PROMO_TYPE_ID[m.promo:upper()] or nil
+        local ok, res = pcall(App.onBoardMove, toGameSquare(m.from), toGameSquare(m.to), promoId)
+        if not ok then
+            print("[RoblyChess] onBoardMove error:", res)
+        else
+            done = res ~= false
+        end
+    end
+    if not done then
+        clickSquare(board, m.from)
+        task.wait(0.25)
+        clickSquare(board, m.to)
+    end
+    Bot.pending = { from = m.from, to = m.to, time = os.clock() }
+    Bot.lastMove = squareName(m.from) .. squareName(m.to) .. (m.promo ~= "" and "=" .. m.promo:upper() or "")
+end
+
+local function thinkAndPlay(board)
+    if not Bot.state then return end
+    if Bot.state.side ~= Bot.ourSide then return end
+    if os.clock() - Bot.lastAttempt < Config.MoveDelay then return end
+    Bot.lastAttempt = os.clock()
+    Bot.lastInfo = "thinking (depth " .. Config.Depth .. ")..."
+    local best, score = Engine.BestMove(Bot.state, Config.Depth, Config.NodeCap)
+    if not best then Bot.lastInfo = "no legal moves" return end
+    Bot.lastInfo = string.format("played %s%s (eval %+d)", squareName(best.from), squareName(best.to), score or 0)
+    performMove(board, best)
+end
+
+local function liveSession()
+    local s = App and App.session
+    if s and (s.kind == "online" or s.kind == "bot") then return s end
+    return nil
+end
+
+local function tickLive(s, board)
+    if s.over then
+        Bot.lastInfo = "game over"
+        Bot.awaitingPly = nil
+        return
+    end
+    local ucis = s.ucis or {}
+    if Bot.awaitingPly then
+        if #ucis >= Bot.awaitingPly then
+            Bot.awaitingPly = nil
+        elseif os.clock() - (Bot.awaitingSince or 0) > 6 then
+            Bot.awaitingPly = nil
+            Bot.lastPly = -2
+            Bot.lastInfo = "move confirm timeout - resyncing"
+        else
+            return -- waiting for server to confirm our move
+        end
+    end
+    if #ucis ~= Bot.lastPly or not Bot.state then
+        Bot.lastPly = #ucis
+        local st = stateFromUcis(ucis)
+        if st then
+            Bot.state = st
+            Bot.lastGrid = nil
+            Bot.pending = nil
+            Bot.lastInfo = "live sync (ply " .. #ucis .. ", to move " .. st.side .. ")"
+        else
+            Bot.state = nil
+            Bot.lastInfo = "uci parse failed (ply " .. #ucis .. ")"
+        end
+    end
+    if not Bot.state then return end
+    local ok, myTurn = pcall(function() return s:isMyTurn() end)
+    if not ok or not myTurn then return end
+    Bot.ourSide = Bot.state.side
+    if not Config.AutoPlay then return end
+    if os.clock() - Bot.lastAttempt < Config.MoveDelay then return end
+    Bot.lastAttempt = os.clock()
+    Bot.lastInfo = "thinking (depth " .. Config.Depth .. ")..."
+    local best, score = Engine.BestMove(Bot.state, Config.Depth, Config.NodeCap)
+    if not best then Bot.lastInfo = "no legal moves" return end
+    Bot.lastInfo = string.format("played %s%s (eval %+d)", squareName(best.from), squareName(best.to), score or 0)
+    Bot.lastMove = squareName(best.from) .. squareName(best.to) .. (best.promo ~= "" and "=" .. best.promo:upper() or "")
+    local promoId = best.promo ~= "" and PROMO_TYPE_ID[best.promo:upper()] or nil
+    local ok2, res = pcall(App.onBoardMove, toGameSquare(best.from), toGameSquare(best.to), promoId)
+    if ok2 then
+        -- onBoardMove may return false/nil even when the move was accepted
+        -- (bot games), so confirmation comes from ucis, not the return value.
+        Bot.awaitingPly = #ucis + 1
+        Bot.awaitingSince = os.clock()
+        if res == false then Bot.lastInfo = Bot.lastInfo .. " [sent?]" end
+    else
+        print("[RoblyChess] onBoardMove error:", res)
+        Bot.lastInfo = "move rejected by game"
+        Bot.lastAttempt = os.clock() + 5
+    end
+end
+
+local function botLoop()
+    task.wait(1)
+    while Bot.running do
+        local board = getBoard()
+        local s = liveSession()
+        if s and board then
+            tickLive(s, board)
+        elseif board then
+            local grid = readGrid(board)
+            if grid then
+                local anyPiece = false
+                for i = 0, 63 do if grid[i] ~= "" then anyPiece = true break end end
+                if anyPiece then
+                    if not Bot.state or not Bot.lastGrid then
+                        resync(board)
+                    else
+                        local mv = diffToMove(Bot.lastGrid, grid)
+                        if mv then
+                            if Bot.pending and mv.from == Bot.pending.from and mv.to == Bot.pending.to then
+                                Bot.pending = nil
+                                local ok = Bot.state and applyMove(Bot.state, mv)
+                                if not ok then resync(board) end
+                            else
+                                local ok = Bot.state and applyMove(Bot.state, mv)
+                                if not ok then
+                                    resync(board)
+                                else
+                                    Bot.lastInfo = "opponent: " .. squareName(mv.from) .. squareName(mv.to)
+                                end
+                            end
+                        else
+                            local changes = 0
+                            for i = 0, 63 do if grid[i] ~= Bot.lastGrid[i] then changes = changes + 1 end end
+                            if changes > 4 then
+                                resync(board)
+                            end
+                        end
+                    end
+                    Bot.lastGrid = grid
+                    if Config.AutoPlay then
+                        thinkAndPlay(board)
+                    end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end
+
+---------------------------------------------------------------
+-- UI
+---------------------------------------------------------------
+local Window = Airflow:CreateWindow({
+    Name = "Robly Chess",
+    LoadingSubtitle = "Engine & auto-play",
+    Icon = "crown",
+    ToggleUIKeybind = "RightShift",
+    ConfigurationSaving = { Enabled = true, FolderName = "RoblyChess" },
+    Home = { Tier = "Free", Stats = { "Players", "FPS", "Ping" }, SupportedExecutors = { "Potassium" } },
+})
+
+local Tab = Window:CreateTab({ Name = "Chess", Icon = "crown", Desc = "Engine and auto-play" })
+local EngineBox = Tab:AddLeftGroupbox({ Name = "Engine", Icon = "brain" })
+local PlayBox = Tab:AddRightGroupbox({ Name = "Play", Icon = "play" })
+
+EngineBox:CreateSlider({
+    Name = "Depth", Range = { 1, 5 }, Increment = 1, Suffix = " ply",
+    CurrentValue = 3, Flag = "ChessDepth",
+    Callback = function(v) Config.Depth = v end,
+})
+
+EngineBox:CreateSlider({
+    Name = "Think budget", Range = { 2, 10 }, Increment = 1, Suffix = "00k nodes",
+    CurrentValue = 15, Flag = "ChessNodes",
+    Callback = function(v) Config.NodeCap = v * 10000 end,
+})
+
+EngineBox:CreateSlider({
+    Name = "Move delay", Range = { 0, 10 }, Increment = 0.5, Suffix = " s",
+    CurrentValue = 1.5, Flag = "ChessDelay",
+    Callback = function(v) Config.MoveDelay = v end,
+})
+
+PlayBox:CreateToggle({
+    Name = "Auto play",
+    Desc = "Bot plays your moves",
+    Flag = "ChessAuto",
+    Callback = function(on) Config.AutoPlay = on end,
+})
+
+PlayBox:CreateButton({
+    Name = "Hint",
+    Desc = "Best move for current position",
+    Callback = function()
+        if not Bot.state then
+            Window:Notify({ Title = "Chess", Text = "No position yet - wait for sync", Type = "Warning" })
+            return
+        end
+        Bot.lastInfo = "thinking..."
+        task.spawn(function()
+            local best, score = Engine.BestMove(Bot.state, Config.Depth, Config.NodeCap)
+            if best then
+                local txt = string.format("Best: %s%s (eval %+d)", squareName(best.from), squareName(best.to), score or 0)
+                Bot.lastInfo = txt
+                Window:Notify({ Title = "Hint", Text = txt, Type = "Success" })
+            end
+        end)
+    end,
+})
+
+PlayBox:CreateButton({
+    Name = "Play now",
+    Desc = "Make the best move immediately",
+    Callback = function()
+        local board = getBoard()
+        if board then
+            Bot.lastAttempt = 0
+            thinkAndPlay(board)
+        end
+    end,
+})
+
+PlayBox:CreateButton({
+    Name = "Resync board",
+    Callback = function()
+        local board = getBoard()
+        if board then
+            Bot.state = nil
+            Bot.lastGrid = nil
+            Bot.lastPly = -1
+            resync(board)
+        end
+    end,
+})
+
+local StatusLabel = Tab:CreateLabel({ Text = "idle", UpdateRate = 1, Update = function()
+    local sk = App and App.session and App.session.kind or "-"
+    return "Status: " .. Bot.lastInfo .. " | side: " .. (Bot.state and Bot.state.side or "-") .. " | we: " .. Bot.ourSide .. " | last: " .. Bot.lastMove .. " | session: " .. sk
+end })
+
+task.spawn(botLoop)
+
+_G.RoblyChess = { Bot = Bot, Engine = Engine, Config = Config, App = App,
+    thinkAndPlay = thinkAndPlay, getBoard = getBoard, resync = resync, readGrid = readGrid,
+    stateFromUcis = stateFromUcis, toGameSquare = toGameSquare }
+
+_G.RoblyChessCleanup = function()
+    Bot.running = false
+    Window:Destroy()
+    _G.RoblyChessCleanup = nil
+end
+
+print("[RoblyChess] Loaded v7.4. RightShift hides the window.")
