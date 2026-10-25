@@ -127,6 +127,8 @@ local TEXT = {
 		tabRebirth = "Ферма ребёрса",
 		rebirthFarm = "Фарм яиц под ребёрс",
 		rebirthFarmDesc = "Покупает только яйцо, которое просит следующий ребёрс",
+		rebirthReal = "Только настоящие яйца",
+		rebirthRealDesc = "Фейковые яйца всегда пропускаются. При включении ферма также активирует авто-ребёрс.",
 		rebirthNeed = "Нужно",
 		rebirthDone = "условие выполнено",
 		rebirthNone = "нет требования",
@@ -254,6 +256,8 @@ local TEXT = {
 		tabRebirth = "Rebirth farm",
 		rebirthFarm = "Farm eggs for rebirth",
 		rebirthFarmDesc = "Buys only the egg the next rebirth asks for",
+		rebirthReal = "Real eggs only",
+		rebirthRealDesc = "Fake eggs are always skipped. Turning this farm on also enables Auto rebirth.",
 		rebirthNeed = "Needs",
 		rebirthDone = "requirement met",
 		rebirthNone = "no requirement",
@@ -335,7 +339,7 @@ local TEXT = {
 
 local Settings = {
 	farm = false,
-	onlyBetter = true,
+	onlyBetter = false,
 	maxPriceEnabled = false,
 	maxPrice = 1000000000000,
 	skipFake = true,
@@ -607,7 +611,8 @@ local function pickEgg(mode)
 	local wanted = mode == "rebirth" and rebirthAnimal() or nil
 	local names = Settings.eggNames
 	local rarities = Settings.eggRarities
-	local realOnly = isOn("skipFake")
+	-- Rebirth farming always skips fake eggs, independently of the Farm toggle.
+	local realOnly = mode == "rebirth" or isOn("skipFake")
 
 	for _, prompt in ipairs(workspace:GetDescendants()) do
 		if prompt:IsA("ProximityPrompt") and prompt.ActionText == "Buy" and prompt.Parent and prompt.Enabled then
@@ -1478,8 +1483,19 @@ local function buildUI()
 		CurrentValue = Settings.rebirthFarm,
 		Callback = function(on)
 			Settings.rebirthFarm = on
+			if on then
+				Settings.rebirth = true
+				if UiRefs.rebirth then
+					UiRefs.rebirth:Set(true)
+				end
+			end
 			log(on and T.rebirthOn or T.rebirthOff)
 		end,
+	})
+
+	RebirthMain:CreateParagraph({
+		Title = T.rebirthReal,
+		Content = T.rebirthRealDesc,
 	})
 
 	RebirthInfo:CreateStatus({
@@ -1711,7 +1727,7 @@ local function buildUI()
 	local AutoMain = AutoTab:CreateGroupbox({ Name = T.tabAuto, Side = "Left" })
 	local AutoInfo = AutoTab:CreateGroupbox({ Name = T.state, Side = "Right" })
 
-	AutoMain:CreateToggle({
+	UiRefs.rebirth = AutoMain:CreateToggle({
 		Name = T.rebirth,
 		Desc = T.rebirthDesc,
 		Flag = "AutoRebirth",
