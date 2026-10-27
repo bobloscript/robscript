@@ -1,0 +1,1239 @@
+--!nonstrict
+--[[
+	Robscript team - NFT Battle
+	Case opening and inventory automation for the NFT Battle case opener (place "Ugc").
+
+	UI framework: Robly Airflow (https://github.com/bobloscript/Robly_Airflow)
+
+	Game surface this script drives (verified against the live client):
+	  * ReplicatedStorage.Events.OpenCase:InvokeServer(caseName, amount, {})
+	      -> true   opened
+	      -> false  refused
+	      -> "Buy"  the case needs a Robux product, the client should open a purchase prompt
+	  * ReplicatedStorage.Events.Inventory:FireServer("Sell", itemName)
+	      only honoured for the inventory cards the game itself rendered, so selling goes
+	      through each card's own Sell signal instead of a hand-made FireServer call.
+	  * ReplicatedStorage.Info.Cases / .PaidCases / .Gifts
+	  * PlayerGui.MainGui.Topbar.Right.Stars
+	  * PlayerGui.MainGui.Pages.Profile.MainFrame.Scroll.Default
+
+	Pacing: the server accepts roughly one open request every 5.7 seconds (measured: an
+	attempt 5.7s after the previous success goes through, anything below 4s is refused, and
+	amount 1 and amount 10 share the same window). Refused attempts are cheap but useless,
+	so the loop waits out the cooldown instead of hammering the remote.
+
+	Strict typing is off on purpose: the executor injects globals (getconnections, firesignal,
+	loadstring, HttpGet) that a strict analyser cannot see.
+]]
+
+----- Identity -----
+
+local HUB_NAME = "Robscript team - NFT Battle"
+local HUB_VERSION = "1.0.0"
+local HUB_FOLDER = "RobScriptNFT"
+
+----- UI library -----
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+for _, url in ipairs(UI_SOURCES) do
+	local loaded, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if loaded and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[" .. HUB_NAME .. "] could not load the Airflow UI library")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+pcall(function()
+	Airflow:LoadFont({ Name = "ValleySans" })
+end)
+
+pcall(function()
+	Airflow:PreloadIcons()
+end)
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+----- Constants -----
+
+local MAX_OPEN_AMOUNT = 10
+local DAILY_CASE_NAME = "Daily"
+-- One accepted open per server window. Anything faster is refused, so this is a floor.
+local SERVER_COOLDOWN = 5.8
+local SELL_STEP_DELAY = 0.12
+local RARE_DROP_PRICE = 5000
+local MAX_CONSECUTIVE_FAILURES = 30
+
+----- Runtime state -----
+
+local state = {
+	selectedCase = nil,
+	autoOpenRequested = false,
+	autoSellRequested = false,
+	sellBusy = false,
+	opens = 0,
+	spent = 0,
+	sold = 0,
+	earned = 0,
+	bestDrop = nil,
+	lastDrop = nil,
+	lastOpenAt = 0,
+}
+
+local ui = {}
+
+----- Small helpers -----
+
+local function formatNumber(value)
+	local number = math.floor(tonumber(value) or 0)
+	local text = tostring(number)
+	local sign = ""
+	if string.sub(text, 1, 1) == "-" then
+		sign = "-"
+		text = string.sub(text, 2)
+	end
+	local reversed = string.reverse(text)
+	reversed = string.gsub(reversed, "(%d%d%d)", "%1,")
+	local formatted = string.reverse(reversed)
+	if string.sub(formatted, 1, 1) == "," then
+		formatted = string.sub(formatted, 2)
+	end
+	formatted = string.gsub(formatted, ",$", "")
+	return sign .. formatted
+end
+
+local function escapeRichText(text)
+	local value = tostring(text)
+	value = string.gsub(value, "&", "&amp;")
+	value = string.gsub(value, "<", "&lt;")
+	value = string.gsub(value, ">", "&gt;")
+	return value
+end
+
+local function waitForChild(parent, childName, timeout)
+	if not parent then
+		return nil
+	end
+	local existing = parent:FindFirstChild(childName)
+	if existing then
+		return existing
+	end
+	local deadline = os.clock() + (timeout or 10)
+	while os.clock() < deadline do
+		local found = parent:FindFirstChild(childName)
+		if found then
+			return found
+		end
+		task.wait(0.2)
+	end
+	return nil
+end
+
+----- Game data -----
+
+local eventsFolder = waitForChild(ReplicatedStorage, "Events", 15)
+local openCaseRemote = waitForChild(eventsFolder, "OpenCase", 10)
+local infoFolder = waitForChild(ReplicatedStorage, "Info", 10)
+
+local casePrices = {}
+local caseData = {}
+local caseNames = {}
+local paidCaseNames = {}
+local giftPrices = {}
+
+do
+	local casesModule = infoFolder and infoFolder:FindFirstChild("Cases")
+	if casesModule then
+		local loaded, data = pcall(require, casesModule)
+		if loaded and type(data) == "table" then
+			for name, entry in pairs(data) do
+				if type(name) == "string" and type(entry) == "table" then
+					casePrices[name] = tonumber(entry.Price) or 0
+					caseData[name] = entry
+					table.insert(caseNames, name)
+				end
+			end
+		end
+	end
+
+	local paidModule = infoFolder and infoFolder:FindFirstChild("PaidCases")
+	if paidModule then
+		local loaded, data = pcall(require, paidModule)
+		if loaded and type(data) == "table" then
+			for name in pairs(data) do
+				if type(name) == "string" then
+					paidCaseNames[name] = true
+				end
+			end
+		end
+	end
+
+	-- Authoritative item prices. The card labels animate their number, so a scan that read
+	-- them mid-animation would see values like 16 for a 100 star item.
+	local giftsModule = infoFolder and infoFolder:FindFirstChild("Gifts")
+	if giftsModule then
+		local loaded, data = pcall(require, giftsModule)
+		if loaded and type(data) == "table" then
+			for name, entry in pairs(data) do
+				if type(name) == "string" and type(entry) == "table" then
+					local price = tonumber(entry.Price)
+					if price then
+						giftPrices[name] = price
+					end
+				end
+			end
+		end
+	end
+
+	-- Fallback: read the case buttons the cases page rendered, in case the modules change.
+	if #caseNames == 0 then
+		local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		local mainGui = playerGui and playerGui:FindFirstChild("MainGui")
+		local pages = mainGui and mainGui:FindFirstChild("Pages")
+		local casesPage = pages and pages:FindFirstChild("Cases")
+		local mainFrame = casesPage and casesPage:FindFirstChild("MainFrame")
+		if mainFrame then
+			for _, group in ipairs(mainFrame:GetChildren()) do
+				if string.sub(group.Name, 1, 2) == "G_" then
+					for _, button in ipairs(group:GetChildren()) do
+						if button:IsA("GuiButton") then
+							casePrices[button.Name] = casePrices[button.Name] or 0
+							table.insert(caseNames, button.Name)
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+table.sort(caseNames, function(left, right)
+	local leftPrice = casePrices[left] or 0
+	local rightPrice = casePrices[right] or 0
+	if leftPrice == rightPrice then
+		return left < right
+	end
+	return leftPrice < rightPrice
+end)
+
+-- Short labels: a free case, a star price, or a Robux case.
+local function caseLabel(caseName)
+	if paidCaseNames[caseName] then
+		return caseName .. " - robux"
+	end
+	local price = casePrices[caseName] or 0
+	if price <= 0 then
+		return caseName .. " - free"
+	end
+	return caseName .. " - " .. formatNumber(price) .. " stars"
+end
+
+local caseLabels = {}
+local labelToCase = {}
+for _, caseName in ipairs(caseNames) do
+	local label = caseLabel(caseName)
+	table.insert(caseLabels, label)
+	labelToCase[label] = caseName
+end
+
+-- Accepts a current label, a bare case name, or a label saved by an older build
+-- ("Trash · free"), so a loaded config never leaves the hub without a case.
+local function resolveCase(option)
+	if type(option) ~= "string" or option == "" then
+		return nil
+	end
+	if labelToCase[option] then
+		return labelToCase[option]
+	end
+	if casePrices[option] ~= nil then
+		return option
+	end
+	local name = string.match(option, "^(.-)%s*[·–%-]")
+	if name and casePrices[name] ~= nil then
+		return name
+	end
+	return nil
+end
+
+local defaultCase = labelToCase[caseLabel("Trash")] and "Trash" or caseNames[1]
+state.selectedCase = defaultCase
+
+local function describeDrops(caseName)
+	local entry = caseData[caseName]
+	local drops = entry and entry.Drop
+	if type(drops) ~= "table" then
+		return "<Muted>unknown</Muted>"
+	end
+	local parts = {}
+	for _, drop in ipairs(drops) do
+		if type(drop) == "table" and drop[1] ~= nil then
+			table.insert(parts, escapeRichText(drop[1]) .. " " .. tostring(drop[2]) .. "%")
+		end
+	end
+	if #parts == 0 then
+		return "<Muted>unknown</Muted>"
+	end
+	return table.concat(parts, " · ")
+end
+
+----- Game access -----
+
+local function getMainGui()
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	return playerGui and playerGui:FindFirstChild("MainGui")
+end
+
+local function getInventoryGrid()
+	local mainGui = getMainGui()
+	local pages = mainGui and mainGui:FindFirstChild("Pages")
+	local profile = pages and pages:FindFirstChild("Profile")
+	local mainFrame = profile and profile:FindFirstChild("MainFrame")
+	local scroll = mainFrame and mainFrame:FindFirstChild("Scroll")
+	return scroll and scroll:FindFirstChild("Default")
+end
+
+local function getStars()
+	local mainGui = getMainGui()
+	local topbar = mainGui and mainGui:FindFirstChild("Topbar")
+	local right = topbar and topbar:FindFirstChild("Right")
+	local stars = right and right:FindFirstChild("Stars")
+	if not stars then
+		return nil
+	end
+	for _, child in ipairs(stars:GetDescendants()) do
+		if child:IsA("IntValue") then
+			return child.Value
+		end
+	end
+	return nil
+end
+
+local function parsePriceLabel(text)
+	if type(text) ~= "string" then
+		return 0
+	end
+	local digits = string.gsub(text, "[^%d]", "")
+	return tonumber(digits) or 0
+end
+
+local function itemPrice(itemName, card)
+	local known = giftPrices[itemName]
+	if known then
+		return known
+	end
+	local priceLabel = card and card:FindFirstChild("Price")
+	return priceLabel and parsePriceLabel(priceLabel.Text) or 0
+end
+
+local function findItemPrice(itemName)
+	local grid = getInventoryGrid()
+	return itemPrice(itemName, grid and grid:FindFirstChild(itemName))
+end
+
+local function countItems()
+	local grid = getInventoryGrid()
+	local counts = {}
+	if not grid then
+		return counts
+	end
+	for _, card in ipairs(grid:GetChildren()) do
+		if card:IsA("Frame") then
+			counts[card.Name] = (counts[card.Name] or 0) + 1
+		end
+	end
+	return counts
+end
+
+local function totalCount(counts)
+	local total = 0
+	for _, quantity in pairs(counts) do
+		total = total + quantity
+	end
+	return total
+end
+
+-- The inventory grid is redrawn a frame or two after the server replies, so the drop
+-- detection has to wait for the cards instead of sampling straight away.
+local function awaitInventoryGrowth(beforeCounts, expected, timeout)
+	local target = totalCount(beforeCounts) + math.max(expected, 1)
+	local deadline = os.clock() + (timeout or 1.5)
+	local counts = countItems()
+	while os.clock() < deadline do
+		if totalCount(counts) >= target then
+			return counts
+		end
+		task.wait(0.1)
+		counts = countItems()
+	end
+	return counts
+end
+
+local function scanInventory()
+	local grid = getInventoryGrid()
+	if not grid then
+		return nil, nil
+	end
+	local items = {}
+	local byName = {}
+	for _, card in ipairs(grid:GetChildren()) do
+		if card:IsA("Frame") then
+			local entry = byName[card.Name]
+			if not entry then
+				entry = {
+					name = card.Name,
+					price = itemPrice(card.Name, card),
+					quantity = 0,
+				}
+				byName[card.Name] = entry
+				table.insert(items, entry)
+			end
+			entry.quantity = entry.quantity + 1
+		end
+	end
+	table.sort(items, function(left, right)
+		if left.price == right.price then
+			return left.name < right.name
+		end
+		return left.price < right.price
+	end)
+	return items, byName
+end
+
+local function fireButton(button)
+	if not button or not button:IsA("GuiButton") then
+		return false
+	end
+	local fired = false
+	if type(getconnections) == "function" then
+		local ok, connections = pcall(getconnections, button.Activated)
+		if ok and type(connections) == "table" then
+			for _, connection in ipairs(connections) do
+				if connection.Enabled then
+					fired = true
+					task.spawn(function()
+						pcall(connection.Function)
+					end)
+				end
+			end
+		end
+	end
+	if not fired and type(firesignal) == "function" then
+		pcall(firesignal, button.Activated)
+		fired = true
+	end
+	return fired
+end
+
+----- Logging -----
+
+local function pushActivity(text, kind)
+	if ui.activityLog then
+		ui.activityLog:Push(text, kind)
+	end
+end
+
+local function pushDrop(text, kind)
+	if ui.dropLog then
+		ui.dropLog:Push(text, kind)
+	end
+end
+
+----- Pacing -----
+
+local function configuredCooldown()
+	local fromSlider = ui.openDelay and ui.openDelay.Value or SERVER_COOLDOWN
+	return math.max(fromSlider, SERVER_COOLDOWN)
+end
+
+local function cooldownRemaining()
+	return math.max(configuredCooldown() - (os.clock() - state.lastOpenAt), 0)
+end
+
+----- Case opening -----
+
+-- Returns status, message. Status is one of: "opened", "skipped", "failed", "purchase", "error".
+local function openOnce(ignoreCooldown)
+	local caseName = state.selectedCase or defaultCase
+	if type(caseName) ~= "string" or caseName == "" then
+		return "error", "Pick a case first"
+	end
+	if not openCaseRemote then
+		return "error", "Game remote is missing"
+	end
+	if not ignoreCooldown and cooldownRemaining() > 0 then
+		return "skipped", string.format("Wait %.0fs, the server allows one open at a time", cooldownRemaining())
+	end
+	if ui.skipDaily and ui.skipDaily.Value and caseName == DAILY_CASE_NAME then
+		return "skipped", "Daily case is skipped"
+	end
+	if ui.skipPaid and ui.skipPaid.Value and paidCaseNames[caseName] then
+		return "skipped", caseName .. " costs Robux"
+	end
+
+	local amount = 1
+	if ui.openAmount then
+		amount = math.clamp(math.floor(ui.openAmount.Value + 0.5), 1, MAX_OPEN_AMOUNT)
+	end
+
+	local unitPrice = casePrices[caseName] or 0
+	local totalCost = unitPrice * amount
+	local reserve = ui.minStars and math.floor(ui.minStars.Value) or 0
+
+	if totalCost > 0 then
+		local stars = getStars()
+		if stars and (stars - totalCost) < reserve then
+			return "skipped", "Not enough stars"
+		end
+	end
+
+	local before = countItems()
+	local starsBefore = getStars()
+
+	local invoked, result = pcall(function()
+		return openCaseRemote:InvokeServer(caseName, amount, {})
+	end)
+
+	-- Count the cooldown from the answer, not from the request, so the next attempt never
+	-- lands inside the server window.
+	state.lastOpenAt = os.clock()
+
+	if not invoked then
+		return "error", tostring(result)
+	end
+	if result == "Buy" then
+		return "purchase", caseName .. " costs Robux"
+	end
+	if result ~= true then
+		return "failed", "Server said no, trying again"
+	end
+
+	state.opens = state.opens + amount
+	local starsAfter = getStars()
+	if starsBefore and starsAfter and starsAfter < starsBefore then
+		state.spent = state.spent + (starsBefore - starsAfter)
+	end
+
+	local after = awaitInventoryGrowth(before, amount, 1.5)
+	local gained = {}
+	for itemName, quantity in pairs(after) do
+		local previous = before[itemName] or 0
+		if quantity > previous then
+			table.insert(gained, {
+				name = itemName,
+				quantity = quantity - previous,
+				price = findItemPrice(itemName),
+			})
+		end
+	end
+	table.sort(gained, function(left, right)
+		return left.price > right.price
+	end)
+
+	local totalValue = 0
+	for _, drop in ipairs(gained) do
+		totalValue = totalValue + drop.price * drop.quantity
+		if not state.bestDrop or drop.price > state.bestDrop.price then
+			state.bestDrop = { name = drop.name, price = drop.price }
+		end
+		local kind = drop.price >= RARE_DROP_PRICE and "Success" or nil
+		pushDrop(string.format(
+			"<Accent>%s</Accent> x%d · %s⭐",
+			escapeRichText(drop.name),
+			drop.quantity,
+			formatNumber(drop.price)
+		), kind)
+	end
+	if gained[1] then
+		state.lastDrop = { name = gained[1].name, price = gained[1].price }
+	end
+
+	if #gained == 0 then
+		pushActivity(string.format("Opened <Accent>%s</Accent> x%d", escapeRichText(caseName), amount))
+	else
+		pushActivity(string.format(
+			"Opened <Accent>%s</Accent> x%d · got %s⭐",
+			escapeRichText(caseName),
+			amount,
+			formatNumber(totalValue)
+		))
+	end
+
+	return "opened", caseName
+end
+
+----- Selling -----
+
+-- The inventory server drops part of the requests sent back to back, so a sale is only
+-- counted once the card has actually left the grid.
+local function sellCard(card, timeout)
+	if not card or not card:IsA("Frame") then
+		return false
+	end
+	if not fireButton(card:FindFirstChild("Sell")) then
+		return false
+	end
+	local deadline = os.clock() + (timeout or 0.7)
+	while os.clock() < deadline do
+		if card.Parent == nil then
+			return true
+		end
+		task.wait(0.05)
+	end
+	return false
+end
+
+local function runSellPass(batchLimit)
+	if state.sellBusy then
+		return 0, 0
+	end
+	local items = scanInventory()
+	if not items then
+		pushActivity("<Warning>Inventory is still loading</Warning>", "Warning")
+		return 0, 0
+	end
+	local threshold = ui.sellThreshold and ui.sellThreshold.Value or 0
+	local limit = batchLimit or (ui.sellBatch and math.floor(ui.sellBatch.Value) or 100)
+	local starsBefore = getStars() or 0
+	local soldCount = 0
+	local misses = 0
+
+	state.sellBusy = true
+	for _, entry in ipairs(items) do
+		if soldCount >= limit or misses >= 3 then
+			break
+		end
+		if entry.price > 0 and entry.price <= threshold then
+			while soldCount < limit and misses < 3 do
+				local grid = getInventoryGrid()
+				local card = grid and grid:FindFirstChild(entry.name)
+				if not card then
+					break
+				end
+				if sellCard(card) then
+					soldCount = soldCount + 1
+					misses = 0
+					task.wait(SELL_STEP_DELAY)
+				else
+					misses = misses + 1
+					task.wait(SELL_STEP_DELAY * 2)
+				end
+			end
+		end
+	end
+	state.sellBusy = false
+
+	local starsAfter = getStars() or starsBefore
+	local earned = math.max(0, starsAfter - starsBefore)
+	if soldCount > 0 then
+		state.sold = state.sold + soldCount
+		state.earned = state.earned + earned
+		pushActivity(string.format(
+			"Sold <Accent>%d</Accent> · +%s⭐",
+			soldCount,
+			formatNumber(earned)
+		))
+	end
+	if misses >= 3 then
+		pushActivity("<Muted>Slow down a bit, the server is refusing sells</Muted>")
+	end
+	return soldCount, earned
+end
+
+local function printInventoryScan()
+	local items = scanInventory()
+	if not items then
+		pushActivity("<Warning>Inventory is still loading</Warning>", "Warning")
+		return
+	end
+	local quantity = 0
+	local value = 0
+	local rows = {}
+	for _, entry in ipairs(items) do
+		quantity = quantity + entry.quantity
+		value = value + entry.price * entry.quantity
+		table.insert(rows, { entry.name, entry.price, entry.quantity })
+	end
+
+	print(string.format(
+		"[NFT Battle] %d kinds, %d items, %s stars total",
+		#items,
+		quantity,
+		formatNumber(value)
+	))
+	for _, entry in ipairs(items) do
+		print(string.format(
+			"  %-36s price %9s  qty %d",
+			entry.name,
+			formatNumber(entry.price),
+			entry.quantity
+		))
+	end
+
+	if ui.scanTable then
+		ui.scanTable:SetRows(rows)
+	end
+	pushActivity(string.format(
+		"Scanned <Accent>%d</Accent> kinds · %d items · %s⭐",
+		#items,
+		quantity,
+		formatNumber(value)
+	))
+end
+
+----- Loops -----
+
+local autoOpenThread = nil
+local autoSellThread = nil
+
+local function stopAutoOpen()
+	if autoOpenThread then
+		task.cancel(autoOpenThread)
+		autoOpenThread = nil
+	end
+end
+
+-- Stops the loop, flips the switch back and tells the player why. Used for reasons the
+-- player has to fix (Robux case, daily case, not enough stars), so it never spins silently.
+local function haltAutoOpen(message, kind)
+	state.autoOpenRequested = false
+	if ui.autoOpenToggle then
+		ui.autoOpenToggle:Set(false, true)
+	end
+	pushActivity("<" .. kind .. ">Stopped:</" .. kind .. "> " .. escapeRichText(message), kind)
+	if ui.window then
+		ui.window:Notify({ Title = "Auto open stopped", Content = message, Type = kind })
+	end
+end
+
+local function startAutoOpen()
+	stopAutoOpen()
+	autoOpenThread = task.spawn(function()
+		local failures = 0
+		while state.autoOpenRequested do
+			if state.sellBusy then
+				task.wait(0.2)
+			else
+				local wait = cooldownRemaining()
+				if wait > 0 then
+					task.wait(math.min(wait, 0.4))
+				else
+					local status, message = openOnce(true)
+					if status == "opened" then
+						failures = 0
+					elseif status == "failed" then
+						failures = failures + 1
+						if failures == 1 or failures % 8 == 0 then
+							pushActivity("<Muted>" .. escapeRichText(message) .. "</Muted>")
+						end
+						if failures >= MAX_CONSECUTIVE_FAILURES then
+							haltAutoOpen("the server keeps refusing, check the case and your stars", "Error")
+							break
+						end
+						task.wait(1)
+					else
+						-- skipped, purchase or error: the player has to change something
+						haltAutoOpen(message, status == "error" and "Error" or "Warning")
+						break
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function stopAutoSell()
+	if autoSellThread then
+		task.cancel(autoSellThread)
+		autoSellThread = nil
+	end
+end
+
+local function startAutoSell()
+	stopAutoSell()
+	autoSellThread = task.spawn(function()
+		while state.autoSellRequested do
+			runSellPass()
+			task.wait(ui.sellScanDelay and ui.sellScanDelay.Value or 3)
+		end
+	end)
+end
+
+----- Window -----
+
+-- Re-running the script stops the previous instance instead of leaving a second set of
+-- loops selling and opening in the background. The old key is still checked so an upgrade
+-- from a previous build cannot leave a zombie behind.
+local shared = (type(getgenv) == "function" and getgenv()) or _G
+for _, key in ipairs({ "RobscriptNFTBattleShutdown", "UgcCaseHubShutdown" }) do
+	if type(shared[key]) == "function" then
+		pcall(shared[key])
+		shared[key] = nil
+	end
+end
+
+-- Same idea for stray windows left by an older title.
+local holder = (type(gethui) == "function" and gethui()) or nil
+if holder then
+	for _, child in ipairs(holder:GetChildren()) do
+		if child:IsA("ScreenGui") and (child.Name == HUB_NAME or child.Name == "Ugc Case Hub") then
+			pcall(function()
+				child:Destroy()
+			end)
+		end
+	end
+end
+
+local Window = Airflow:CreateWindow({
+	Name = HUB_NAME,
+	LoadingSubtitle = "auto open · auto sell",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(760, 520),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = HUB_FOLDER },
+	Home = {
+		Title = HUB_NAME,
+		Welcome = "Welcome back,",
+		Tier = "v" .. HUB_VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+ui.window = Window
+
+if #caseLabels == 0 then
+	caseLabels = { "No cases found" }
+end
+
+----- Tab: Open -----
+
+local OpenTab = Window:CreateTab({ Name = "Open", Icon = "package" })
+local OpenBox = OpenTab:CreateGroupbox({ Name = "Auto Open", Icon = "zap", Side = "Left" })
+local CaseBox = OpenTab:CreateGroupbox({ Name = "Selected Case", Icon = "gift", Side = "Right" })
+local AdvancedBox = OpenTab:CreateGroupbox({
+	Name = "Advanced",
+	Icon = "settings-2",
+	Side = "Right",
+	Collapsed = true,
+})
+
+OpenBox:CreateParagraph({
+	Title = "How it works",
+	Content = "Pick a case, switch AUTO OPEN on and leave it. The game server allows about one open every 6 seconds, so the timer on the right moves slowly - that is normal.",
+})
+
+ui.autoOpenToggle = OpenBox:CreateToggle({
+	Name = "AUTO OPEN",
+	Desc = "Keeps opening the selected case",
+	Flag = "AutoOpen",
+	CurrentValue = false,
+	Callback = function(enabled)
+		state.autoOpenRequested = enabled
+		if enabled then
+			startAutoOpen()
+		else
+			stopAutoOpen()
+		end
+	end,
+})
+
+OpenBox:CreateDropdown({
+	Name = "Case",
+	Desc = "Which case to open",
+	Options = caseLabels,
+	CurrentOption = defaultCase and caseLabel(defaultCase) or nil,
+	Flag = "CaseName",
+	Searchable = true,
+	MaxRows = 8,
+	Callback = function(option)
+		state.selectedCase = resolveCase(option) or state.selectedCase or defaultCase
+	end,
+})
+
+ui.openAmount = OpenBox:CreateStepper({
+	Name = "Cases per open",
+	Desc = "1 to 10 at a time, same waiting time",
+	Range = { 1, MAX_OPEN_AMOUNT },
+	Increment = 1,
+	CurrentValue = 1,
+	Flag = "OpenAmount",
+})
+
+OpenBox:CreateStatus({
+	Name = "Next open",
+	Style = "Row",
+	UpdateRate = 0.4,
+	Pin = true,
+	Update = function()
+		if state.sellBusy then
+			return "<Warning>selling…</Warning>"
+		end
+		if not state.autoOpenRequested then
+			return "<Muted>off</Muted>"
+		end
+		local wait = cooldownRemaining()
+		if wait > 0.1 then
+			return string.format("<Warning>%.0f s</Warning>", math.ceil(wait))
+		end
+		return "<Success>now</Success>"
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Opened",
+	Style = "Stat",
+	Update = function()
+		return formatNumber(state.opens)
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Spent",
+	Style = "Stat",
+	Update = function()
+		return formatNumber(state.spent) .. "⭐"
+	end,
+})
+
+CaseBox:CreateStatus({
+	Name = "Price",
+	Style = "Row",
+	Update = function()
+		local caseName = state.selectedCase
+		if not caseName then
+			return "<Muted>none</Muted>"
+		end
+		if paidCaseNames[caseName] then
+			return "<Warning>Robux</Warning>"
+		end
+		local price = casePrices[caseName] or 0
+		if price <= 0 then
+			return "<Success>free</Success>"
+		end
+		return formatNumber(price) .. "⭐"
+	end,
+})
+
+CaseBox:CreateStatus({
+	Name = "Last drop",
+	Style = "Row",
+	Update = function()
+		if not state.lastDrop then
+			return "<Muted>nothing yet</Muted>"
+		end
+		return escapeRichText(state.lastDrop.name) .. " " .. formatNumber(state.lastDrop.price) .. "⭐"
+	end,
+})
+
+CaseBox:CreateStatus({
+	Name = "Best drop",
+	Style = "Row",
+	Update = function()
+		if not state.bestDrop then
+			return "<Muted>nothing yet</Muted>"
+		end
+		return escapeRichText(state.bestDrop.name) .. " " .. formatNumber(state.bestDrop.price) .. "⭐"
+	end,
+})
+
+CaseBox:CreateStatus({
+	Name = "Contains",
+	Style = "Plain",
+	UpdateRate = 2,
+	Update = function()
+		local caseName = state.selectedCase
+		return caseName and describeDrops(caseName) or "<Muted>none</Muted>"
+	end,
+})
+
+CaseBox:CreateButton({
+	Name = "Open once",
+	Desc = "One open, no loop",
+	Icon = "play",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			local status, message = openOnce(false)
+			if status == "opened" then
+				return
+			end
+			local kind = (status == "error") and "Error" or "Warning"
+			pushActivity("<" .. kind .. ">" .. escapeRichText(message) .. "</" .. kind .. ">", kind)
+		end)
+	end,
+})
+
+ui.openDelay = AdvancedBox:CreateSlider({
+	Name = "Wait between opens",
+	Desc = "Server limit is about 6 seconds",
+	Range = { 6, 30 },
+	Increment = 1,
+	Suffix = " s",
+	CurrentValue = 6,
+	Flag = "OpenDelay",
+})
+
+ui.minStars = AdvancedBox:CreateSlider({
+	Name = "Keep this many stars",
+	Desc = "Auto open stops before going below",
+	Range = { 0, 10000000 },
+	Increment = 1000,
+	CurrentValue = 0,
+	Flag = "MinStars",
+})
+
+ui.skipDaily = AdvancedBox:CreateToggle({
+	Name = "Skip Daily case",
+	Desc = "It only works once a day",
+	Flag = "SkipDaily",
+	CurrentValue = true,
+})
+
+ui.skipPaid = AdvancedBox:CreateToggle({
+	Name = "Skip Robux cases",
+	Desc = "Never open a case that costs Robux",
+	Flag = "SkipPaid",
+	CurrentValue = true,
+})
+
+----- Tab: Sell -----
+
+local SellTab = Window:CreateTab({ Name = "Sell", Icon = "coins" })
+local SellBox = SellTab:CreateGroupbox({ Name = "Auto Sell", Icon = "tag", Side = "Left" })
+local BagBox = SellTab:CreateGroupbox({ Name = "Inventory", Icon = "backpack", Side = "Right" })
+
+ui.autoSellToggle = SellBox:CreateToggle({
+	Name = "AUTO SELL",
+	Desc = "Sells everything cheaper than the price below",
+	Flag = "AutoSell",
+	CurrentValue = false,
+	Callback = function(enabled)
+		state.autoSellRequested = enabled
+		if enabled then
+			startAutoSell()
+		else
+			stopAutoSell()
+		end
+	end,
+})
+
+ui.sellThreshold = SellBox:CreateSlider({
+	Name = "Sell items under",
+	Desc = "Item price in stars",
+	Range = { 0, 2000000 },
+	Increment = 25,
+	Suffix = "⭐",
+	CurrentValue = 0,
+	Flag = "SellThreshold",
+})
+
+SellBox:CreateStatus({
+	Name = "Will sell",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local items = scanInventory()
+		if not items then
+			return "<Muted>loading</Muted>"
+		end
+		local threshold = ui.sellThreshold and ui.sellThreshold.Value or 0
+		local quantity = 0
+		local value = 0
+		for _, entry in ipairs(items) do
+			if entry.price > 0 and entry.price <= threshold then
+				quantity = quantity + entry.quantity
+				value = value + entry.price * entry.quantity
+			end
+		end
+		if quantity == 0 then
+			return "<Muted>nothing, raise the price</Muted>"
+		end
+		return string.format("%d items · ~%s⭐", quantity, formatNumber(value))
+	end,
+})
+
+SellBox:CreateButton({
+	Name = "Sell now",
+	Desc = "One pass, no loop",
+	Icon = "hand-coins",
+	Style = "Primary",
+	Callback = function()
+		if state.sellBusy then
+			pushActivity("<Warning>Sell pass is already running</Warning>", "Warning")
+			return
+		end
+		task.spawn(function()
+			local soldCount = runSellPass()
+			if soldCount == 0 then
+				pushActivity("<Muted>Nothing matched the price</Muted>")
+			end
+		end)
+	end,
+})
+
+ui.sellScanDelay = SellBox:CreateSlider({
+	Name = "Rescan every",
+	Desc = "How often auto sell looks at the bag",
+	Range = { 0.5, 30 },
+	Increment = 0.5,
+	Suffix = " s",
+	CurrentValue = 3,
+	Flag = "SellScanDelay",
+})
+
+ui.sellBatch = SellBox:CreateSlider({
+	Name = "Max per pass",
+	Desc = "Stops after this many items",
+	Range = { 5, 500 },
+	Increment = 5,
+	CurrentValue = 100,
+	Flag = "SellBatch",
+})
+
+BagBox:CreateStatus({
+	Name = "Sold",
+	Style = "Stat",
+	Update = function()
+		return formatNumber(state.sold)
+	end,
+})
+
+BagBox:CreateStatus({
+	Name = "Earned",
+	Style = "Stat",
+	Update = function()
+		return formatNumber(state.earned) .. "⭐"
+	end,
+})
+
+BagBox:CreateStatus({
+	Name = "Stars",
+	Style = "Row",
+	Update = function()
+		local stars = getStars()
+		if not stars then
+			return "<Muted>?</Muted>"
+		end
+		return formatNumber(stars)
+	end,
+})
+
+BagBox:CreateButton({
+	Name = "Print inventory",
+	Desc = "Dump the bag to the console",
+	Icon = "printer",
+	Callback = function()
+		task.spawn(printInventoryScan)
+	end,
+})
+
+ui.scanTable = BagBox:CreateTable({
+	Name = "Last scan",
+	Columns = {
+		{ Name = "Item", Width = 0.52 },
+		{ Name = "Price", Align = "Right", Width = 0.3 },
+		{ Name = "Qty", Align = "Right", Width = 0.16 },
+	},
+	Rows = {},
+	MaxRows = 6,
+	EmptyText = "Press Print inventory",
+	Search = true,
+})
+
+----- Tab: Log -----
+
+local LogTab = Window:CreateTab({ Name = "Log", Icon = "scroll-text" })
+local ActivityBox = LogTab:CreateGroupbox({ Name = "Everything", Icon = "list", Side = "Left" })
+local DropBox = LogTab:CreateGroupbox({ Name = "Drops", Icon = "gem", Side = "Right" })
+
+ui.activityLog = ActivityBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 400,
+	MaxRows = 12,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+ui.dropLog = DropBox:CreateLog({
+	Name = "Drops",
+	MaxEntries = 250,
+	MaxRows = 12,
+	Timestamps = true,
+	EmptyText = "No drops yet",
+})
+
+----- Tab: Settings -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+SettingsTab:CreateButton({
+	Name = "Unload hub",
+	Desc = "Closes the window and stops everything",
+	Icon = "power",
+	Confirm = "Click again to unload",
+	Callback = function()
+		if type(shared.RobscriptNFTBattleShutdown) == "function" then
+			shared.RobscriptNFTBattleShutdown()
+		end
+	end,
+})
+
+----- Start -----
+
+shared.RobscriptNFTBattleShutdown = function()
+	state.autoOpenRequested = false
+	state.autoSellRequested = false
+	stopAutoOpen()
+	stopAutoSell()
+	pcall(function()
+		Window:Destroy()
+	end)
+	shared.RobscriptNFTBattleShutdown = nil
+end
+
+Window:LoadAutoload()
+
+pushActivity(string.format(
+	"Ready · <Accent>%d</Accent> cases · %s⭐",
+	#caseNames,
+	formatNumber(getStars() or 0)
+))
+
+Window:Notify({
+	Title = HUB_NAME .. " v" .. HUB_VERSION,
+	Content = "Pick a case, then switch AUTO OPEN on",
+	Type = "Success",
+})
