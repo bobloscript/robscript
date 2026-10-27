@@ -1,0 +1,1342 @@
+--!nonstrict
+-- Robscript.com - PIGU
+-- Korean Dodgeball (한국 피구) · PlaceId 90696832826220
+-- UI: Robly Airflow (Robscript theme), loaded from GitHub on start.
+--
+-- How this works (reverse-engineered from the game client):
+--   * GameState (ReplicatedStorage.GameState) — round attributes:
+--       State (Playing / Intermission), TimeLeft, Alive, MapName, Rally,
+--       Rush, SuddenDeath, BallState (Loose / Held / Live),
+--       HolderId, FlightTarget, TargetId.
+--   * Remotes (ReplicatedStorage.DodgeShared.Remotes):
+--       RequestCharge(true|false)  — start the wind-up
+--       RequestThrow(power, dir, curve, targetUserId) — throw
+--       RequestCatch(eta)          — catch attempt
+--       RequestPickup()            — pick up a loose ball
+--       RequestDodge(animName)     — dodge
+--       RequestSkill()             — skill (Dash by default)
+--       RequestJoin()              — join the next round
+--       ClaimDaily()               — RemoteFunction, daily reward
+--   * Player attributes: HP, Hearts, Alive, InRound, Coins, RankRP, EquippedSkill.
+--   * Targets: Models in workspace with attribute InGame == true.
+--
+-- NOTE: every combat feature is OFF by default. The server tracks who holds
+-- the ball (HolderId) and who is alive (Alive), so some features only work
+-- while you are in a round and holding the ball.
+
+----------------------------------------------------------------------
+-- 1. Load the UI library
+----------------------------------------------------------------------
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[PIGU] Airflow UI failed to load")
+end
+
+----------------------------------------------------------------------
+-- 2. Robscript theme
+----------------------------------------------------------------------
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----------------------------------------------------------------------
+-- 3. Services and game objects
+----------------------------------------------------------------------
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local DodgeShared = ReplicatedStorage:WaitForChild("DodgeShared")
+local GameState = ReplicatedStorage:WaitForChild("GameState")
+local Remotes = DodgeShared:WaitForChild("Remotes")
+
+local Config = {}
+do
+	local ok, module = pcall(require, DodgeShared:WaitForChild("Config"))
+	if ok and type(module) == "table" then
+		Config = module
+	end
+end
+
+local CATCH_RADIUS = Config.CatchRadius or 4.5
+local CATCH_COOLDOWN = Config.CatchCooldown or 1
+local DODGE_COOLDOWN = Config.DodgeCooldown or 5
+
+-- Re-run protection: the previous window and its loops must die.
+local GENERATION = (_G.PIGUGeneration or 0) + 1
+_G.PIGUGeneration = GENERATION
+
+local function isCurrentGeneration()
+	return _G.PIGUGeneration == GENERATION
+end
+
+for _, previous in ipairs({ _G.PIGU, _G.DodgeHub }) do
+	if type(previous) == "table" and typeof(previous.Window) == "Instance" then
+		pcall(function()
+			previous.Window:Destroy()
+		end)
+	end
+end
+
+pcall(function()
+	for _, name in ipairs({ "PIGU_ESP", "DodgeHubESP" }) do
+		local oldGui = gethui():FindFirstChild(name)
+		if oldGui then
+			oldGui:Destroy()
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- 4. Window
+----------------------------------------------------------------------
+local Window = Airflow:CreateWindow({
+	Name = "Robscript.com - PIGU",
+	LoadingSubtitle = "pigu · combat · visuals",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "PIGU" },
+	Home = {
+		Title = "Robscript.com - PIGU",
+		Welcome = "Pigu,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----------------------------------------------------------------------
+-- 5. Flag helper: read values through Airflow.Flags
+----------------------------------------------------------------------
+local state = {}
+
+local function flag(name)
+	local handle = Airflow.Flags and Airflow.Flags[name]
+	if handle then
+		local ok, value = pcall(function()
+			return handle:Get()
+		end)
+		if ok and value ~= nil then
+			return value
+		end
+	end
+	return state[name]
+end
+
+local function num(name, fallback)
+	local value = flag(name)
+	if type(value) == "number" then
+		return value
+	end
+	return fallback
+end
+
+----------------------------------------------------------------------
+-- 6. Game helpers
+----------------------------------------------------------------------
+local function getCharacter()
+	return LocalPlayer.Character
+end
+
+local function getRoot()
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function isInRound()
+	return LocalPlayer:GetAttribute("InRound") == true
+end
+
+local function isAlive()
+	return LocalPlayer:GetAttribute("Alive") == true
+end
+
+local function isHolder()
+	return GameState:GetAttribute("HolderId") == LocalPlayer.UserId
+end
+
+-- Every workspace Model with InGame == true, excluding our own character.
+local function collectTargets()
+	local list = {}
+	local myCharacter = getCharacter()
+	for _, model in ipairs(workspace:GetChildren()) do
+		if model:IsA("Model") and model ~= myCharacter and model:GetAttribute("InGame") == true then
+			local root = model:FindFirstChild("HumanoidRootPart")
+			if root then
+				local player = Players:GetPlayerFromCharacter(model)
+				local userId = 0
+				if player then
+					userId = player.UserId
+				else
+					-- Bots are named "봇<number>" and use negative ids.
+					local botIndex = model.Name:match("^봇(%d+)$")
+					if botIndex then
+						userId = -tonumber(botIndex)
+					end
+				end
+
+				local hp = 0
+				local coins = 0
+				local rankRP = 0
+				local alive = true
+				if player then
+					hp = player:GetAttribute("HP") or 0
+					coins = player:GetAttribute("Coins") or 0
+					rankRP = player:GetAttribute("RankRP") or 0
+					local attr = player:GetAttribute("Alive")
+					alive = attr == nil and true or attr == true
+				end
+
+				list[#list + 1] = {
+					model = model,
+					root = root,
+					player = player,
+					name = player and player.DisplayName or model.Name,
+					userId = userId,
+					hp = hp,
+					coins = coins,
+					rankRP = rankRP,
+					alive = alive,
+				}
+			end
+		end
+	end
+	return list
+end
+
+local function bestTarget()
+	local root = getRoot()
+	if not root then
+		return nil
+	end
+
+	local myPosition = root.Position
+	local maxRange = num("AimFOV", 0)
+	local priority = flag("TargetPriority") or "Nearest"
+	local best, bestScore = nil, math.huge
+
+	for _, target in ipairs(collectTargets()) do
+		if target.alive then
+			local distance = (target.root.Position - myPosition).Magnitude
+			local inRange = maxRange <= 0 or distance <= maxRange
+			if inRange and distance > 1 then
+				local score = distance
+				if priority == "Lowest HP" then
+					score = target.hp
+				elseif priority == "Most RP" then
+					score = -target.rankRP
+				elseif priority == "Most Coins" then
+					score = -target.coins
+				elseif priority == "Ball Holder (threat)" then
+					score = (GameState:GetAttribute("HolderId") == target.userId) and -1 or distance
+				end
+
+				if score < bestScore then
+					bestScore, best = score, target
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+local function throwAt(target)
+	local root = getRoot()
+	if not (root and target) then
+		return false, "no target"
+	end
+	if GameState:GetAttribute("State") ~= "Playing" then
+		return false, "not in a round"
+	end
+	if not isHolder() then
+		return false, "you do not hold the ball"
+	end
+
+	local delta = Vector3.new(
+		target.root.Position.X - root.Position.X,
+		0,
+		target.root.Position.Z - root.Position.Z
+	)
+	if delta.Magnitude < 1 then
+		return false, "target is too close"
+	end
+
+	-- Power mode: Perfect (the server treats 1.0 as perfect), Fixed or Random.
+	local mode = flag("PowerMode") or "Perfect"
+	local power = 1
+	if mode == "Fixed" then
+		power = num("PowerValue", 1)
+	elseif mode == "Random" then
+		power = 0.55 + math.random() * 0.45
+	end
+	power = math.clamp(power, 0, 1)
+
+	local curve = num("ThrowCurve", 0)
+	curve = math.clamp(curve, -1, 1)
+
+	Remotes.RequestCharge:FireServer(true)
+	task.wait(0.04)
+	Remotes.RequestThrow:FireServer(power, delta.Unit, curve, target.userId)
+
+	return true
+end
+
+-- Mirrors the game's own ballEta(): seconds until the ball reaches us.
+local function ballEta()
+	if GameState:GetAttribute("BallState") ~= "Live" then
+		return nil
+	end
+
+	local ball = workspace:FindFirstChild("DodgeBall")
+	local root = getRoot()
+	if not (ball and root) then
+		return nil
+	end
+
+	local velocity = ball.AssemblyLinearVelocity
+	local flat = Vector3.new(velocity.X, 0, velocity.Z)
+	local speed = flat.Magnitude
+	if speed < 20 then
+		return nil
+	end
+
+	local direction = flat / speed
+	local toMe = Vector3.new(
+		root.Position.X - ball.Position.X,
+		0,
+		root.Position.Z - ball.Position.Z
+	)
+	local along = toMe:Dot(direction)
+	local lateral = (toMe - direction * along).Magnitude
+
+	if along < -1 then
+		return nil
+	end
+	if lateral > CATCH_RADIUS + 6 then
+		return nil
+	end
+
+	return math.max(along - CATCH_RADIUS, 0) / speed, lateral, along
+end
+
+local function ballDistance()
+	local ball = workspace:FindFirstChild("DodgeBall")
+	local root = getRoot()
+	if not (ball and root) then
+		return nil
+	end
+	return (ball.Position - root.Position).Magnitude
+end
+
+----------------------------------------------------------------------
+-- 7. Tabs
+----------------------------------------------------------------------
+local LogsTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogsBox = LogsTab:CreateGroupbox({ Name = "Activity", Side = "Left" })
+local Log = LogsBox:CreateLog({
+	Name = "Events",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+-- =====================  COMBAT  =====================
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local ThrowBox = CombatTab:CreateGroupbox({ Name = "Throw", Side = "Left" })
+local DefenseBox = CombatTab:CreateGroupbox({ Name = "Defense", Side = "Right" })
+
+ThrowBox:CreateDropdown({
+	Name = "Power mode",
+	Desc = "Perfect = maximum damage",
+	Options = { "Perfect", "Fixed", "Random" },
+	CurrentOption = "Perfect",
+	Flag = "PowerMode",
+	Callback = function(value)
+		state.PowerMode = value
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "Power value",
+	Range = { 0, 1 },
+	Increment = 0.05,
+	CurrentValue = 1,
+	Flag = "PowerValue",
+	DependsOn = { Flag = "PowerMode", Value = "Fixed" },
+	Callback = function(value)
+		state.PowerValue = value
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "Curve",
+	Range = { -1, 1 },
+	Increment = 0.1,
+	CurrentValue = 0,
+	Flag = "ThrowCurve",
+	Callback = function(value)
+		state.ThrowCurve = value
+	end,
+})
+
+ThrowBox:CreateDropdown({
+	Name = "Target priority",
+	Options = { "Nearest", "Lowest HP", "Most RP", "Most Coins", "Ball Holder (threat)" },
+	CurrentOption = "Nearest",
+	Flag = "TargetPriority",
+	Callback = function(value)
+		state.TargetPriority = value
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "Target range",
+	Range = { 0, 300 },
+	Increment = 5,
+	Suffix = " studs",
+	CurrentValue = 0,
+	Flag = "AimFOV",
+	Callback = function(value)
+		state.AimFOV = value
+	end,
+})
+
+ThrowBox:CreateKeybind({
+	Name = "Throw key",
+	Desc = "E is the game's catch key",
+	CurrentKeybind = "R",
+	Flag = "ThrowKey",
+	Callback = function(key)
+		state.ThrowKey = key
+	end,
+})
+
+ThrowBox:CreateToggle({
+	Name = "Auto throw",
+	Desc = "Throws at the best target whenever you hold the ball",
+	Flag = "AutoThrow",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoThrow = on
+		Log:Push(on and "<Success>Auto throw on</Success>" or "<Muted>Auto throw off</Muted>")
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "Auto throw delay",
+	Range = { 0, 1 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.15,
+	Flag = "AutoThrowDelay",
+	Callback = function(value)
+		state.AutoThrowDelay = value
+	end,
+})
+
+ThrowBox:CreateButton({
+	Name = "Throw now",
+	Icon = "send",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			local target = bestTarget()
+			if not target then
+				Log:Push("<Warning>No target</Warning>")
+				return
+			end
+			local ok, reason = throwAt(target)
+			if ok then
+				Log:Push("Throw → <Accent>" .. target.name .. "</Accent>")
+			else
+				Log:Push("<Warning>" .. reason .. "</Warning>")
+			end
+		end)
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "Auto catch",
+	Desc = "Catches the ball flying at you",
+	Flag = "AutoCatch",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoCatch = on
+		Log:Push(on and "<Success>Auto catch on</Success>" or "<Muted>Auto catch off</Muted>")
+	end,
+})
+
+DefenseBox:CreateSlider({
+	Name = "Catch margin",
+	Range = { 0, 1 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.15,
+	Flag = "CatchMargin",
+	Callback = function(value)
+		state.CatchMargin = value
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "Auto pickup",
+	Desc = "Picks up a loose ball nearby",
+	Flag = "AutoPickup",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoPickup = on
+	end,
+})
+
+DefenseBox:CreateSlider({
+	Name = "Pickup radius",
+	Range = { 5, 60 },
+	Increment = 5,
+	Suffix = " studs",
+	CurrentValue = 25,
+	Flag = "PickupRadius",
+	Callback = function(value)
+		state.PickupRadius = value
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "Auto dodge",
+	Desc = "RequestDodge when the ball is close",
+	Flag = "AutoDodge",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoDodge = on
+	end,
+})
+
+DefenseBox:CreateDropdown({
+	Name = "Dodge animation",
+	Options = { "Default (auto)", "D_Capoeira", "D_Cartwheel", "D_Slide", "D_Spin", "D_Ninja", "D_Backflip", "D_Matrix" },
+	CurrentOption = "D_Slide",
+	Flag = "DodgeAnim",
+	Callback = function(value)
+		state.DodgeAnim = value
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "Auto skill",
+	Desc = "RequestSkill on cooldown (Dash)",
+	Flag = "AutoSkill",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoSkill = on
+	end,
+})
+
+DefenseBox:CreateStatus({
+	Name = "Ball",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local ballState = GameState:GetAttribute("BallState") or "?"
+		local holder = GameState:GetAttribute("HolderId")
+		local owner = "none"
+		if holder == LocalPlayer.UserId then
+			owner = "you"
+		elseif holder and holder ~= 0 then
+			local player = Players:GetPlayerByUserId(holder)
+			owner = player and player.DisplayName or tostring(holder)
+		end
+		return ("%s · %s"):format(ballState, owner)
+	end,
+})
+
+-- =====================  VISUALS  =====================
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local EspBox = VisualsTab:CreateGroupbox({ Name = "Player ESP", Side = "Left" })
+local BallBox = VisualsTab:CreateGroupbox({ Name = "Ball and round", Side = "Right" })
+
+EspBox:CreateToggle({
+	Name = "Enable ESP",
+	Flag = "EspEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		state.EspEnabled = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Highlight",
+	Flag = "EspHighlight",
+	CurrentValue = true,
+	Callback = function(on)
+		state.EspHighlight = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Name",
+	Flag = "EspName",
+	CurrentValue = true,
+	Callback = function(on)
+		state.EspName = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "HP and distance",
+	Flag = "EspHealth",
+	CurrentValue = true,
+	Callback = function(on)
+		state.EspHealth = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Tracers",
+	Flag = "EspTracer",
+	CurrentValue = false,
+	Callback = function(on)
+		state.EspTracer = on
+	end,
+})
+
+EspBox:CreateSlider({
+	Name = "Max distance",
+	Range = { 50, 500 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 300,
+	Flag = "EspDistance",
+	Callback = function(value)
+		state.EspDistance = value
+	end,
+})
+
+EspBox:CreateColorPicker({
+	Name = "ESP color",
+	Color = Color3.fromHex("#FF3B7F"),
+	Flag = "EspColor",
+	Callback = function(color)
+		state.EspColor = color
+	end,
+})
+
+BallBox:CreateToggle({
+	Name = "Ball ESP",
+	Flag = "BallEsp",
+	CurrentValue = true,
+	Callback = function(on)
+		state.BallEsp = on
+	end,
+})
+
+BallBox:CreateToggle({
+	Name = "Incoming ball warning",
+	Flag = "BallWarn",
+	CurrentValue = true,
+	Callback = function(on)
+		state.BallWarn = on
+	end,
+})
+
+BallBox:CreateStatus({
+	Name = "Round",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local stateName = GameState:GetAttribute("State") or "?"
+		local timeLeft = GameState:GetAttribute("TimeLeft") or 0
+		local alive = GameState:GetAttribute("Alive") or 0
+		return ("%s · %ds · alive %d"):format(stateName, math.floor(timeLeft), alive)
+	end,
+})
+
+BallBox:CreateStatus({
+	Name = "Map",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local mapName = GameState:GetAttribute("MapName") or "?"
+		local tags = {}
+		if GameState:GetAttribute("Rush") then
+			table.insert(tags, "RUSH")
+		end
+		if GameState:GetAttribute("SuddenDeath") then
+			table.insert(tags, "SUDDEN")
+		end
+		local rally = GameState:GetAttribute("Rally") or 0
+		if rally and rally > 0 then
+			table.insert(tags, "rally x" .. tostring(rally))
+		end
+		local suffix = #tags > 0 and (" · " .. table.concat(tags, " · ")) or ""
+		return mapName .. suffix
+	end,
+})
+
+BallBox:CreateStatus({
+	Name = "You",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		local hp = LocalPlayer:GetAttribute("HP") or 0
+		local where
+		if isInRound() then
+			where = isAlive() and "<Success>in round</Success>" or "<Error>eliminated</Error>"
+		else
+			where = "<Muted>lobby</Muted>"
+		end
+		return ("%d HP · %s"):format(hp, where)
+	end,
+})
+
+-- =====================  MOVEMENT  =====================
+local MoveTab = Window:CreateTab({ Name = "Movement", Icon = "move" })
+local MoveBox = MoveTab:CreateGroupbox({ Name = "Character", Side = "Left" })
+
+MoveBox:CreateToggle({
+	Name = "Speed",
+	Flag = "SpeedEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		state.SpeedEnabled = on
+		if not on then
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.WalkSpeed = 30
+			end
+		end
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "WalkSpeed",
+	Range = { 16, 200 },
+	Increment = 2,
+	CurrentValue = 60,
+	Flag = "WalkSpeed",
+	DependsOn = "SpeedEnabled",
+	Callback = function(value)
+		state.WalkSpeed = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "Jump",
+	Flag = "JumpEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		state.JumpEnabled = on
+		if not on then
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.JumpPower = 50
+			end
+		end
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "JumpPower",
+	Range = { 50, 300 },
+	Increment = 5,
+	CurrentValue = 100,
+	Flag = "JumpPower",
+	DependsOn = "JumpEnabled",
+	Callback = function(value)
+		state.JumpPower = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "Infinite jump",
+	Flag = "InfJump",
+	CurrentValue = false,
+	Callback = function(on)
+		state.InfJump = on
+	end,
+})
+
+MoveBox:CreateDivider({ Text = "session" })
+
+MoveBox:CreateStatus({
+	Name = "Thrown",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(state.thrownCount or 0)
+	end,
+})
+
+MoveBox:CreateStatus({
+	Name = "Caught",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(state.caughtCount or 0)
+	end,
+})
+
+-- =====================  AUTO  =====================
+local AutoTab = Window:CreateTab({ Name = "Auto", Icon = "bot" })
+local AutoBox = AutoTab:CreateGroupbox({ Name = "Automation", Side = "Left" })
+
+AutoBox:CreateToggle({
+	Name = "Auto join",
+	Desc = "RequestJoin during the intermission",
+	Flag = "AutoJoin",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoJoin = on
+	end,
+})
+
+AutoBox:CreateToggle({
+	Name = "Anti-AFK",
+	Desc = "Keeps moving so rewards still count",
+	Flag = "AntiAfk",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AntiAfk = on
+	end,
+})
+
+AutoBox:CreateButton({
+	Name = "Claim daily reward",
+	Icon = "gift",
+	Callback = function()
+		task.spawn(function()
+			local ok, result = pcall(function()
+				return Remotes.ClaimDaily:InvokeServer()
+			end)
+			if ok then
+				Log:Push("<Success>Daily reward claimed</Success>")
+			else
+				Log:Push("<Error>Failed: " .. tostring(result) .. "</Error>")
+			end
+		end)
+	end,
+})
+
+AutoBox:CreateButton({
+	Name = "Dump game state",
+	Icon = "info",
+	Callback = function()
+		local parts = {
+			"State=" .. tostring(GameState:GetAttribute("State")),
+			"BallState=" .. tostring(GameState:GetAttribute("BallState")),
+			"HolderId=" .. tostring(GameState:GetAttribute("HolderId")),
+			"Alive=" .. tostring(GameState:GetAttribute("Alive")),
+			"TimeLeft=" .. tostring(GameState:GetAttribute("TimeLeft")),
+			"Map=" .. tostring(GameState:GetAttribute("MapName")),
+		}
+		Log:Push("<Accent>" .. table.concat(parts, " · ") .. "</Accent>")
+	end,
+})
+
+----------------------------------------------------------------------
+-- 8. ESP
+----------------------------------------------------------------------
+local espFolder = Instance.new("Folder")
+espFolder.Name = "PIGU_ESP"
+pcall(function()
+	espFolder.Parent = gethui()
+end)
+if not espFolder.Parent then
+	espFolder.Parent = game:GetService("CoreGui")
+end
+
+local espEntries = {}
+
+local function destroyEspEntry(userId)
+	local entry = espEntries[userId]
+	if not entry then
+		return
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	if entry.billboard then
+		entry.billboard:Destroy()
+	end
+	if entry.tracer then
+		entry.tracer:Remove()
+	end
+	espEntries[userId] = nil
+end
+
+local function ensureEspEntry(target)
+	local entry = espEntries[target.userId]
+	if entry and entry.model ~= target.model then
+		destroyEspEntry(target.userId)
+		entry = nil
+	end
+
+	if not entry then
+		entry = { model = target.model }
+		espEntries[target.userId] = entry
+	end
+
+	if not entry.billboard then
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "PIGU_Tag"
+		billboard.Size = UDim2.fromOffset(150, 38)
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
+		billboard.AlwaysOnTop = true
+		billboard.Adornee = target.root
+		billboard.Parent = espFolder
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Text"
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamMedium
+		label.TextSize = 13
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextStrokeTransparency = 0.3
+		label.TextStrokeColor3 = Color3.new(0, 0, 0)
+		label.TextWrapped = true
+		label.Parent = billboard
+
+		entry.billboard = billboard
+		entry.label = label
+	end
+
+	entry.billboard.Adornee = target.root
+	return entry
+end
+
+local function updateEsp()
+	local enabled = flag("EspEnabled")
+	local root = getRoot()
+	local color = state.EspColor or THEME.Accent
+	local maxDistance = num("EspDistance", 300)
+	local showName = flag("EspName") ~= false
+	local showHealth = flag("EspHealth") ~= false
+	local showTracer = flag("EspTracer") == true
+	local showHighlight = flag("EspHighlight") ~= false
+
+	if not enabled then
+		for userId in pairs(espEntries) do
+			destroyEspEntry(userId)
+		end
+		return
+	end
+
+	local seen = {}
+	local targets = collectTargets()
+
+	for _, target in ipairs(targets) do
+		local distance = root and (target.root.Position - root.Position).Magnitude or 0
+		if target.alive and distance <= maxDistance then
+			seen[target.userId] = true
+			local entry = ensureEspEntry(target)
+
+			if showHighlight then
+				if not entry.highlight then
+					local highlight = Instance.new("Highlight")
+					highlight.Name = "PIGU_Highlight"
+					highlight.FillTransparency = 0.65
+					highlight.OutlineTransparency = 0
+					highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					highlight.Adornee = target.model
+					highlight.Parent = espFolder
+					entry.highlight = highlight
+				end
+				entry.highlight.FillColor = color
+				entry.highlight.OutlineColor = color
+			elseif entry.highlight then
+				entry.highlight:Destroy()
+				entry.highlight = nil
+			end
+
+			local lines = {}
+			if showName then
+				table.insert(lines, target.name)
+			end
+			if showHealth then
+				table.insert(lines, ("%d HP · %d m"):format(math.floor(target.hp), math.floor(distance)))
+			end
+			if entry.label then
+				entry.label.Text = table.concat(lines, "\n")
+				entry.label.TextColor3 = color:Lerp(Color3.new(1, 1, 1), 0.35)
+				entry.label.Visible = #lines > 0
+			end
+
+			if showTracer and root then
+				if not entry.tracer then
+					entry.tracer = Drawing.new("Line")
+					entry.tracer.Thickness = 1
+					entry.tracer.Transparency = 0.7
+				end
+				local screenPoint, onScreen = workspace.CurrentCamera:WorldToViewportPoint(target.root.Position)
+				if onScreen then
+					entry.tracer.From = Vector2.new(
+						workspace.CurrentCamera.ViewportSize.X / 2,
+						workspace.CurrentCamera.ViewportSize.Y
+					)
+					entry.tracer.To = Vector2.new(screenPoint.X, screenPoint.Y)
+					entry.tracer.Color = color
+					entry.tracer.Visible = true
+				else
+					entry.tracer.Visible = false
+				end
+			elseif entry.tracer then
+				entry.tracer:Remove()
+				entry.tracer = nil
+			end
+		else
+			destroyEspEntry(target.userId)
+		end
+	end
+
+	for userId in pairs(espEntries) do
+		if not seen[userId] then
+			destroyEspEntry(userId)
+		end
+	end
+end
+
+-- Ball ESP
+local ballHighlight, ballBillboard, ballLabel
+
+local function updateBallEsp()
+	local enabled = flag("BallEsp")
+	local ball = workspace:FindFirstChild("DodgeBall")
+
+	if not enabled or not ball then
+		if ballHighlight then
+			ballHighlight:Destroy()
+			ballHighlight = nil
+		end
+		if ballBillboard then
+			ballBillboard:Destroy()
+			ballBillboard = nil
+			ballLabel = nil
+		end
+		return
+	end
+
+	if not ballHighlight then
+		ballHighlight = Instance.new("Highlight")
+		ballHighlight.Name = "PIGU_Ball"
+		ballHighlight.FillColor = Color3.fromHex("#FFD166")
+		ballHighlight.OutlineColor = Color3.fromHex("#FFFFFF")
+		ballHighlight.FillTransparency = 0.4
+		ballHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		ballHighlight.Parent = espFolder
+	end
+	ballHighlight.Adornee = ball
+
+	if not ballBillboard then
+		ballBillboard = Instance.new("BillboardGui")
+		ballBillboard.Name = "PIGU_BallTag"
+		ballBillboard.Size = UDim2.fromOffset(140, 26)
+		ballBillboard.StudsOffsetWorldSpace = Vector3.new(0, 1.6, 0)
+		ballBillboard.AlwaysOnTop = true
+		ballBillboard.Parent = espFolder
+
+		ballLabel = Instance.new("TextLabel")
+		ballLabel.BackgroundTransparency = 1
+		ballLabel.Size = UDim2.fromScale(1, 1)
+		ballLabel.Font = Enum.Font.GothamMedium
+		ballLabel.TextSize = 12
+		ballLabel.TextColor3 = Color3.fromHex("#FFD166")
+		ballLabel.TextStrokeTransparency = 0.3
+		ballLabel.Parent = ballBillboard
+	end
+
+	ballBillboard.Adornee = ball
+
+	local eta = ballEta()
+	local text
+	if eta then
+		text = ("incoming · %0.2fs"):format(eta)
+		if state.BallWarn ~= false then
+			ballLabel.TextColor3 = Color3.fromHex("#FF4D4D")
+		end
+	else
+		local distance = ballDistance()
+		text = distance and ("%d m"):format(math.floor(distance)) or "?"
+		ballLabel.TextColor3 = Color3.fromHex("#FFD166")
+	end
+	ballLabel.Text = text
+end
+
+----------------------------------------------------------------------
+-- 9. Settings (configs and themes)
+----------------------------------------------------------------------
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----------------------------------------------------------------------
+-- 10. Runtime loops
+----------------------------------------------------------------------
+local nextThrow = 0
+local nextCatch = 0
+local nextPickup = 0
+local nextDodge = 0
+local nextSkill = 0
+local nextJoin = 0
+local nextAfk = 0
+
+state.thrownCount = 0
+state.caughtCount = 0
+
+-- Throw key hold. Airflow hands us a KeyCode, but a loaded config may
+-- restore it as a string.
+local function throwKeyCode()
+	local value = flag("ThrowKey")
+	if typeof(value) == "EnumItem" then
+		return value
+	end
+	if type(value) == "string" then
+		local ok, code = pcall(function()
+			return Enum.KeyCode[value]
+		end)
+		if ok and code then
+			return code
+		end
+	end
+	return Enum.KeyCode.R
+end
+
+local holdThrowKey = false
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == throwKeyCode() then
+		holdThrowKey = true
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.KeyCode == throwKeyCode() then
+		holdThrowKey = false
+	end
+end)
+
+-- Infinite jump
+UserInputService.JumpRequest:Connect(function()
+	if flag("InfJump") then
+		local humanoid = getHumanoid()
+		if humanoid then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end
+end)
+
+task.spawn(function()
+	while isCurrentGeneration() do
+		local now = os.clock()
+		local inRound = isInRound()
+		local alive = isAlive()
+		local playing = GameState:GetAttribute("State") == "Playing"
+
+		-- Auto throw
+		if flag("AutoThrow") and playing and inRound and alive and isHolder() and now >= nextThrow then
+			nextThrow = now + math.max(num("AutoThrowDelay", 0.15), 0.15)
+			local target = bestTarget()
+			if target then
+				task.spawn(function()
+					if throwAt(target) then
+						state.thrownCount = (state.thrownCount or 0) + 1
+						Log:Push("Auto → <Accent>" .. target.name .. "</Accent>")
+					end
+				end)
+			end
+		end
+
+		-- Manual throw while the key is held
+		if holdThrowKey and playing and inRound and alive and isHolder() and now >= nextThrow then
+			nextThrow = now + 0.3
+			local target = bestTarget()
+			if target then
+				task.spawn(function()
+					if throwAt(target) then
+						state.thrownCount = (state.thrownCount or 0) + 1
+					end
+				end)
+			end
+		end
+
+		-- Auto catch
+		if flag("AutoCatch") and now >= nextCatch then
+			local eta = ballEta()
+			if eta and eta <= math.max(num("CatchMargin", 0.15), 0.05) then
+				nextCatch = now + CATCH_COOLDOWN
+				pcall(function()
+					Remotes.RequestCatch:FireServer(eta)
+				end)
+				state.caughtCount = (state.caughtCount or 0) + 1
+				Log:Push("<Success>Catch!</Success>")
+			end
+		end
+
+		-- Auto pickup
+		if flag("AutoPickup") and now >= nextPickup and GameState:GetAttribute("BallState") == "Loose" then
+			local distance = ballDistance()
+			if distance and distance <= num("PickupRadius", 25) then
+				nextPickup = now + 0.3
+				pcall(function()
+					Remotes.RequestPickup:FireServer()
+				end)
+			end
+		end
+
+		-- Auto dodge
+		if flag("AutoDodge") and now >= nextDodge and playing and alive then
+			local eta, lateral = ballEta()
+			if eta and eta <= 0.3 and (lateral or 99) <= CATCH_RADIUS + 8 then
+				nextDodge = now + DODGE_COOLDOWN
+				local anim = flag("DodgeAnim") or "D_Slide"
+				if anim == "Default (auto)" then
+					anim = "D_Dodge"
+				end
+				pcall(function()
+					Remotes.RequestDodge:FireServer(anim)
+				end)
+			end
+		end
+
+		-- Auto skill
+		if flag("AutoSkill") and now >= nextSkill and playing and alive and inRound then
+			local skillName = LocalPlayer:GetAttribute("EquippedSkill") or "Dash"
+			local skill = Config.Skills and Config.Skills[skillName]
+			local cooldown = skill and skill.Cooldown or 12
+			nextSkill = now + cooldown
+			pcall(function()
+				Remotes.RequestSkill:FireServer()
+			end)
+		end
+
+		-- Auto join
+		if flag("AutoJoin") and GameState:GetAttribute("State") ~= "Playing" and not inRound and now >= nextJoin then
+			nextJoin = now + 4
+			pcall(function()
+				Remotes.RequestJoin:FireServer()
+			end)
+			Log:Push("Joined the next round")
+		end
+
+		-- Anti-AFK: short steps so the game sees movement
+		if flag("AntiAfk") and now >= nextAfk then
+			nextAfk = now + 25
+			local humanoid = getHumanoid()
+			local root = getRoot()
+			if humanoid and root then
+				local direction = Vector3.new(math.random(-1, 1), 0, math.random(-1, 1))
+				if direction.Magnitude < 0.1 then
+					direction = Vector3.new(1, 0, 0)
+				end
+				humanoid:Move(direction.Unit, false)
+				task.wait(0.4)
+				humanoid:Move(Vector3.zero, false)
+			end
+		end
+
+		-- Speed and jump (the game may reset them)
+		local humanoid = getHumanoid()
+		if humanoid then
+			if flag("SpeedEnabled") then
+				local speed = num("WalkSpeed", 30)
+				if humanoid.WalkSpeed ~= speed then
+					humanoid.WalkSpeed = speed
+				end
+			end
+			if flag("JumpEnabled") then
+				local power = num("JumpPower", 50)
+				if humanoid.JumpPower ~= power then
+					humanoid.JumpPower = power
+				end
+			end
+		end
+
+		task.wait(0.05)
+	end
+end)
+
+-- Slower loop dedicated to visuals
+task.spawn(function()
+	while isCurrentGeneration() do
+		local ok, err = pcall(function()
+			updateEsp()
+			updateBallEsp()
+		end)
+		if not ok then
+			warn("[PIGU] ESP:", tostring(err))
+			Log:Push("<Error>ESP: " .. tostring(err) .. "</Error>")
+			task.wait(2)
+		end
+		task.wait(0.12)
+	end
+end)
+
+----------------------------------------------------------------------
+-- 11. Final
+----------------------------------------------------------------------
+-- Public handle: _G.PIGU.Flags.EspEnabled:Set(true), etc.
+_G.PIGU = {
+	Window = Window,
+	Flags = Airflow.Flags,
+	State = state,
+	GameState = GameState,
+	Remotes = Remotes,
+	Tabs = {
+		Logs = LogsTab,
+		Combat = CombatTab,
+		Visuals = VisualsTab,
+		Movement = MoveTab,
+		Auto = AutoTab,
+		Settings = SettingsTab,
+	},
+}
+
+Window:LoadAutoload()
+Window:Notify({
+	Title = "Robscript.com - PIGU",
+	Content = "Loaded · RightControl hides the menu",
+	Type = "Success",
+})
+Log:Push("<Accent>PIGU ready</Accent>")
