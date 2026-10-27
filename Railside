@@ -1,0 +1,1491 @@
+--!strict
+-- RailSide Hub
+-- Small hub for "RailSide [BETA]" on the Potassium executor.
+-- UI: Robly Airflow (bobloscript/Robly_Airflow), Robscript theme.
+--
+-- Everything works on your own client: the hub only reads game attributes and sends the
+-- same remotes the normal client sends. Coins, injuries and grip stay server-side.
+
+----- Services -----
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService = game:GetService("SoundService")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+----- UI library -----
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+for _, url in ipairs(UI_SOURCES) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RailSide Hub] UI library did not load")
+end
+
+----- Theme -----
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Game constants -----
+local ROLE_COLORS = {
+	Citizen = Color3.fromRGB(75, 157, 255),
+	Patrol = Color3.fromRGB(226, 63, 58),
+	TB = Color3.fromRGB(246, 206, 40),
+	Unknown = Color3.fromRGB(180, 180, 180),
+}
+local ROLE_LABELS = {
+	Citizen = "Citizen",
+	Patrol = "Anti-crouch",
+	TB = "Security",
+	Unknown = "Unknown",
+}
+local HOSTILE_TO_CITIZEN = { Patrol = true, TB = true }
+local HOSTILE_TO_STAFF = { Citizen = true }
+
+local BANDAGE_PRICE = 40
+local PILLS_PRICE = 30
+local DEFAULT_ESP_DISTANCE = 50
+local MAX_ESP_DISTANCE = 2000
+
+----- Text -----
+local TEXT = {
+	en = {
+		loading = "esp, radar, speed, teleports",
+		main = "Main",
+		lang_group = "Language",
+		lang_hint = "Choose the language of the menu. It changes right away — no reload needed.",
+		lang_status = "Now",
+		lang_en = "English",
+		lang_ru = "Русский",
+		visuals = "Visuals",
+		survival = "Survival",
+		movement = "Movement",
+		logs = "Logs",
+		settings = "Settings",
+		esp_group = "Player ESP",
+		radar_group = "Radar",
+		auto_group = "Automation",
+		status_group = "Status",
+		speed_group = "Speed",
+		teleport_group = "Teleport",
+		log_group = "Activity",
+		about_group = "About",
+		esp = "Player ESP",
+		esp_desc = "See players through walls.",
+		esp_bind = "ESP key",
+		esp_bind_desc = "Turns ESP on and off.",
+		roles = "Roles",
+		roles_desc = "Who to show.",
+		distance = "Distance",
+		metres = "Show metres",
+		metres_desc = "Adds the distance to the tag.",
+		threat = "Enemy nearby",
+		radius = "Alert radius",
+		alert = "Sound alert",
+		alert_desc = "Beeps when an enemy is close.",
+		release = "Let go of the train",
+		release_desc = "Drops the grip when an enemy is close.",
+		panic = "Auto panic",
+		panic_desc = "Clicks Resist for you.",
+		cola = "Auto cola",
+		cola_desc = "Drinks cola when stamina is low.",
+		bandage = "Auto bandage",
+		bandage_desc = "Heals you when you are hurt.",
+		pills = "Auto pills",
+		pills_desc = "Takes pills when fear is high.",
+		coins = "Coins",
+		stamina = "Stamina",
+		fear = "Fear",
+		sanity = "Sanity",
+		injuries = "Injuries",
+		walk = "WalkSpeed",
+		walk_desc = "Makes you faster.",
+		walk_bind = "Speed key",
+		walk_value = "Speed",
+		jump = "Jump",
+		jump_desc = "Turns jumping on.",
+		jump_bind = "Jump key",
+		jump_value = "Jump power",
+		noclip = "Noclip",
+		noclip_desc = "Walk through walls.",
+		noclip_bind = "Noclip key",
+		fly = "Fly",
+		fly_desc = "WASD to fly. Space up, Ctrl down.",
+		fly_bind = "Fly key",
+		fly_speed = "Fly speed",
+		to_spawn = "To spawn",
+		to_shop = "To shop",
+		to_train = "To train",
+		respawn = "Respawn",
+		about_text = "Small hub for RailSide. RightControl hides the window.",
+		unload = "Unload",
+		lang = "Language",
+		en = "EN",
+		ru = "RU",
+		nobody = "nobody near",
+		none = "none",
+		loaded = "Hub loaded",
+		esp_on = "ESP on",
+		esp_off = "ESP off",
+		ready = "Press RightControl.",
+		where_lang = "Language is on the Main tab.",
+		danger = "Danger",
+		teleported = "Teleported",
+		not_found = "Not found",
+		unloaded = "Hub closed",
+	},
+	ru = {
+		loading = "esp, радар, скорость, телепорты",
+		main = "Главная",
+		lang_group = "Язык",
+		lang_hint = "Выбери язык меню. Он сменится сразу — перезапускать не надо.",
+		lang_status = "Сейчас",
+		lang_en = "English",
+		lang_ru = "Русский",
+		visuals = "Видео",
+		survival = "Выживание",
+		movement = "Движение",
+		logs = "Логи",
+		settings = "Настройки",
+		esp_group = "ESP игроков",
+		radar_group = "Радар",
+		auto_group = "Автоматика",
+		status_group = "Состояние",
+		speed_group = "Скорость",
+		teleport_group = "Телепорт",
+		log_group = "События",
+		about_group = "О хабе",
+		esp = "ESP игроков",
+		esp_desc = "Видно игроков через стены.",
+		esp_bind = "Кнопка ESP",
+		esp_bind_desc = "Включает и выключает ESP.",
+		roles = "Роли",
+		roles_desc = "Кого показывать.",
+		distance = "Дальность",
+		metres = "Показывать метры",
+		metres_desc = "Пишет дистанцию на табличке.",
+		threat = "Враг рядом",
+		radius = "Радиус тревоги",
+		alert = "Звук тревоги",
+		alert_desc = "Пищит, когда враг близко.",
+		release = "Отпускать зацеп",
+		release_desc = "Бросает поезд, когда враг близко.",
+		panic = "Авто-паника",
+		panic_desc = "Сам жмёт «Сопротивляться».",
+		cola = "Авто-кола",
+		cola_desc = "Пьёт колу, когда мало сил.",
+		bandage = "Авто-бинт",
+		bandage_desc = "Лечит, когда ты ранен.",
+		pills = "Авто-таблетки",
+		pills_desc = "Пьёт таблетки при страхе.",
+		coins = "Монеты",
+		stamina = "Силы",
+		fear = "Страх",
+		sanity = "Рассудок",
+		injuries = "Травмы",
+		walk = "Скорость ходьбы",
+		walk_desc = "Бегаешь быстрее.",
+		walk_bind = "Кнопка скорости",
+		walk_value = "Скорость",
+		jump = "Прыжок",
+		jump_desc = "Включает прыжки.",
+		jump_bind = "Кнопка прыжка",
+		jump_value = "Сила прыжка",
+		noclip = "Сквозь стены",
+		noclip_desc = "Проходишь через стены.",
+		noclip_bind = "Кнопка ноклипа",
+		fly = "Полёт",
+		fly_desc = "WASD — лететь. Пробел вверх, Ctrl вниз.",
+		fly_bind = "Кнопка полёта",
+		fly_speed = "Скорость полёта",
+		to_spawn = "На спавн",
+		to_shop = "К ларьку",
+		to_train = "К поезду",
+		respawn = "Возродиться",
+		about_text = "Маленький хаб для RailSide. RightControl скрывает окно.",
+		unload = "Выключить",
+		lang = "Язык",
+		en = "EN",
+		ru = "RU",
+		nobody = "рядом никого",
+		none = "нет",
+		loaded = "Хаб загружен",
+		esp_on = "ESP включён",
+		esp_off = "ESP выключен",
+		ready = "Нажми RightControl.",
+		where_lang = "Язык меняется на вкладке «Главная».",
+		danger = "Опасность",
+		teleported = "Телепорт готов",
+		not_found = "Не найдено",
+		unloaded = "Хаб закрыт",
+	},
+}
+
+local Lang = "en"
+
+local function T(key: string): string
+	local pack = TEXT[Lang] or TEXT.en
+	return pack[key] or TEXT.en[key] or key
+end
+
+----- Remotes -----
+local function findChild(parent: Instance?, name: string, timeout: number): Instance?
+	if not parent then
+		return nil
+	end
+	local existing = parent:FindFirstChild(name)
+	if existing then
+		return existing
+	end
+	local ok, child = pcall(function()
+		return parent:WaitForChild(name, timeout)
+	end)
+	return if ok then child else nil
+end
+
+local StationGameplay = findChild(ReplicatedStorage, "StationGameplay", 10)
+local GripFolder = findChild(ReplicatedStorage, "StationGrip", 10)
+local FearFolder = findChild(ReplicatedStorage, "StationFear", 10)
+local ShopFolder = findChild(ReplicatedStorage, "StationShop", 10)
+local CoinsFolder = findChild(ReplicatedStorage, "StationCoins", 10)
+
+local Remotes = {
+	Interact = findChild(StationGameplay, "Interact", 5),
+	Sprint = findChild(StationGameplay, "Sprint", 5),
+	Crouch = findChild(StationGameplay, "Crouch", 5),
+	Drink = findChild(StationGameplay, "Drink", 5),
+	GripRelease = findChild(GripFolder, "Release", 5),
+	FearResist = findChild(FearFolder, "Resist", 5),
+	ShopRequest = findChild(ShopFolder, "Request", 5),
+	CoinsEarned = findChild(CoinsFolder, "Earned", 5),
+	Reset = findChild(ReplicatedStorage, "StationReset", 5),
+}
+
+----- Role data -----
+local roleConfig = nil
+do
+	local rolesFolder = findChild(ReplicatedStorage, "StationRoles", 5)
+	local configModule = findChild(rolesFolder, "Config", 5)
+	if configModule and configModule:IsA("ModuleScript") then
+		local ok, result = pcall(require, configModule)
+		if ok and type(result) == "table" then
+			roleConfig = result
+		end
+	end
+end
+
+if roleConfig and type(roleConfig.Roles) == "table" then
+	for roleId, roleData in pairs(roleConfig.Roles) do
+		if type(roleData) == "table" then
+			if type(roleData.Color) == "table" and #roleData.Color >= 3 then
+				ROLE_COLORS[roleId] = Color3.new(roleData.Color[1], roleData.Color[2], roleData.Color[3])
+			end
+			if type(roleData.Short) == "string" then
+				ROLE_LABELS[roleId] = roleData.Short
+			end
+		end
+	end
+end
+
+----- State -----
+type EspEntry = {
+	highlight: Highlight?,
+	billboard: BillboardGui?,
+	label: TextLabel?,
+	role: string,
+}
+
+local State = {
+	espEnabled = false,
+	espMaxDistance = DEFAULT_ESP_DISTANCE,
+	espShowDistance = true,
+	espRoles = { Citizen = true, Patrol = true, TB = true, Unknown = true },
+	dangerAlert = true,
+	dangerRadius = 60,
+	autoPanic = false,
+	autoDrink = false,
+	autoBandage = false,
+	autoPills = false,
+	autoReleaseOnDanger = false,
+	walkSpeedEnabled = false,
+	walkSpeed = 34,
+	jumpEnabled = false,
+	jumpPower = 50,
+	noclip = false,
+	fly = false,
+	flySpeed = 60,
+	nearestThreatDistance = math.huge,
+	nearestThreatName = "-",
+	nearestThreatRole = "-",
+	lastThreatNotice = 0,
+	lastDrinkAt = 0,
+	lastBandageAt = 0,
+	lastPillsAt = 0,
+	lastReleaseAt = 0,
+}
+
+local espEntries: { [Player]: EspEntry } = {}
+
+local Hub: any = {}
+local Ui: any = {}
+local Binds: { { handle: any, action: () -> () } } = {}
+
+-- Placeholders: the UI fires callbacks while the elements are being created.
+Hub.log = function(_: string) end
+Hub.notify = function(_: string, _: string, _: string?) end
+
+----- Character helpers -----
+local function getCharacter(): Model?
+	local character = LocalPlayer.Character
+	if character and character.Parent and character:FindFirstChildOfClass("Humanoid") then
+		return character
+	end
+	return nil
+end
+
+local function getHumanoid(): Humanoid?
+	local character = getCharacter()
+	return if character then character:FindFirstChildOfClass("Humanoid") else nil
+end
+
+local function getRoot(): BasePart?
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+local function attributeOf(instance: Instance?, name: string): any
+	if not instance then
+		return nil
+	end
+	local ok, value = pcall(function()
+		return instance:GetAttribute(name)
+	end)
+	return if ok then value else nil
+end
+
+local INJURY_KEYS = {
+	"StationInjury_Head",
+	"StationInjury_Neck",
+	"StationInjury_Chest",
+	"StationInjury_Abdomen",
+	"StationInjury_UpperBack",
+	"StationInjury_LowerBack",
+	"StationInjury_Pelvis",
+	"StationInjury_LeftArm",
+	"StationInjury_RightArm",
+	"StationInjury_LeftLeg",
+	"StationInjury_RightLeg",
+	"StationInjury_LeftShoulder",
+	"StationInjury_RightShoulder",
+}
+
+local function injuryCount(player: Player): number
+	local count = 0
+	for _, key in ipairs(INJURY_KEYS) do
+		local value = tonumber(attributeOf(player, key)) or 0
+		if value > 0 then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function roleOf(player: Player): string
+	local role = attributeOf(player, "StationRole")
+	if type(role) == "string" and role ~= "" and ROLE_COLORS[role] then
+		return role
+	end
+	local team = player.Team
+	if team then
+		for roleId, roleData in pairs((roleConfig and roleConfig.Roles) or {}) do
+			if type(roleData) == "table" and roleData.Team == team.Name then
+				return roleId
+			end
+		end
+	end
+	return "Unknown"
+end
+
+----- ESP -----
+local function removeEsp(player: Player)
+	local entry = espEntries[player]
+	if not entry then
+		return
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	if entry.billboard then
+		entry.billboard:Destroy()
+	end
+	espEntries[player] = nil
+end
+
+local function clearEsp()
+	for player in pairs(espEntries) do
+		removeEsp(player)
+	end
+end
+
+local function buildEsp(player: Player, character: Model, role: string): EspEntry
+	local color = ROLE_COLORS[role] or Color3.new(1, 1, 1)
+
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "RailSideHubHighlight"
+	highlight.FillColor = color
+	highlight.FillTransparency = 0.7
+	highlight.OutlineColor = color
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Adornee = character
+	highlight.Parent = character
+
+	local entry: EspEntry = { highlight = highlight, billboard = nil, label = nil, role = role }
+
+	local anchor = (character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")) :: BasePart?
+	if anchor then
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "RailSideHubTag"
+		billboard.AlwaysOnTop = true
+		billboard.Size = UDim2.fromOffset(240, 40)
+		billboard.StudsOffset = Vector3.new(0, 2.1, 0)
+		billboard.MaxDistance = State.espMaxDistance
+		billboard.Adornee = anchor
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 14
+		label.TextColor3 = color
+		label.TextStrokeTransparency = 0.4
+		label.TextWrapped = true
+		label.Text = player.Name
+		label.Parent = billboard
+
+		billboard.Parent = anchor
+		entry.billboard = billboard
+		entry.label = label
+	end
+
+	return entry
+end
+
+local function updateEsp()
+	if not State.espEnabled then
+		return
+	end
+
+	local root = getRoot()
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player == LocalPlayer then
+			continue
+		end
+
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local role = roleOf(player)
+
+		local visible = character ~= nil
+			and humanoid ~= nil
+			and humanoid.Health > 0
+			and State.espRoles[role] == true
+
+		if not visible then
+			removeEsp(player)
+			continue
+		end
+
+		local distance = 0
+		if root then
+			local targetRoot = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+			if targetRoot then
+				distance = (root.Position - targetRoot.Position).Magnitude
+			end
+		end
+
+		if distance > State.espMaxDistance then
+			removeEsp(player)
+			continue
+		end
+
+		local entry = espEntries[player]
+		if
+			not entry
+			or entry.role ~= role
+			or not entry.highlight
+			or not entry.highlight.Parent
+			or (entry.billboard == nil and (character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")) ~= nil)
+		then
+			removeEsp(player)
+			entry = buildEsp(player, character, role)
+			espEntries[player] = entry
+		end
+
+		if entry.label then
+			local health = humanoid and math.max(0, math.floor(humanoid.Health)) or 0
+			local roleText = ROLE_LABELS[role] or role
+			if State.espShowDistance then
+				entry.label.Text = string.format("%s\n%s | %d hp | %d m", player.Name, roleText, health, math.floor(distance))
+			else
+				entry.label.Text = string.format("%s\n%s | %d hp", player.Name, roleText, health)
+			end
+		end
+	end
+
+	for player in pairs(espEntries) do
+		if not player.Parent then
+			removeEsp(player)
+		end
+	end
+end
+
+----- Survival helpers -----
+local function fire(remote: Instance?, ...)
+	if not remote then
+		return false
+	end
+	local args = table.pack(...)
+	local ok = pcall(function()
+		(remote :: any):FireServer(table.unpack(args, 1, args.n))
+	end)
+	return ok
+end
+
+local function invokeShop(action: string, payload: any): (boolean, any)
+	if not Remotes.ShopRequest then
+		return false, "no shop"
+	end
+	local ok, result = pcall(function()
+		return (Remotes.ShopRequest :: any):InvokeServer(action, payload)
+	end)
+	return ok, result
+end
+
+local function nearestThreat()
+	local myRole = roleOf(LocalPlayer)
+	-- Passengers look for the patrol; the patrol and the guards look for passengers.
+	local hostile = if myRole == "Citizen" then HOSTILE_TO_CITIZEN else HOSTILE_TO_STAFF
+	local root = getRoot()
+
+	local bestDistance = math.huge
+	local bestPlayer: Player? = nil
+	local bestRole = "-"
+
+	if not root then
+		return math.huge, nil, "-"
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local role = roleOf(player)
+			if hostile[role] then
+				local character = player.Character
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				local targetRoot = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+				if targetRoot and humanoid and humanoid.Health > 0 then
+					local distance = (root.Position - targetRoot.Position).Magnitude
+					if distance < bestDistance then
+						bestDistance = distance
+						bestPlayer = player
+						bestRole = role
+					end
+				end
+			end
+		end
+	end
+
+	return bestDistance, bestPlayer, bestRole
+end
+
+local function beep()
+	local sound = Instance.new("Sound")
+	sound.SoundId = "rbxasset://sounds/electronicpingshort.wav"
+	sound.Volume = 0.4
+	sound.Parent = SoundService
+	sound:Play()
+	task.delay(1.5, function()
+		sound:Destroy()
+	end)
+end
+
+----- Movement state -----
+local noclipConnection: RBXScriptConnection? = nil
+local flyConnection: RBXScriptConnection? = nil
+local flyVelocity: BodyVelocity? = nil
+
+local function stopFly()
+	if flyConnection then
+		flyConnection:Disconnect()
+		flyConnection = nil
+	end
+	if flyVelocity then
+		flyVelocity:Destroy()
+		flyVelocity = nil
+	end
+	local humanoid = getHumanoid()
+	if humanoid then
+		humanoid.PlatformStand = false
+	end
+end
+
+local function startFly()
+	stopFly()
+	local root = getRoot()
+	local humanoid = getHumanoid()
+	if not root or not humanoid then
+		return
+	end
+
+	humanoid.PlatformStand = true
+
+	local velocity = Instance.new("BodyVelocity")
+	velocity.Name = "RailSideHubFly"
+	velocity.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+	velocity.Velocity = Vector3.zero
+	velocity.Parent = root
+	flyVelocity = velocity
+
+	flyConnection = RunService.RenderStepped:Connect(function()
+		if not State.fly then
+			return
+		end
+		local camera = workspace.CurrentCamera
+		if not getRoot() or not camera then
+			return
+		end
+
+		local move = Vector3.zero
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+			move += camera.CFrame.LookVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+			move -= camera.CFrame.LookVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+			move -= camera.CFrame.RightVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+			move += camera.CFrame.RightVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+			move += Vector3.yAxis
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+			move -= Vector3.yAxis
+		end
+
+		local speed = State.flySpeed
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+			speed *= 2
+		end
+
+		velocity.Velocity = if move.Magnitude > 0 then move.Unit * speed else Vector3.zero
+	end)
+end
+
+local function applyMovement()
+	local humanoid = getHumanoid()
+	if not humanoid then
+		return
+	end
+
+	if State.walkSpeedEnabled and humanoid.WalkSpeed ~= State.walkSpeed then
+		humanoid.WalkSpeed = State.walkSpeed
+	end
+
+	if State.jumpEnabled then
+		humanoid.UseJumpPower = true
+		if humanoid.JumpPower ~= State.jumpPower then
+			humanoid.JumpPower = State.jumpPower
+		end
+	end
+
+	if State.noclip and not noclipConnection then
+		noclipConnection = RunService.Stepped:Connect(function()
+			local character = getCharacter()
+			if not character then
+				return
+			end
+			for _, part in ipairs(character:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanCollide then
+					part.CanCollide = false
+				end
+			end
+		end)
+	elseif not State.noclip and noclipConnection then
+		noclipConnection:Disconnect()
+		noclipConnection = nil
+	end
+end
+
+----- Teleport -----
+local function teleport(position: Vector3): boolean
+	local root = getRoot()
+	if not root then
+		return false
+	end
+	root.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+	return true
+end
+
+local function findModelByName(namePart: string): Model?
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if descendant:IsA("Model") and string.find(string.lower(descendant.Name), string.lower(namePart), 1, true) then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function teleportToSpawn(): boolean
+	local spawnPart = workspace:FindFirstChild("SpawnLocation")
+	if spawnPart and spawnPart:IsA("BasePart") then
+		return teleport(spawnPart.Position + Vector3.new(0, 2, 0))
+	end
+	return false
+end
+
+local function teleportToKiosk(): boolean
+	local kiosk = findModelByName("Ларёк")
+	if kiosk then
+		return teleport(kiosk:GetPivot().Position)
+	end
+	return false
+end
+
+local function teleportToTrain(): boolean
+	local trains = workspace:FindFirstChild("_LocalStationTrains") or workspace:FindFirstChild("StationTrainPresentation")
+	if trains then
+		for _, train in ipairs(trains:GetChildren()) do
+			if train:IsA("Model") then
+				local pivot = train:GetPivot()
+				if pivot.Position.Y > -20 then
+					return teleport(pivot.Position + Vector3.new(0, 6, 0))
+				end
+			end
+		end
+	end
+	return false
+end
+
+----- UI -----
+local function toggleHandle(handle: any)
+	if handle then
+		handle:Set(not handle:Get())
+	end
+end
+
+local function addBind(handle: any, action: () -> ())
+	Binds[#Binds + 1] = { handle = handle, action = action }
+end
+
+local function buildUi()
+	for key in pairs(Ui) do
+		Ui[key] = nil
+	end
+	for index = #Binds, 1, -1 do
+		Binds[index] = nil
+	end
+	clearEsp()
+
+	local Window = Airflow:CreateWindow({
+		Name = "RailSide Hub",
+		LoadingSubtitle = T("loading"),
+		ToggleUIKeybind = "RightControl",
+		Size = UDim2.fromOffset(780, 540),
+		Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+		Theme = THEME,
+		ConfigurationSaving = { Enabled = true, FolderName = "RailSideHub" },
+		Home = {
+			Title = "RailSide Hub",
+			Welcome = "Welcome back,",
+			Tier = "v1.1",
+			Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+		},
+	})
+	Ui.window = Window
+
+	----- Main -----
+	local MainTab = Window:CreateTab({ Name = T("main"), Icon = "house" })
+	local LangBox = MainTab:CreateGroupbox({ Name = T("lang_group"), Side = "Left" })
+
+	LangBox:CreateParagraph({
+		Title = T("lang_group"),
+		Content = T("lang_hint"),
+	})
+
+	LangBox:CreateButtonRow({
+		{
+			Name = T("lang_en"),
+			Style = if Lang == "en" then "Primary" else nil,
+			Callback = function()
+				Hub.setLanguage("en")
+			end,
+		},
+		{
+			Name = T("lang_ru"),
+			Style = if Lang == "ru" then "Primary" else nil,
+			Callback = function()
+				Hub.setLanguage("ru")
+			end,
+		},
+	})
+
+	LangBox:CreateStatus({
+		Name = T("lang_status"),
+		Style = "Row",
+		Update = function()
+			return if Lang == "en" then "<Accent>" .. T("lang_en") .. "</Accent>" else "<Accent>" .. T("lang_ru") .. "</Accent>"
+		end,
+	})
+
+	----- Visuals -----
+	local VisTab = Window:CreateTab({ Name = T("visuals"), Icon = "eye" })
+	local EspBox = VisTab:CreateGroupbox({ Name = T("esp_group"), Side = "Left" })
+	local RadarBox = VisTab:CreateGroupbox({ Name = T("radar_group"), Side = "Right" })
+
+	Ui.esp = EspBox:CreateToggle({
+		Name = T("esp"),
+		Desc = T("esp_desc"),
+		Flag = "EspEnabled",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.espEnabled = enabled
+			if not enabled then
+				clearEsp()
+			end
+			Hub.log(if enabled then "<Success>" .. T("esp_on") .. "</Success>" else "<Muted>" .. T("esp_off") .. "</Muted>")
+		end,
+	})
+
+	local espBind = EspBox:CreateKeybind({
+		Name = T("esp_bind"),
+		Desc = T("esp_bind_desc"),
+		CurrentKeybind = "F1",
+		Flag = "BindEsp",
+	})
+	addBind(espBind, function()
+		toggleHandle(Ui.esp)
+	end)
+
+	EspBox:CreateDropdown({
+		Name = T("roles"),
+		Desc = T("roles_desc"),
+		Options = { "Citizens", "Anti-crouch", "Security" },
+		MultipleOptions = true,
+		CurrentOption = { "Citizens", "Anti-crouch", "Security" },
+		Flag = "EspRoles",
+		Callback = function(options: { string })
+			State.espRoles = {
+				Citizen = table.find(options, "Citizens") ~= nil,
+				Patrol = table.find(options, "Anti-crouch") ~= nil,
+				TB = table.find(options, "Security") ~= nil,
+				Unknown = true,
+			}
+		end,
+	})
+
+	EspBox:CreateSlider({
+		Name = T("distance"),
+		Range = { DEFAULT_ESP_DISTANCE, MAX_ESP_DISTANCE },
+		Increment = 50,
+		Suffix = " m",
+		CurrentValue = DEFAULT_ESP_DISTANCE,
+		Flag = "EspDistance",
+		Callback = function(value: number)
+			State.espMaxDistance = value
+			for _, entry in pairs(espEntries) do
+				if entry.billboard then
+					entry.billboard.MaxDistance = value
+				end
+			end
+		end,
+	})
+
+	EspBox:CreateToggle({
+		Name = T("metres"),
+		Desc = T("metres_desc"),
+		Flag = "EspShowDistance",
+		CurrentValue = true,
+		Callback = function(enabled: boolean)
+			State.espShowDistance = enabled
+		end,
+	})
+
+	RadarBox:CreateStatus({
+		Name = T("threat"),
+		Style = "Row",
+		Pin = true,
+		UpdateRate = 0.4,
+		Update = function()
+			if State.nearestThreatDistance == math.huge then
+				return "<Muted>" .. T("nobody") .. "</Muted>"
+			end
+			local color = if State.nearestThreatDistance <= State.dangerRadius then "Error" else "Warning"
+			return string.format(
+				"<%s>%s</%s> <Muted>·</Muted> %s <Muted>·</Muted> %d m",
+				color,
+				State.nearestThreatName,
+				color,
+				ROLE_LABELS[State.nearestThreatRole] or State.nearestThreatRole,
+				math.floor(State.nearestThreatDistance)
+			)
+		end,
+	})
+
+	RadarBox:CreateSlider({
+		Name = T("radius"),
+		Range = { 15, 200 },
+		Increment = 5,
+		Suffix = " m",
+		CurrentValue = 60,
+		Flag = "DangerRadius",
+		Callback = function(value: number)
+			State.dangerRadius = value
+		end,
+	})
+
+	RadarBox:CreateToggle({
+		Name = T("alert"),
+		Desc = T("alert_desc"),
+		Flag = "DangerAlert",
+		CurrentValue = true,
+		Callback = function(enabled: boolean)
+			State.dangerAlert = enabled
+		end,
+	})
+
+	RadarBox:CreateToggle({
+		Name = T("release"),
+		Desc = T("release_desc"),
+		Flag = "AutoReleaseGrip",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.autoReleaseOnDanger = enabled
+		end,
+	})
+
+	----- Survival -----
+	local SurvTab = Window:CreateTab({ Name = T("survival"), Icon = "heart-pulse" })
+	local AutoBox = SurvTab:CreateGroupbox({ Name = T("auto_group"), Side = "Left" })
+	local StatusBox = SurvTab:CreateGroupbox({ Name = T("status_group"), Side = "Right" })
+
+	AutoBox:CreateToggle({
+		Name = T("panic"),
+		Desc = T("panic_desc"),
+		Flag = "AutoPanic",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.autoPanic = enabled
+		end,
+	})
+
+	AutoBox:CreateToggle({
+		Name = T("cola"),
+		Desc = T("cola_desc"),
+		Flag = "AutoDrink",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.autoDrink = enabled
+		end,
+	})
+
+	AutoBox:CreateToggle({
+		Name = T("bandage"),
+		Desc = T("bandage_desc"),
+		Flag = "AutoBandage",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.autoBandage = enabled
+		end,
+	})
+
+	AutoBox:CreateToggle({
+		Name = T("pills"),
+		Desc = T("pills_desc"),
+		Flag = "AutoPills",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.autoPills = enabled
+		end,
+	})
+
+	StatusBox:CreateStatus({
+		Name = T("coins"),
+		Style = "Row",
+		UpdateRate = 0.5,
+		Update = function()
+			local coins = tonumber(attributeOf(LocalPlayer, "ZcpCoins")) or 0
+			return string.format("<Accent>%d</Accent> ZCP", coins)
+		end,
+	})
+
+	StatusBox:CreateStatus({
+		Name = T("stamina"),
+		Style = "Bar",
+		Max = 100,
+		UpdateRate = 0.4,
+		Update = function()
+			return tonumber(attributeOf(LocalPlayer, "Stamina")) or 100
+		end,
+	})
+
+	StatusBox:CreateStatus({
+		Name = T("fear"),
+		Style = "Bar",
+		Max = 100,
+		UpdateRate = 0.4,
+		Update = function()
+			return tonumber(attributeOf(LocalPlayer, "Fear")) or 0
+		end,
+	})
+
+	StatusBox:CreateStatus({
+		Name = T("sanity"),
+		Style = "Bar",
+		Max = 100,
+		UpdateRate = 0.4,
+		Update = function()
+			return tonumber(attributeOf(LocalPlayer, "Sanity")) or 100
+		end,
+	})
+
+	StatusBox:CreateStatus({
+		Name = T("injuries"),
+		Style = "Row",
+		UpdateRate = 1,
+		Update = function()
+			local count = injuryCount(LocalPlayer)
+			if count == 0 then
+				return "<Success>" .. T("none") .. "</Success>"
+			end
+			return string.format("<Error>%d</Error>", count)
+		end,
+	})
+
+	----- Movement -----
+	local MoveTab = Window:CreateTab({ Name = T("movement"), Icon = "move" })
+	local SpeedBox = MoveTab:CreateGroupbox({ Name = T("speed_group"), Side = "Left" })
+	local TeleportBox = MoveTab:CreateGroupbox({ Name = T("teleport_group"), Side = "Right" })
+
+	Ui.walk = SpeedBox:CreateToggle({
+		Name = T("walk"),
+		Desc = T("walk_desc"),
+		Flag = "WalkSpeedEnabled",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.walkSpeedEnabled = enabled
+		end,
+	})
+	addBind(SpeedBox:CreateKeybind({
+		Name = T("walk_bind"),
+		CurrentKeybind = "F2",
+		Flag = "BindWalk",
+	}), function()
+		toggleHandle(Ui.walk)
+	end)
+
+	SpeedBox:CreateSlider({
+		Name = T("walk_value"),
+		Range = { 16, 120 },
+		Increment = 1,
+		CurrentValue = 34,
+		Flag = "WalkSpeedValue",
+		DependsOn = "WalkSpeedEnabled",
+		Callback = function(value: number)
+			State.walkSpeed = value
+		end,
+	})
+
+	Ui.jump = SpeedBox:CreateToggle({
+		Name = T("jump"),
+		Desc = T("jump_desc"),
+		Flag = "JumpEnabled",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.jumpEnabled = enabled
+			local humanoid = getHumanoid()
+			if humanoid and not enabled then
+				humanoid.JumpPower = 0
+			end
+		end,
+	})
+	addBind(SpeedBox:CreateKeybind({
+		Name = T("jump_bind"),
+		CurrentKeybind = "F3",
+		Flag = "BindJump",
+	}), function()
+		toggleHandle(Ui.jump)
+	end)
+
+	SpeedBox:CreateSlider({
+		Name = T("jump_value"),
+		Range = { 20, 120 },
+		Increment = 5,
+		CurrentValue = 50,
+		Flag = "JumpValue",
+		DependsOn = "JumpEnabled",
+		Callback = function(value: number)
+			State.jumpPower = value
+		end,
+	})
+
+	Ui.noclip = SpeedBox:CreateToggle({
+		Name = T("noclip"),
+		Desc = T("noclip_desc"),
+		Flag = "Noclip",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.noclip = enabled
+		end,
+	})
+	addBind(SpeedBox:CreateKeybind({
+		Name = T("noclip_bind"),
+		CurrentKeybind = "F4",
+		Flag = "BindNoclip",
+	}), function()
+		toggleHandle(Ui.noclip)
+	end)
+
+	Ui.fly = SpeedBox:CreateToggle({
+		Name = T("fly"),
+		Desc = T("fly_desc"),
+		Flag = "Fly",
+		CurrentValue = false,
+		Callback = function(enabled: boolean)
+			State.fly = enabled
+			if enabled then
+				task.spawn(startFly)
+			else
+				task.spawn(stopFly)
+			end
+		end,
+	})
+	addBind(SpeedBox:CreateKeybind({
+		Name = T("fly_bind"),
+		CurrentKeybind = "F5",
+		Flag = "BindFly",
+	}), function()
+		toggleHandle(Ui.fly)
+	end)
+
+	SpeedBox:CreateSlider({
+		Name = T("fly_speed"),
+		Range = { 20, 300 },
+		Increment = 5,
+		CurrentValue = 60,
+		Flag = "FlySpeed",
+		DependsOn = "Fly",
+		Callback = function(value: number)
+			State.flySpeed = value
+		end,
+	})
+
+	TeleportBox:CreateButton({
+		Name = T("to_spawn"),
+		Icon = "map-pin",
+		Callback = function()
+			if teleportToSpawn() then
+				Hub.log("<Success>" .. T("teleported") .. "</Success>")
+			else
+				Hub.log("<Error>" .. T("not_found") .. "</Error>")
+			end
+		end,
+	})
+
+	TeleportBox:CreateButton({
+		Name = T("to_shop"),
+		Icon = "shopping-basket",
+		Callback = function()
+			if teleportToKiosk() then
+				Hub.log("<Success>" .. T("teleported") .. "</Success>")
+			else
+				Hub.log("<Error>" .. T("not_found") .. "</Error>")
+			end
+		end,
+	})
+
+	TeleportBox:CreateButton({
+		Name = T("to_train"),
+		Icon = "train-front",
+		Callback = function()
+			if teleportToTrain() then
+				Hub.log("<Success>" .. T("teleported") .. "</Success>")
+			else
+				Hub.log("<Error>" .. T("not_found") .. "</Error>")
+			end
+		end,
+	})
+
+	TeleportBox:CreateButton({
+		Name = T("respawn"),
+		Icon = "rotate-ccw",
+		Confirm = true,
+		Callback = function()
+			fire(Remotes.Reset)
+		end,
+	})
+
+	----- Logs -----
+	local LogsTab = Window:CreateTab({ Name = T("logs"), Icon = "scroll-text" })
+	local LogsBox = LogsTab:CreateGroupbox({ Name = T("log_group"), Side = "Left" })
+	Ui.log = LogsBox:CreateLog({
+		Name = T("log_group"),
+		MaxEntries = 300,
+		MaxRows = 16,
+		Timestamps = true,
+		EmptyText = "",
+	})
+
+	----- Settings -----
+	local SettingsTab = Window:CreateTab({ Name = T("settings"), Icon = "settings" })
+	SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+	SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+	local AboutBox = LogsTab:CreateGroupbox({ Name = T("about_group"), Side = "Right" })
+	AboutBox:CreateParagraph({
+		Title = "RailSide Hub",
+		Content = T("about_text"),
+	})
+	AboutBox:CreateButton({
+		Name = T("unload"),
+		Icon = "trash-2",
+		Style = "Primary",
+		Confirm = true,
+		Callback = function()
+			clearEsp()
+			stopFly()
+			if noclipConnection then
+				noclipConnection:Disconnect()
+				noclipConnection = nil
+			end
+			if Ui.window then
+				Ui.window:Destroy()
+				Ui.window = nil
+			end
+			Ui.log = nil
+			local registry = getgenv()
+			if registry then
+				registry.RailSideHub = nil
+			end
+		end,
+	})
+
+	Window:LoadAutoload()
+	Window:SelectTab(MainTab)
+end
+
+function Hub.log(text: string)
+	if Ui.log then
+		Ui.log:Push(text)
+	end
+end
+
+function Hub.notify(title: string, content: string, kind: string?)
+	if Ui.window then
+		Ui.window:Notify({ Title = title, Content = content, Type = kind or "Info" })
+	end
+end
+
+function Hub.setLanguage(language: string)
+	if language == Lang or (TEXT[language] == nil) then
+		return
+	end
+	Lang = language
+	if Ui.window then
+		pcall(function()
+			Ui.window:Destroy()
+		end)
+	end
+	buildUi()
+	Hub.log("<Accent>" .. T("loaded") .. "</Accent>")
+end
+
+----- Keybinds -----
+UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+	if gameProcessed then
+		return
+	end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	for _, bind in ipairs(Binds) do
+		local handle = bind.handle
+		if handle and not handle.Listening and handle.Value == input.KeyCode then
+			task.spawn(bind.action)
+		end
+	end
+end)
+
+----- Master loop -----
+local accumulator = 0
+local espWasEnabled = false
+local fearHeld = false
+
+RunService.Heartbeat:Connect(function(deltaTime: number)
+	accumulator += deltaTime
+	if accumulator < 0.15 then
+		return
+	end
+	accumulator = 0
+
+	if State.espEnabled and not espWasEnabled then
+		espWasEnabled = true
+	elseif not State.espEnabled and espWasEnabled then
+		espWasEnabled = false
+		clearEsp()
+	end
+
+	updateEsp()
+
+	local distance, threat, threatRole = nearestThreat()
+	State.nearestThreatDistance = distance
+	State.nearestThreatName = if threat then threat.Name else "-"
+	State.nearestThreatRole = threatRole
+
+	local now = os.clock()
+	local inDanger = threat ~= nil and distance <= State.dangerRadius
+
+	if inDanger and State.dangerAlert and now - State.lastThreatNotice > 6 then
+		State.lastThreatNotice = now
+		beep()
+		Hub.notify(
+			T("danger"),
+			string.format("%s (%s) — %d m", threat.Name, ROLE_LABELS[threatRole] or threatRole, math.floor(distance)),
+			"Warning"
+		)
+	end
+
+	if inDanger and State.autoReleaseOnDanger and now - State.lastReleaseAt > 2 then
+		State.lastReleaseAt = now
+		fire(Remotes.GripRelease)
+	end
+
+	local frozen = attributeOf(LocalPlayer, "StationFearFrozen") == true
+	local fearEffect = tonumber(attributeOf(LocalPlayer, "StationFearEffect")) or 0
+	local fearUntil = tonumber(attributeOf(LocalPlayer, "StationFearEffectUntil")) or 0
+
+	if State.autoPanic then
+		local shouldHold = frozen or (fearEffect > 0 and workspace:GetServerTimeNow() < fearUntil)
+		if shouldHold and not fearHeld then
+			fearHeld = true
+			fire(Remotes.FearResist, true)
+		elseif not shouldHold and fearHeld then
+			fearHeld = false
+			fire(Remotes.FearResist, false)
+		end
+	elseif fearHeld then
+		fearHeld = false
+		fire(Remotes.FearResist, false)
+	end
+
+	if State.autoDrink and now - State.lastDrinkAt > 8 then
+		local stamina = tonumber(attributeOf(LocalPlayer, "Stamina")) or 100
+		local cola = tonumber(attributeOf(LocalPlayer, "ShopCola")) or 0
+		if stamina < 35 and cola > 0 then
+			State.lastDrinkAt = now
+			fire(Remotes.Drink)
+		end
+	end
+
+	if State.autoBandage and now - State.lastBandageAt > 15 and injuryCount(LocalPlayer) > 0 then
+		local coins = tonumber(attributeOf(LocalPlayer, "ZcpCoins")) or 0
+		if coins >= BANDAGE_PRICE then
+			State.lastBandageAt = now
+			task.spawn(function()
+				invokeShop("buy", "Bandage")
+			end)
+		end
+	end
+
+	if State.autoPills and now - State.lastPillsAt > 25 then
+		local fear = tonumber(attributeOf(LocalPlayer, "Fear")) or 0
+		local sanity = tonumber(attributeOf(LocalPlayer, "Sanity")) or 100
+		local coins = tonumber(attributeOf(LocalPlayer, "ZcpCoins")) or 0
+		if (fear >= 40 or sanity <= 60) and coins >= PILLS_PRICE then
+			State.lastPillsAt = now
+			task.spawn(function()
+				invokeShop("buy", "Pills")
+			end)
+		end
+	end
+end)
+
+RunService.Heartbeat:Connect(applyMovement)
+
+LocalPlayer.CharacterAdded:Connect(function()
+	stopFly()
+	State.fly = false
+	task.delay(1, applyMovement)
+end)
+
+----- Public API -----
+Hub.state = State
+Hub.lang = function(): string
+	return Lang
+end
+Hub.esp = function(enabled: boolean?)
+	if not Ui.esp then
+		return
+	end
+	local target = if enabled == nil then not Ui.esp:Get() else enabled
+	if Ui.esp:Get() ~= target then
+		Ui.esp:Set(target)
+	end
+end
+Hub.teleport = teleport
+Hub.toSpawn = teleportToSpawn
+Hub.toKiosk = teleportToKiosk
+Hub.toTrain = teleportToTrain
+Hub.threat = nearestThreat
+Hub.stopFly = stopFly
+Hub.binds = Binds
+
+getgenv().RailSideHub = Hub
+
+----- Boot -----
+buildUi()
+
+Hub.log("<Accent>RailSide Hub</Accent> " .. T("loaded"))
+Hub.notify("RailSide Hub", T("ready") .. " " .. T("where_lang"), "Success")
+
+pcall(function()
+	StarterGui:SetCore("SendNotification", {
+		Title = "RailSide Hub",
+		Text = T("ready"),
+		Duration = 4,
+	})
+end)
