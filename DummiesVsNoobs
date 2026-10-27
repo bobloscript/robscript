@@ -1,0 +1,2180 @@
+--!strict
+--[[
+	RobScript.com - Dummies vs Noobs
+
+	A client-side hub for "Dummies vs Noobs" (place name "Ugc", PlaceId 8657806289).
+
+	Features: wave intel, unit ESP, aimbot, character utilities and automation
+	(kit, voting, weapon upgrades, respawn).
+
+	UI: Robly Airflow (https://github.com/bobloscript/Robly_Airflow) with the
+	Robscript theme from the "Robly Airflow" reference note.
+
+	Usage: loadstring(game:HttpGet("<raw url>"))()  or paste the file into an executor.
+]]
+
+----- Services -----
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+
+local LocalPlayer = Players.LocalPlayer
+
+----- Executor environment -----
+local Environment: any = (typeof(getgenv) == "function" and getgenv()) or _G
+local IdentifyExecutor: any = (typeof(identifyexecutor) == "function" and identifyexecutor) or function()
+	return "Unknown"
+end
+local FirePrompt: any = (typeof(fireproximityprompt) == "function" and fireproximityprompt) or nil
+local GetConnections: any = (typeof(getconnections) == "function" and getconnections) or nil
+local MouseClick: any = (typeof(mouse1click) == "function" and mouse1click) or nil
+
+-- Shut down a previous instance of this hub if one is still running.
+if typeof(Environment.UgcHubDestroy) == "function" then
+	pcall(Environment.UgcHubDestroy)
+	Environment.UgcHubDestroy = nil
+end
+if Environment.UgcHubWindow then
+	pcall(function()
+		Environment.UgcHubWindow:Destroy()
+	end)
+	Environment.UgcHubWindow = nil
+end
+
+----- Constants -----
+local HUB_NAME = "RobScript.com - Dummies vs Noobs"
+local HUB_VERSION = "1.0.0"
+
+-- Old GUI names left behind by earlier builds of this script.
+local LEGACY_GUI_NAMES = { "Ugc Hub" }
+
+local STRUCTURE_TYPES: { [string]: boolean } = { PDC = true, Barrier = true }
+local HAZARD_TYPES: { [string]: boolean } = { NoKillReward = true }
+
+local BOSS_TYPES: { [string]: boolean } = {
+	Prometheus = true,
+	Zeus = true,
+	Ares = true,
+	TheWicked = true,
+	MegaJoe = true,
+	London = true,
+	Gaia = true,
+	Achilles = true,
+	Sparchilles = true,
+	Trident = true,
+	Hermes = true,
+	Tempest = true,
+	Deimos = true,
+	Icarus = true,
+	Jetnuker = true,
+	Dreadnought = true,
+	Combatant = true,
+	MangleNether345 = true,
+	Sparta = true,
+	Daedalus = true,
+	Lelantos = true,
+	Instigant = true,
+	["Achilles (1.9)"] = true,
+	["Achilles(ht)"] = true,
+	["Sparta (overhaul)"] = true,
+}
+
+local ELITE_TYPES: { [string]: boolean } = {
+	MADS = true,
+	Tank = true,
+	APU = true,
+	APURail = true,
+	Platform = true,
+	["Platform-A"] = true,
+	Mart = true,
+	MartBreaker = true,
+	Gunner = true,
+}
+
+local SPECIAL_TYPES: { [string]: boolean } = {
+	Saboteur = true,
+	Cloaker = true,
+	Jagant = true,
+	Sniper = true,
+	Radiant = true,
+	Grenadier = true,
+	Cremator = true,
+	Ranger = true,
+	Bombardier = true,
+	Liquidator = true,
+	Conflagrator = true,
+	Baby = true,
+	Fusilier = true,
+	Administrant = true,
+	Agreement = true,
+	Operator = true,
+	Tranquilizer = true,
+	Observant = true,
+	Jetpacker = true,
+	EscortShielder = true,
+	EscortGunner = true,
+	Adjutant = true,
+	Confidant = true,
+	Informant = true,
+	Agitator = true,
+	Engineer = true,
+	Constructant = true,
+	Medic = true,
+	Sergeant = true,
+	Administrator = true,
+}
+
+local KIT_NAMES = { "Assault", "Recon", "Engineer", "Specialist", "Scout", "Medic" }
+local DIFFICULTY_NAMES = { "Conscript", "Infant", "Shellshock", "Hell", "Masochist", "Dynamic" }
+local GAMEMODE_NAMES = { "Siege", "Mastermind", "Attrition", "Epilogue", "Finalstand", "Nullscape" }
+
+local RANK_COLORS = {
+	Boss = Color3.fromHex("#FF2D6B"),
+	Elite = Color3.fromHex("#FF9F45"),
+	Special = Color3.fromHex("#FFD84D"),
+	Basic = Color3.fromHex("#8FB8FF"),
+	Structure = Color3.fromHex("#6EE7B7"),
+	Hazard = Color3.fromHex("#FF5C5C"),
+}
+
+-- Airflow does not always remove its ScreenGui, so drop leftovers by name.
+local function purgeHubGuis()
+	local roots = { game:GetService("CoreGui") }
+	local hiddenGui = typeof(gethui) == "function" and gethui() or nil
+	if hiddenGui then
+		table.insert(roots, hiddenGui)
+	end
+	for _, root in ipairs(roots) do
+		local targets = {}
+		for _, descendant in ipairs(root:GetDescendants()) do
+			if descendant:IsA("ScreenGui") then
+				local isHubGui = descendant.Name == HUB_NAME
+				if not isHubGui then
+					for _, legacy in ipairs(LEGACY_GUI_NAMES) do
+						if descendant.Name == legacy then
+							isHubGui = true
+							break
+						end
+					end
+				end
+				if isHubGui then
+					table.insert(targets, descendant)
+				end
+			end
+		end
+		for _, target in ipairs(targets) do
+			pcall(function()
+				target:Destroy()
+			end)
+		end
+	end
+end
+
+purgeHubGuis()
+
+----- Shared UI theme (Robscript) -----
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+----- Game references -----
+local RSValues = ReplicatedStorage:WaitForChild("Values", 20) :: Folder
+
+local function gameValue(name: string): any
+	return RSValues and RSValues:FindFirstChild(name)
+end
+
+local function readNumber(name: string, fallback: number?): number?
+	local value = gameValue(name)
+	if value and value:IsA("ValueBase") then
+		local raw = value.Value
+		if typeof(raw) == "number" then
+			return raw
+		end
+	end
+	return fallback
+end
+
+local function readString(name: string, fallback: string?): string?
+	local value = gameValue(name)
+	if value and value:IsA("ValueBase") and typeof(value.Value) == "string" then
+		return value.Value
+	end
+	return fallback
+end
+
+local function readBool(name: string, fallback: boolean?): boolean?
+	local value = gameValue(name)
+	if value and value:IsA("ValueBase") and typeof(value.Value) == "boolean" then
+		return value.Value
+	end
+	return fallback
+end
+
+----- Types -----
+type UnitRecord = {
+	model: Model,
+	humanoid: Humanoid,
+	root: BasePart,
+	name: string,
+	rank: string,
+	color: Color3,
+	health: number,
+	maxHealth: number,
+	distance: number,
+	cloaked: boolean,
+	structure: boolean,
+	hazard: boolean,
+}
+
+type EspEntry = {
+	highlight: Highlight?,
+	billboard: BillboardGui?,
+	title: TextLabel?,
+	info: TextLabel?,
+	barBackground: Frame?,
+	barFill: Frame?,
+	tracer: any?,
+}
+
+----- State -----
+local liveUnits: { UnitRecord } = {}
+local espCache: { [Model]: EspEntry } = {}
+local activeConnections: { RBXScriptConnection } = {}
+local currentAimTarget: UnitRecord? = nil
+
+local espEnabled = true
+local espHighlights = true
+local espNameplates = true
+local espTracers = false
+local espStructures = false
+local espHazards = true
+local espMaxDistance = 600
+
+local aimbotEnabled = false
+local aimbotFov = 140
+local aimbotSmoothness = 12
+local aimbotPart = "Head"
+local aimbotVisibleOnly = false
+local aimbotMaxDistance = 500
+local autoShoot = false
+local aiming = false
+local aimKeyValue: any = nil
+local lastShot = 0
+
+local walkSpeedEnabled = false
+local walkSpeedValue = 24
+local jumpPowerEnabled = false
+local jumpPowerValue = 55
+local flyEnabled = false
+local flySpeed = 60
+local noclipEnabled = false
+local infiniteJumpEnabled = false
+local antiAfkEnabled = false
+local fullBrightEnabled = false
+local noParticlesEnabled = false
+local glowEnabled = false
+
+local autoKitEnabled = false
+local autoKitName = KIT_NAMES[1]
+local autoDifficultyEnabled = false
+local autoDifficultyName = DIFFICULTY_NAMES[1]
+local autoGamemodeEnabled = false
+local autoGamemodeName = GAMEMODE_NAMES[1]
+local autoMapEnabled = false
+local autoMapName = ""
+local autoUpgradeEnabled = false
+local autoRespawnEnabled = false
+local autoDialogsEnabled = false
+local ignorePromptDistance = false
+
+local flyVelocity: BodyVelocity? = nil
+local flyGyro: BodyGyro? = nil
+local flyingConnections: { RBXScriptConnection } = {}
+
+local savedPosition: CFrame? = nil
+local lightingBackup: { [string]: any } = {}
+
+local votedGamemodeRound = false
+local votedMapRound = false
+
+-- Forward declarations: UI callbacks may fire before the bodies below are reached.
+local clearEsp: (() -> ()) = function() end
+local clearEspFor: ((Model) -> ()) = function() end
+local startFly: (() -> ()) = function() end
+local stopFly: (() -> ()) = function() end
+local applyLighting: (() -> ()) = function() end
+local applyParticles: (() -> ()) = function() end
+
+----- Helpers -----
+local function formatNumber(value: number?): string
+	if not value then
+		return "--"
+	end
+	if math.abs(value) >= 1e6 then
+		return string.format("%.2fM", value / 1e6)
+	elseif math.abs(value) >= 1e4 then
+		return string.format("%.1fK", value / 1e3)
+	end
+	return tostring(math.floor(value * 100) / 100)
+end
+
+local function formatTime(seconds: number?): string
+	if not seconds then
+		return "--"
+	end
+	local total = math.max(0, math.floor(seconds))
+	local hours = math.floor(total / 3600)
+	local minutes = math.floor((total % 3600) / 60)
+	return string.format("%dh %02dm", hours, minutes)
+end
+
+local function escapeRichText(text: string): string
+	return (text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function getCharacter(): Model?
+	local character = LocalPlayer.Character
+	if character and character:FindFirstChildOfClass("Humanoid") then
+		return character
+	end
+	return nil
+end
+
+local function getHumanoid(): Humanoid?
+	local character = getCharacter()
+	if character then
+		return character:FindFirstChildOfClass("Humanoid")
+	end
+	return nil
+end
+
+local function getRootPart(): BasePart?
+	local character = getCharacter()
+	local humanoid = getHumanoid()
+	if character and humanoid and humanoid.RootPart then
+		return humanoid.RootPart
+	end
+	if character then
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") then
+			return root
+		end
+	end
+	return nil
+end
+
+local function getCamera(): Camera?
+	return workspace.CurrentCamera
+end
+
+local function unitRoot(model: Model): BasePart?
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	local head = model:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head
+	end
+	return model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function averageTransparency(model: Model): number
+	local total, count = 0, 0
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			total += descendant.Transparency
+			count += 1
+		end
+	end
+	if count == 0 then
+		return 0
+	end
+	return total / count
+end
+
+local function rankName(unitType: string, structure: boolean, hazard: boolean): string
+	if structure then
+		return "Structure"
+	elseif hazard then
+		return "Hazard"
+	elseif BOSS_TYPES[unitType] then
+		return "Boss"
+	elseif ELITE_TYPES[unitType] then
+		return "Elite"
+	elseif SPECIAL_TYPES[unitType] then
+		return "Special"
+	end
+	return "Basic"
+end
+
+local function scanUnits(): { UnitRecord }
+	local result = {}
+	local characterRoot = getRootPart()
+	local origin = characterRoot and characterRoot.Position or nil
+
+	for _, model in ipairs(workspace:GetChildren()) do
+		if model:IsA("Model") and Players:GetPlayerFromCharacter(model) == nil then
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			local root = unitRoot(model)
+			local unitType = model:GetAttribute("Type")
+			if humanoid and root and typeof(unitType) == "string" then
+				local structure = STRUCTURE_TYPES[unitType] == true
+				local hazard = HAZARD_TYPES[unitType] == true
+				local rank = rankName(unitType, structure, hazard)
+				local distance = origin and (root.Position - origin).Magnitude or 0
+				table.insert(result, {
+					model = model,
+					humanoid = humanoid,
+					root = root,
+					name = unitType,
+					rank = rank,
+					color = RANK_COLORS[rank] or RANK_COLORS.Basic,
+					health = humanoid.Health,
+					maxHealth = math.max(1, humanoid.MaxHealth),
+					distance = distance,
+					cloaked = not structure and not hazard and averageTransparency(model) > 0.45,
+					structure = structure,
+					hazard = hazard,
+				})
+			end
+		end
+	end
+	return result
+end
+
+local function findPrompts(actionText: string, objectName: string?): { ProximityPrompt }
+	local result = {}
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") and descendant.ActionText == actionText then
+			local parent = descendant.Parent
+			if objectName == nil or (parent ~= nil and parent.Name == objectName) then
+				table.insert(result, descendant)
+			end
+		end
+	end
+	return result
+end
+
+local function promptPosition(prompt: ProximityPrompt): Vector3?
+	local parent = prompt.Parent
+	if not parent then
+		return nil
+	end
+	if parent:IsA("BasePart") then
+		return parent.Position
+	elseif parent:IsA("Model") then
+		local root = unitRoot(parent)
+		return root and root.Position or nil
+	elseif parent:IsA("Attachment") then
+		return parent.WorldPosition
+	end
+	return nil
+end
+
+local function activatePrompt(prompt: ProximityPrompt): boolean
+	if FirePrompt then
+		local ok = pcall(FirePrompt, prompt)
+		if ok then
+			return true
+		end
+	end
+	local began = pcall(function()
+		prompt:InputHoldBegin()
+	end)
+	if began then
+		task.delay(0.15, function()
+			pcall(function()
+				prompt:InputHoldEnd()
+			end)
+		end)
+		return true
+	end
+	return false
+end
+
+local function promptInReach(prompt: ProximityPrompt): boolean
+	if ignorePromptDistance then
+		return true
+	end
+	local root = getRootPart()
+	if not root then
+		return false
+	end
+	local position = promptPosition(prompt)
+	if not position then
+		return false
+	end
+	return (position - root.Position).Magnitude <= math.max(prompt.MaxActivationDistance, 12) + 4
+end
+
+local function fireGuiButton(button: GuiButton): boolean
+	local fired = false
+	if GetConnections then
+		pcall(function()
+			for _, connection in ipairs(GetConnections(button.MouseButton1Click)) do
+				if typeof(connection.Function) == "function" then
+					task.spawn(function()
+						pcall(connection.Function, button, 0, 0)
+					end)
+					fired = true
+				elseif typeof(connection.Fire) == "function" then
+					task.spawn(function()
+						pcall(connection.Fire)
+					end)
+					fired = true
+				end
+			end
+		end)
+	end
+	if not fired then
+		pcall(function()
+			button:Activate()
+		end)
+	end
+	return fired
+end
+
+local function findButtonByText(root: Instance, keyword: string): GuiButton?
+	local lower = string.lower(keyword)
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if descendant:IsA("GuiButton") then
+			local text = descendant:IsA("TextButton") and descendant.Text or ""
+			if string.find(string.lower(text), lower, 1, true) then
+				return descendant
+			end
+		end
+	end
+	return nil
+end
+
+----- UI: load the library -----
+local AirflowSources = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow: any = nil
+for _, url in ipairs(AirflowSources) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and typeof(library) == "table" and typeof(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[" .. HUB_NAME .. "] could not load the Airflow UI library")
+end
+
+Airflow:LoadFont({ Name = "ValleySans" })
+Airflow:PreloadIcons()
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+local Window = Airflow:CreateWindow({
+	Name = HUB_NAME,
+	LoadingSubtitle = "wave intel, esp, automation",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptDvN" },
+	Home = {
+		Title = HUB_NAME,
+		Welcome = "Welcome back,",
+		Tier = "v" .. HUB_VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+Environment.UgcHubWindow = Window
+Environment.UgcHub = {
+	Airflow = Airflow,
+	Window = Window,
+	Version = HUB_VERSION,
+	GetUnits = function()
+		return liveUnits
+	end,
+	GetAimTarget = function()
+		return currentAimTarget
+	end,
+}
+
+----- UI: Server tab -----
+local ServerTab = Window:CreateTab({ Name = "Server", Icon = "radar" })
+local StatusBox = ServerTab:CreateGroupbox({ Name = "Wave", Side = "Left" })
+local WaveBox = ServerTab:CreateGroupbox({ Name = "Next wave", Side = "Left" })
+local PlayerBox = ServerTab:CreateGroupbox({ Name = "Player", Side = "Right" })
+local LogBox = ServerTab:CreateGroupbox({ Name = "Events", Side = "Right" })
+
+local Log = LogBox:CreateLog({
+	Name = "Events",
+	MaxEntries = 200,
+	MaxRows = 16,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+StatusBox:CreateStatus({
+	Name = "Wave",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format(
+			"<Accent>%d</Accent> (subwave %d)",
+			math.floor(readNumber("Wave", 0) or 0),
+			math.floor(readNumber("SubWave", 1) or 1)
+		)
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Phase",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if readBool("IsIntermission", false) then
+			return string.format("<Warning>intermission</Warning> %ds", math.floor(readNumber("IntermissionTime", 0) or 0))
+		end
+		return "<Success>combat</Success>"
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Units",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local folder = RSValues and RSValues:FindFirstChild("CurrentWaveUnits")
+		if not folder then
+			return "<Muted>--</Muted>"
+		end
+		local alive = folder:FindFirstChild("AliveUnits")
+		local left = folder:FindFirstChild("UnitsLeft")
+		local aliveValue = alive and typeof(alive.Value) == "number" and alive.Value or 0
+		local leftValue = left and typeof(left.Value) == "number" and left.Value or 0
+		return string.format("<Text>%d</Text> alive · <Muted>%d</Muted> left", math.floor(aliveValue), math.floor(leftValue))
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Gamemode",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Accent>%s</Accent>", escapeRichText(readString("Gamemode", "--") or "--"))
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Difficulty",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format(
+			"x%.2f · units x%.2f · avg lvl %d",
+			readNumber("DifficultyRatio", 0) or 0,
+			readNumber("UnitMultiplier", 1) or 1,
+			math.floor(readNumber("AverageServerLevel", 0) or 0)
+		)
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Server age",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return formatTime(readNumber("ServerAge", 0))
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Next boss",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local folder = RSValues and RSValues:FindFirstChild("CurrentWaveUnits")
+		local boss = folder and folder:FindFirstChild("NextBoss")
+		local name = boss and typeof(boss.Value) == "string" and boss.Value or ""
+		if name == "" then
+			return "<Muted>none</Muted>"
+		end
+		return string.format("<Error>%s</Error>", escapeRichText(name))
+	end,
+})
+
+WaveBox:CreateLabel({
+	Text = "...",
+	UpdateRate = 1,
+	Update = function()
+		local folder = RSValues and RSValues:FindFirstChild("NextWaveUnits")
+		if not folder then
+			return "<Muted>unknown</Muted>"
+		end
+		local lines = {}
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				for _, value in ipairs(child:GetChildren()) do
+					if value:IsA("ValueBase") and typeof(value.Value) == "number" then
+						table.insert(lines, string.format("<Text>%s</Text> <Muted>x%d</Muted>", escapeRichText(value.Name), value.Value))
+					end
+				end
+			elseif child:IsA("ValueBase") and typeof(child.Value) == "number" then
+				table.insert(lines, string.format("<Text>%s</Text> <Muted>x%d</Muted>", escapeRichText(child.Name), child.Value))
+			end
+		end
+		if #lines == 0 then
+			return "<Muted>list is empty</Muted>"
+		end
+		return table.concat(lines, "\n")
+	end,
+})
+
+PlayerBox:CreateStatus({
+	Name = "Health",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.25,
+	Update = function()
+		local humanoid = getHumanoid()
+		if not humanoid then
+			return "<Muted>--</Muted>"
+		end
+		local ratio = humanoid.Health / math.max(1, humanoid.MaxHealth)
+		local tag = ratio > 0.5 and "Success" or (ratio > 0.25 and "Warning" or "Error")
+		return string.format("<%s>%d / %d</%s>", tag, math.floor(humanoid.Health), math.floor(humanoid.MaxHealth), tag)
+	end,
+})
+
+PlayerBox:CreateStatus({
+	Name = "Points / Reserves",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local stats = LocalPlayer:FindFirstChild("leaderstats")
+		if not stats then
+			return "<Muted>--</Muted>"
+		end
+		local points = stats:FindFirstChild("Points")
+		local reserves = stats:FindFirstChild("Reserves")
+		local ammo = stats:FindFirstChild("Ammo")
+		return string.format(
+			"<Accent>%s</Accent> points · %s reserves · %s ammo",
+			formatNumber(points and points.Value or 0),
+			formatNumber(reserves and reserves.Value or 0),
+			formatNumber(ammo and ammo.Value or 0)
+		)
+	end,
+})
+
+PlayerBox:CreateStatus({
+	Name = "Level / EXP",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local stats = LocalPlayer:FindFirstChild("leaderstats")
+		local levelValue = stats and stats:FindFirstChild("Level")
+		local exp = LocalPlayer:FindFirstChild("EXP")
+		local expAmount = exp and typeof(exp.Value) == "number" and exp.Value or 0
+		local level = levelValue and typeof(levelValue.Value) == "number" and levelValue.Value or 0
+		return string.format("<Text>%d</Text> lvl · %s EXP", math.floor(level), formatNumber(expAmount))
+	end,
+})
+
+PlayerBox:CreateStatus({
+	Name = "Revives",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local stats = LocalPlayer:FindFirstChild("leaderstats")
+		local revs = stats and stats:FindFirstChild("Revs Left")
+		return string.format("<Text>%d</Text>", math.floor(revs and revs.Value or 0))
+	end,
+})
+
+PlayerBox:CreateStatus({
+	Name = "Stress",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local stress = LocalPlayer:FindFirstChild("Stress")
+		return string.format("%d", math.floor(stress and stress.Value or 0))
+	end,
+})
+
+PlayerBox:CreateStatus({
+	Name = "Wave damage",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local stats = LocalPlayer:FindFirstChild("leaderstats")
+		if not stats then
+			return "<Muted>--</Muted>"
+		end
+		local standard = stats:FindFirstChild("WaveStandardDamage")
+		local mech = stats:FindFirstChild("WaveMechDamage")
+		local boss = stats:FindFirstChild("WaveBossDamage")
+		return string.format(
+			"%s · %s · <Error>%s</Error>",
+			formatNumber(standard and standard.Value or 0),
+			formatNumber(mech and mech.Value or 0),
+			formatNumber(boss and boss.Value or 0)
+		)
+	end,
+})
+
+----- UI: ESP tab -----
+local EspTab = Window:CreateTab({ Name = "ESP", Icon = "eye" })
+local EspMainBox = EspTab:CreateGroupbox({ Name = "Highlight", Side = "Left" })
+local EspVisualBox = EspTab:CreateGroupbox({ Name = "Style", Side = "Right" })
+
+EspMainBox:CreateToggle({
+	Name = "Enable ESP",
+	Desc = "Master switch for every ESP layer",
+	Flag = "EspEnabled",
+	CurrentValue = true,
+	Callback = function(state)
+		espEnabled = state
+		if not state then
+			clearEsp()
+		end
+	end,
+})
+
+EspMainBox:CreateToggle({
+	Name = "Model highlight",
+	Flag = "EspHighlight",
+	CurrentValue = true,
+	Callback = function(state)
+		espHighlights = state
+		clearEsp()
+	end,
+})
+
+EspMainBox:CreateToggle({
+	Name = "Names and health",
+	Flag = "EspNames",
+	CurrentValue = true,
+	Callback = function(state)
+		espNameplates = state
+		clearEsp()
+	end,
+})
+
+EspMainBox:CreateToggle({
+	Name = "Tracers",
+	Desc = "Lines from the bottom of the screen to each unit (Drawing)",
+	Flag = "EspTracers",
+	CurrentValue = false,
+	Callback = function(state)
+		espTracers = state
+		clearEsp()
+	end,
+})
+
+EspMainBox:CreateToggle({
+	Name = "Structures (PDC / Barrier)",
+	Flag = "EspStructures",
+	CurrentValue = false,
+	Callback = function(state)
+		espStructures = state
+		clearEsp()
+	end,
+})
+
+EspMainBox:CreateToggle({
+	Name = "Mines and hazards",
+	Flag = "EspHazards",
+	CurrentValue = true,
+	Callback = function(state)
+		espHazards = state
+		clearEsp()
+	end,
+})
+
+EspMainBox:CreateSlider({
+	Name = "ESP range",
+	Range = { 50, 2000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 600,
+	Flag = "EspDistance",
+	Callback = function(value)
+		espMaxDistance = value
+	end,
+})
+
+EspVisualBox:CreateParagraph({
+	Title = "Colors",
+	Content = "Boss is pink, elite is orange, special is yellow, basic is blue, structures are green, mines are red.",
+})
+
+EspVisualBox:CreateButton({
+	Name = "Reset ESP",
+	Callback = function()
+		clearEsp()
+	end,
+})
+
+----- UI: Aim tab -----
+local AimTab = Window:CreateTab({ Name = "Aim", Icon = "crosshair" })
+local AimMainBox = AimTab:CreateGroupbox({ Name = "Aimbot", Side = "Left" })
+local AimExtraBox = AimTab:CreateGroupbox({ Name = "Extras", Side = "Right" })
+
+AimMainBox:CreateToggle({
+	Name = "Aimbot",
+	Desc = "Smoothly locks the camera onto the unit closest to your crosshair",
+	Flag = "Aimbot",
+	CurrentValue = false,
+	Callback = function(state)
+		aimbotEnabled = state
+		if not state then
+			currentAimTarget = nil
+		end
+	end,
+})
+
+AimMainBox:CreateKeybind({
+	Name = "Hold key",
+	CurrentKeybind = "E",
+	Flag = "AimKey",
+	Callback = function(key)
+		aimKeyValue = key
+	end,
+})
+
+AimMainBox:CreateSlider({
+	Name = "FOV",
+	Range = { 20, 600 },
+	Increment = 10,
+	Suffix = " px",
+	CurrentValue = 140,
+	Flag = "AimFov",
+	Callback = function(value)
+		aimbotFov = value
+	end,
+})
+
+AimMainBox:CreateSlider({
+	Name = "Smoothing",
+	Range = { 1, 25 },
+	Increment = 1,
+	CurrentValue = 12,
+	Flag = "AimSmooth",
+	Callback = function(value)
+		aimbotSmoothness = value
+	end,
+})
+
+AimMainBox:CreateSlider({
+	Name = "Max distance",
+	Range = { 50, 1500 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 500,
+	Flag = "AimDistance",
+	Callback = function(value)
+		aimbotMaxDistance = value
+	end,
+})
+
+AimMainBox:CreateDropdown({
+	Name = "Aim part",
+	Options = { "Head", "HumanoidRootPart" },
+	CurrentOption = "Head",
+	Flag = "AimPart",
+	Callback = function(option)
+		aimbotPart = option
+	end,
+})
+
+AimMainBox:CreateToggle({
+	Name = "Visible only",
+	Desc = "Raycast check so the target is not behind a wall",
+	Flag = "AimVisible",
+	CurrentValue = false,
+	Callback = function(state)
+		aimbotVisibleOnly = state
+	end,
+})
+
+AimExtraBox:CreateToggle({
+	Name = "Auto shoot",
+	Desc = "Clicks while a target is locked",
+	Flag = "AutoShoot",
+	CurrentValue = false,
+	Callback = function(state)
+		autoShoot = state
+	end,
+})
+
+AimExtraBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.25,
+	Update = function()
+		if not currentAimTarget then
+			return "<Muted>none</Muted>"
+		end
+		return string.format("<Accent>%s</Accent> · %d studs", escapeRichText(currentAimTarget.name), math.floor(currentAimTarget.distance))
+	end,
+})
+
+----- UI: Character tab -----
+local CharacterTab = Window:CreateTab({ Name = "Character", Icon = "user" })
+local MoveBox = CharacterTab:CreateGroupbox({ Name = "Movement", Side = "Left" })
+local VisualBox = CharacterTab:CreateGroupbox({ Name = "Visuals", Side = "Right" })
+
+MoveBox:CreateToggle({
+	Name = "Walk speed",
+	Flag = "WalkSpeedOn",
+	CurrentValue = false,
+	Callback = function(state)
+		walkSpeedEnabled = state
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "WalkSpeed",
+	Range = { 16, 250 },
+	Increment = 1,
+	CurrentValue = 24,
+	Flag = "WalkSpeedValue",
+	Callback = function(value)
+		walkSpeedValue = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "Jump power",
+	Flag = "JumpPowerOn",
+	CurrentValue = false,
+	Callback = function(state)
+		jumpPowerEnabled = state
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "JumpPower",
+	Range = { 50, 400 },
+	Increment = 5,
+	CurrentValue = 55,
+	Flag = "JumpPowerValue",
+	Callback = function(value)
+		jumpPowerValue = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "Fly",
+	Desc = "WASD to move, Space up, LeftShift down",
+	Flag = "Fly",
+	CurrentValue = false,
+	Callback = function(state)
+		flyEnabled = state
+		if state then
+			startFly()
+		else
+			stopFly()
+		end
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "Fly speed",
+	Range = { 20, 300 },
+	Increment = 10,
+	CurrentValue = 60,
+	Flag = "FlySpeed",
+	Callback = function(value)
+		flySpeed = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "NoClip",
+	Flag = "Noclip",
+	CurrentValue = false,
+	Callback = function(state)
+		noclipEnabled = state
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "Infinite jump",
+	Flag = "InfiniteJump",
+	CurrentValue = false,
+	Callback = function(state)
+		infiniteJumpEnabled = state
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "Anti-AFK",
+	Flag = "AntiAfk",
+	CurrentValue = false,
+	Callback = function(state)
+		antiAfkEnabled = state
+	end,
+})
+
+MoveBox:CreateButtonRow({
+	{
+		Name = "Save position",
+		Callback = function()
+			local root = getRootPart()
+			if not root then
+				return
+			end
+			savedPosition = root.CFrame
+			Log:Push(string.format("Position saved: %d, %d", math.floor(root.Position.X), math.floor(root.Position.Z)))
+		end,
+	},
+	{
+		Name = "Return",
+		Callback = function()
+			local root = getRootPart()
+			if not root or not savedPosition then
+				return
+			end
+			root.CFrame = savedPosition
+			Log:Push("Returned to the saved position")
+		end,
+	},
+})
+
+VisualBox:CreateToggle({
+	Name = "FullBright",
+	Desc = "Removes darkness and fog",
+	Flag = "FullBright",
+	CurrentValue = false,
+	Callback = function(state)
+		fullBrightEnabled = state
+		applyLighting()
+	end,
+})
+
+VisualBox:CreateToggle({
+	Name = "Less particles",
+	Desc = "Disables ParticleEmitters to raise FPS",
+	Flag = "NoParticles",
+	CurrentValue = false,
+	Callback = function(state)
+		noParticlesEnabled = state
+		applyParticles()
+	end,
+})
+
+VisualBox:CreateToggle({
+	Name = "Player glow",
+	Desc = "Highlight on every character",
+	Flag = "Glow",
+	CurrentValue = false,
+	Callback = function(state)
+		glowEnabled = state
+		if not state then
+			for _, player in ipairs(Players:GetPlayers()) do
+				local character = player.Character
+				local existing = character and character:FindFirstChild("RobScriptGlow")
+				if existing then
+					existing:Destroy()
+				end
+			end
+		end
+	end,
+})
+
+VisualBox:CreateButton({
+	Name = "Rejoin server",
+	Confirm = true,
+	Callback = function()
+		pcall(function()
+			TeleportService:Teleport(game.PlaceId)
+		end)
+	end,
+})
+
+----- UI: Automation tab -----
+local AutoTab = Window:CreateTab({ Name = "Auto", Icon = "bot" })
+local VotingBox = AutoTab:CreateGroupbox({ Name = "Voting", Side = "Left" })
+local ActionBox = AutoTab:CreateGroupbox({ Name = "Actions", Side = "Right" })
+
+VotingBox:CreateToggle({
+	Name = "Auto kit",
+	Desc = "Uses the selected kit stand when you are close to it",
+	Flag = "AutoKit",
+	CurrentValue = false,
+	Callback = function(state)
+		autoKitEnabled = state
+	end,
+})
+
+VotingBox:CreateDropdown({
+	Name = "Kit",
+	Options = KIT_NAMES,
+	CurrentOption = KIT_NAMES[1],
+	Flag = "AutoKitName",
+	Callback = function(option)
+		autoKitName = option
+	end,
+})
+
+VotingBox:CreateToggle({
+	Name = "Auto difficulty vote",
+	Flag = "AutoDifficulty",
+	CurrentValue = false,
+	Callback = function(state)
+		autoDifficultyEnabled = state
+	end,
+})
+
+VotingBox:CreateDropdown({
+	Name = "Difficulty",
+	Options = DIFFICULTY_NAMES,
+	CurrentOption = DIFFICULTY_NAMES[1],
+	Flag = "AutoDifficultyName",
+	Callback = function(option)
+		autoDifficultyName = option
+	end,
+})
+
+VotingBox:CreateToggle({
+	Name = "Auto gamemode vote",
+	Desc = "Clicks the gamemode card in the voting window",
+	Flag = "AutoGamemode",
+	CurrentValue = false,
+	Callback = function(state)
+		autoGamemodeEnabled = state
+	end,
+})
+
+VotingBox:CreateDropdown({
+	Name = "Gamemode",
+	Options = GAMEMODE_NAMES,
+	CurrentOption = GAMEMODE_NAMES[1],
+	Flag = "AutoGamemodeName",
+	Callback = function(option)
+		autoGamemodeName = option
+	end,
+})
+
+VotingBox:CreateToggle({
+	Name = "Auto map vote",
+	Flag = "AutoMap",
+	CurrentValue = false,
+	Callback = function(state)
+		autoMapEnabled = state
+	end,
+})
+
+VotingBox:CreateInput({
+	Name = "Map",
+	PlaceholderText = "exact or partial map name",
+	CurrentValue = "",
+	Flag = "AutoMapName",
+	Callback = function(text)
+		autoMapName = text
+	end,
+})
+
+ActionBox:CreateToggle({
+	Name = "Auto weapon upgrade",
+	Desc = "Uses the weapon upgrade stand when it is in range",
+	Flag = "AutoUpgrade",
+	CurrentValue = false,
+	Callback = function(state)
+		autoUpgradeEnabled = state
+	end,
+})
+
+ActionBox:CreateToggle({
+	Name = "Auto respawn",
+	Desc = "Presses the respawn button after death",
+	Flag = "AutoRespawn",
+	CurrentValue = false,
+	Callback = function(state)
+		autoRespawnEnabled = state
+	end,
+})
+
+ActionBox:CreateToggle({
+	Name = "Auto dialogs",
+	Desc = "Clicks Continue / Skip in popups",
+	Flag = "AutoDialogs",
+	CurrentValue = false,
+	Callback = function(state)
+		autoDialogsEnabled = state
+	end,
+})
+
+ActionBox:CreateToggle({
+	Name = "Ignore prompt distance",
+	Desc = "Tries to use stands from far away",
+	Flag = "IgnorePromptDistance",
+	CurrentValue = false,
+	Callback = function(state)
+		ignorePromptDistance = state
+	end,
+})
+
+ActionBox:CreateButton({
+	Name = "Activate all nearby prompts",
+	Callback = function()
+		local fired = 0
+		for _, descendant in ipairs(workspace:GetDescendants()) do
+			if descendant:IsA("ProximityPrompt") and descendant.Enabled and promptInReach(descendant) then
+				if activatePrompt(descendant) then
+					fired += 1
+				end
+			end
+		end
+		Log:Push("Prompts activated: " .. tostring(fired))
+	end,
+})
+
+----- UI: Settings tab -----
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+SettingsTab:CreateParagraph({
+	Title = HUB_NAME .. " v" .. HUB_VERSION,
+	Content = "Executor: "
+		.. tostring(IdentifyExecutor())
+		.. ". UI library: Robly Airflow with the Robscript theme. Press RightControl to hide the interface.",
+})
+
+SettingsTab:CreateButton({
+	Name = "Unload hub",
+	Callback = function()
+		if typeof(Environment.UgcHubDestroy) == "function" then
+			pcall(Environment.UgcHubDestroy)
+		end
+		pcall(function()
+			Window:Destroy()
+		end)
+		purgeHubGuis()
+	end,
+})
+
+----- ESP implementation -----
+local function makeBillboard(adornee: BasePart): (BillboardGui, TextLabel, TextLabel, Frame, Frame)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "RobScriptESP"
+	billboard.Adornee = adornee
+	billboard.Size = UDim2.fromOffset(220, 44)
+	billboard.StudsOffset = Vector3.new(0, 2.6, 0)
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.MaxDistance = espMaxDistance
+	billboard.ResetOnSpawn = false
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.new(1, 0, 0, 18)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 14
+	title.TextColor3 = Color3.new(1, 1, 1)
+	title.TextStrokeTransparency = 0.35
+	title.Text = ""
+	title.Parent = billboard
+
+	local info = Instance.new("TextLabel")
+	info.Name = "Info"
+	info.BackgroundTransparency = 1
+	info.Position = UDim2.new(0, 0, 0, 18)
+	info.Size = UDim2.new(1, 0, 0, 14)
+	info.Font = Enum.Font.Gotham
+	info.TextSize = 12
+	info.TextColor3 = Color3.fromHex("#D8D8E0")
+	info.TextStrokeTransparency = 0.5
+	info.Text = ""
+	info.Parent = billboard
+
+	local barBackground = Instance.new("Frame")
+	barBackground.Name = "BarBackground"
+	barBackground.AnchorPoint = Vector2.new(0.5, 0)
+	barBackground.Position = UDim2.new(0.5, 0, 0, 34)
+	barBackground.Size = UDim2.fromOffset(150, 5)
+	barBackground.BackgroundColor3 = Color3.fromHex("#0A0A0C")
+	barBackground.BorderSizePixel = 0
+	barBackground.Parent = billboard
+
+	local barFill = Instance.new("Frame")
+	barFill.Name = "BarFill"
+	barFill.Size = UDim2.fromScale(1, 1)
+	barFill.BackgroundColor3 = Color3.fromHex("#6EE7B7")
+	barFill.BorderSizePixel = 0
+	barFill.Parent = barBackground
+
+	return billboard, title, info, barBackground, barFill
+end
+
+local function healthColor(ratio: number): Color3
+	if ratio > 0.6 then
+		return Color3.fromHex("#6EE7B7")
+	elseif ratio > 0.3 then
+		return Color3.fromHex("#FFD84D")
+	end
+	return Color3.fromHex("#FF5C5C")
+end
+
+clearEspFor = function(model: Model)
+	local entry = espCache[model]
+	if not entry then
+		return
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	if entry.billboard then
+		entry.billboard:Destroy()
+	end
+	if entry.tracer then
+		pcall(function()
+			entry.tracer.Visible = false
+			entry.tracer:Remove()
+		end)
+	end
+	espCache[model] = nil
+end
+
+clearEsp = function()
+	local models = {}
+	for model in pairs(espCache) do
+		table.insert(models, model)
+	end
+	for _, model in ipairs(models) do
+		clearEspFor(model)
+	end
+end
+
+local function updateTracer(entry: EspEntry, unit: UnitRecord)
+	if not espTracers then
+		if entry.tracer then
+			pcall(function()
+				entry.tracer.Visible = false
+			end)
+		end
+		return
+	end
+
+	local camera = getCamera()
+	if not camera or unit.structure then
+		return
+	end
+
+	local point, onScreen = camera:WorldToViewportPoint(unit.root.Position)
+	if not onScreen then
+		if entry.tracer then
+			entry.tracer.Visible = false
+		end
+		return
+	end
+
+	if not entry.tracer then
+		entry.tracer = Drawing.new("Line")
+		entry.tracer.Thickness = 1
+		entry.tracer.Transparency = 0.6
+	end
+
+	local line = entry.tracer
+	line.From = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
+	line.To = Vector2.new(point.X, point.Y)
+	line.Color = unit.color
+	line.Visible = true
+end
+
+local function updateEsp()
+	local seen: { [Model]: boolean } = {}
+
+	for _, unit in ipairs(liveUnits) do
+		local model = unit.model
+		local wanted = espEnabled
+			and unit.distance <= espMaxDistance
+			and (not unit.structure or espStructures)
+			and (not unit.hazard or espHazards)
+		if wanted then
+			seen[model] = true
+			local entry = espCache[model]
+			if not entry then
+				entry = {}
+				espCache[model] = entry
+			end
+
+			if espHighlights then
+				if not entry.highlight or entry.highlight.Parent ~= model then
+					if entry.highlight then
+						entry.highlight:Destroy()
+					end
+					local highlight = Instance.new("Highlight")
+					highlight.Name = "RobScriptHighlight"
+					highlight.Adornee = model
+					highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					highlight.Parent = model
+					entry.highlight = highlight
+				end
+				entry.highlight.FillColor = unit.color
+				entry.highlight.OutlineColor = unit.color
+				entry.highlight.FillTransparency = unit.cloaked and 0.92 or 0.72
+				entry.highlight.OutlineTransparency = 0.15
+			elseif entry.highlight then
+				entry.highlight:Destroy()
+				entry.highlight = nil
+			end
+
+			if espNameplates then
+				if not entry.billboard or entry.billboard.Parent ~= model then
+					if entry.billboard then
+						entry.billboard:Destroy()
+					end
+					local billboard, title, info, barBackground, barFill = makeBillboard(unit.root)
+					billboard.Parent = model
+					entry.billboard = billboard
+					entry.title = title
+					entry.info = info
+					entry.barBackground = barBackground
+					entry.barFill = barFill
+				end
+				local billboard = entry.billboard :: BillboardGui
+				billboard.Adornee = unit.root
+				billboard.MaxDistance = espMaxDistance
+				if entry.title then
+					local suffix = unit.cloaked and " (cloak)" or (unit.structure and " [build]" or "")
+					entry.title.Text = unit.name .. suffix
+					entry.title.TextColor3 = unit.color
+				end
+				if entry.info then
+					entry.info.Text = string.format(
+						"HP %d/%d · %dm",
+						math.floor(unit.health),
+						math.floor(unit.maxHealth),
+						math.floor(unit.distance)
+					)
+				end
+				if entry.barFill and entry.barBackground then
+					local ratio = math.clamp(unit.health / unit.maxHealth, 0, 1)
+					entry.barFill.Size = UDim2.fromScale(ratio, 1)
+					entry.barFill.BackgroundColor3 = healthColor(ratio)
+					entry.barBackground.Visible = not unit.structure
+				end
+			elseif entry.billboard then
+				entry.billboard:Destroy()
+				entry.billboard = nil
+			end
+
+			updateTracer(entry, unit)
+		end
+	end
+
+	local stale = {}
+	for model in pairs(espCache) do
+		if not seen[model] or model.Parent == nil then
+			table.insert(stale, model)
+		end
+	end
+	for _, model in ipairs(stale) do
+		clearEspFor(model)
+	end
+end
+
+----- Aim implementation -----
+local fovCircle: any = nil
+if Drawing then
+	local circle = Drawing.new("Circle")
+	circle.Thickness = 1
+	circle.NumSides = 64
+	circle.Color = THEME.Accent
+	circle.Transparency = 0.5
+	circle.Filled = false
+	circle.Visible = false
+	fovCircle = circle
+end
+
+local function screenDistance(unit: UnitRecord): number?
+	local camera = getCamera()
+	if not camera then
+		return nil
+	end
+	local position, onScreen = camera:WorldToViewportPoint(unit.root.Position)
+	if not onScreen then
+		return nil
+	end
+	return (Vector2.new(position.X, position.Y) - camera.ViewportSize / 2).Magnitude
+end
+
+local function isVisible(unit: UnitRecord): boolean
+	local camera = getCamera()
+	local character = getCharacter()
+	if not camera or not character then
+		return true
+	end
+	local parameters = RaycastParams.new()
+	parameters.FilterType = Enum.RaycastFilterType.Exclude
+	parameters.FilterDescendantsInstances = { character }
+	parameters.IgnoreWater = true
+	local result = workspace:Raycast(camera.CFrame.Position, unit.root.Position - camera.CFrame.Position, parameters)
+	if not result then
+		return true
+	end
+	return result.Instance:IsDescendantOf(unit.model)
+end
+
+local function findAimTarget(): UnitRecord?
+	local best: UnitRecord? = nil
+	local bestDistance = math.huge
+	for _, unit in ipairs(liveUnits) do
+		if not unit.structure and not unit.hazard and unit.health > 0 and unit.distance <= aimbotMaxDistance then
+			local distance = screenDistance(unit)
+			if distance and distance <= aimbotFov and distance < bestDistance then
+				if not aimbotVisibleOnly or isVisible(unit) then
+					best = unit
+					bestDistance = distance
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function updateAim(deltaTime: number)
+	currentAimTarget = findAimTarget()
+
+	local camera = getCamera()
+	local shouldAim = aimbotEnabled and currentAimTarget ~= nil and (aiming or aimKeyValue == nil)
+
+	if fovCircle then
+		fovCircle.Visible = aimbotEnabled and camera ~= nil
+		if camera then
+			fovCircle.Position = camera.ViewportSize / 2
+			fovCircle.Radius = aimbotFov
+		end
+	end
+
+	if shouldAim and camera and currentAimTarget then
+		local part = currentAimTarget.model:FindFirstChild(aimbotPart)
+		local targetPart = part and part:IsA("BasePart") and part or currentAimTarget.root
+		local aimPosition = targetPart.Position
+		local velocity = targetPart.AssemblyLinearVelocity
+		if velocity.Magnitude > 1 then
+			local travel = (aimPosition - camera.CFrame.Position).Magnitude / 900
+			aimPosition = aimPosition + velocity * travel
+		end
+		local desired = CFrame.lookAt(camera.CFrame.Position, aimPosition)
+		local alpha = math.clamp(deltaTime * aimbotSmoothness, 0, 1)
+		camera.CFrame = camera.CFrame:Lerp(desired, alpha)
+	end
+
+	if autoShoot and MouseClick and currentAimTarget and camera then
+		local targetScreen = screenDistance(currentAimTarget)
+		if targetScreen and targetScreen <= aimbotFov and os.clock() - lastShot > 0.06 then
+			lastShot = os.clock()
+			pcall(MouseClick)
+		end
+	end
+end
+
+----- Character implementation -----
+stopFly = function()
+	for _, connection in ipairs(flyingConnections) do
+		connection:Disconnect()
+	end
+	flyingConnections = {}
+	if flyVelocity then
+		flyVelocity:Destroy()
+		flyVelocity = nil
+	end
+	if flyGyro then
+		flyGyro:Destroy()
+		flyGyro = nil
+	end
+	local humanoid = getHumanoid()
+	if humanoid then
+		humanoid.PlatformStand = false
+	end
+end
+
+startFly = function()
+	stopFly()
+	local humanoid = getHumanoid()
+	local root = getRootPart()
+	if not humanoid or not root then
+		return
+	end
+
+	local velocity = Instance.new("BodyVelocity")
+	velocity.Name = "RobScriptFlyVelocity"
+	velocity.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+	velocity.Velocity = Vector3.zero
+	velocity.Parent = root
+	flyVelocity = velocity
+
+	local gyro = Instance.new("BodyGyro")
+	gyro.Name = "RobScriptFlyGyro"
+	gyro.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+	gyro.P = 4000
+	gyro.D = 200
+	gyro.Parent = root
+	flyGyro = gyro
+
+	humanoid.PlatformStand = true
+
+	table.insert(
+		flyingConnections,
+		RunService.Heartbeat:Connect(function()
+			local camera = getCamera()
+			local currentRoot = getRootPart()
+			if not flyEnabled or not camera or not currentRoot or not flyGyro or not flyVelocity then
+				return
+			end
+			local direction = Vector3.zero
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+				direction += camera.CFrame.LookVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+				direction -= camera.CFrame.LookVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+				direction += camera.CFrame.RightVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+				direction -= camera.CFrame.RightVector
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+				direction += Vector3.yAxis
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+				direction -= Vector3.yAxis
+			end
+			if direction.Magnitude > 0 then
+				direction = direction.Unit
+			end
+			flyVelocity.Velocity = direction * flySpeed
+			flyGyro.CFrame = CFrame.new(currentRoot.Position, currentRoot.Position + camera.CFrame.LookVector)
+		end)
+	)
+end
+
+applyLighting = function()
+	if fullBrightEnabled then
+		if not lightingBackup.Brightness then
+			lightingBackup.Brightness = Lighting.Brightness
+			lightingBackup.ClockTime = Lighting.ClockTime
+			lightingBackup.FogEnd = Lighting.FogEnd
+			lightingBackup.Ambient = Lighting.Ambient
+			lightingBackup.OutdoorAmbient = Lighting.OutdoorAmbient
+			lightingBackup.GlobalShadows = Lighting.GlobalShadows
+		end
+		Lighting.Brightness = 3
+		Lighting.ClockTime = 14
+		Lighting.FogEnd = 100000
+		Lighting.Ambient = Color3.fromRGB(180, 180, 180)
+		Lighting.OutdoorAmbient = Color3.fromRGB(180, 180, 180)
+		Lighting.GlobalShadows = false
+	elseif lightingBackup.Brightness then
+		Lighting.Brightness = lightingBackup.Brightness
+		Lighting.ClockTime = lightingBackup.ClockTime
+		Lighting.FogEnd = lightingBackup.FogEnd
+		Lighting.Ambient = lightingBackup.Ambient
+		Lighting.OutdoorAmbient = lightingBackup.OutdoorAmbient
+		Lighting.GlobalShadows = lightingBackup.GlobalShadows
+	end
+end
+
+applyParticles = function()
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if descendant:IsA("ParticleEmitter") then
+			descendant.Enabled = not noParticlesEnabled
+		end
+	end
+end
+
+local function updateGlow()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		if character and Players:GetPlayerFromCharacter(character) then
+			local existing = character:FindFirstChild("RobScriptGlow")
+			if glowEnabled and not existing then
+				local highlight = Instance.new("Highlight")
+				highlight.Name = "RobScriptGlow"
+				highlight.Adornee = character
+				highlight.FillColor = player == LocalPlayer and THEME.Accent or Color3.fromHex("#8FB8FF")
+				highlight.FillTransparency = 0.65
+				highlight.OutlineTransparency = 0.4
+				highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+				highlight.Parent = character
+			elseif not glowEnabled and existing then
+				existing:Destroy()
+			end
+		end
+	end
+end
+
+local function updateMovement()
+	local humanoid = getHumanoid()
+	if not humanoid then
+		return
+	end
+	if walkSpeedEnabled then
+		humanoid.WalkSpeed = walkSpeedValue
+	end
+	if jumpPowerEnabled then
+		humanoid.UseJumpPower = true
+		humanoid.JumpPower = jumpPowerValue
+	end
+	if noclipEnabled then
+		local character = getCharacter()
+		if character then
+			for _, descendant in ipairs(character:GetDescendants()) do
+				if descendant:IsA("BasePart") then
+					descendant.CanCollide = false
+				end
+			end
+		end
+	end
+end
+
+----- Automation implementation -----
+local lastAntiAfk = 0
+local lastAutomationTick = 0
+local lastRespawnAttempt = 0
+
+local function automationTick()
+	local now = os.clock()
+
+	if antiAfkEnabled and now - lastAntiAfk > 240 then
+		lastAntiAfk = now
+		pcall(function()
+			mousemoverel(2, 0)
+			task.wait(0.05)
+			mousemoverel(-2, 0)
+		end)
+	end
+
+	if now - lastAutomationTick < 0.75 then
+		return
+	end
+	lastAutomationTick = now
+
+	if autoKitEnabled then
+		for _, prompt in ipairs(findPrompts("Select kit", autoKitName)) do
+			if prompt.Enabled and promptInReach(prompt) then
+				activatePrompt(prompt)
+				break
+			end
+		end
+	end
+
+	if autoDifficultyEnabled then
+		for _, prompt in ipairs(findPrompts("Vote", autoDifficultyName)) do
+			if prompt.Enabled and promptInReach(prompt) then
+				activatePrompt(prompt)
+				break
+			end
+		end
+	end
+
+	if autoUpgradeEnabled then
+		for _, prompt in ipairs(findPrompts("Upgrade weapon", nil)) do
+			if prompt.Enabled and promptInReach(prompt) then
+				activatePrompt(prompt)
+				break
+			end
+		end
+	end
+
+	local humanoid = getHumanoid()
+	if autoRespawnEnabled and (not humanoid or humanoid.Health <= 0) and now - lastRespawnAttempt > 2 then
+		lastRespawnAttempt = now
+		local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		if playerGui then
+			for _, gui in ipairs(playerGui:GetChildren()) do
+				if gui:IsA("ScreenGui") and gui.Enabled then
+					local button = findButtonByText(gui, "respawn")
+						or findButtonByText(gui, "redeploy")
+						or findButtonByText(gui, "reinforce")
+					if button then
+						fireGuiButton(button)
+						break
+					end
+				end
+			end
+		end
+	end
+
+	if autoDialogsEnabled then
+		local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		if playerGui then
+			for _, name in ipairs({ "CommanderDialogue", "CasualtyReports", "Cutscenes", "LevelUp" }) do
+				local gui = playerGui:FindFirstChild(name)
+				if gui and gui:IsA("ScreenGui") and gui.Enabled then
+					local button = findButtonByText(gui, "continue")
+						or findButtonByText(gui, "next")
+						or findButtonByText(gui, "skip")
+					if button then
+						fireGuiButton(button)
+					end
+				end
+			end
+		end
+	end
+
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if playerGui then
+		local votingGui = playerGui:FindFirstChild("GamemodeVoting")
+		if votingGui and votingGui:IsA("ScreenGui") and votingGui.Enabled then
+			if autoGamemodeEnabled and not votedGamemodeRound then
+				for _, descendant in ipairs(votingGui:GetDescendants()) do
+					if descendant:IsA("ImageButton") and string.lower(descendant.Name) == string.lower(autoGamemodeName) then
+						votedGamemodeRound = fireGuiButton(descendant)
+						Log:Push("Gamemode vote: <Accent>" .. escapeRichText(autoGamemodeName) .. "</Accent>")
+						break
+					end
+				end
+			end
+		else
+			votedGamemodeRound = false
+		end
+
+		local mapGui = playerGui:FindFirstChild("MapVoting")
+		if mapGui and mapGui:IsA("ScreenGui") and mapGui.Enabled then
+			if autoMapEnabled and not votedMapRound and autoMapName ~= "" then
+				for _, descendant in ipairs(mapGui:GetDescendants()) do
+					if descendant:IsA("TextLabel") and descendant.Name == "MapName" then
+						if string.find(string.lower(descendant.Text), string.lower(autoMapName), 1, true) then
+							local container = descendant.Parent
+							local button = container and container:FindFirstChildWhichIsA("GuiButton")
+							if not button and container and container.Parent then
+								button = container.Parent:FindFirstChildWhichIsA("GuiButton")
+							end
+							if button then
+								votedMapRound = fireGuiButton(button)
+								Log:Push("Map vote: <Accent>" .. escapeRichText(descendant.Text) .. "</Accent>")
+								break
+							end
+						end
+					end
+				end
+			end
+		else
+			votedMapRound = false
+		end
+	end
+end
+
+----- Input -----
+table.insert(
+	activeConnections,
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if aimKeyValue and input.KeyCode == aimKeyValue then
+			aiming = true
+		end
+		if infiniteJumpEnabled and input.KeyCode == Enum.KeyCode.Space then
+			local humanoid = getHumanoid()
+			if humanoid and humanoid:GetState() ~= Enum.HumanoidStateType.Jumping then
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+		end
+	end)
+)
+
+table.insert(
+	activeConnections,
+	UserInputService.InputEnded:Connect(function(input)
+		if aimKeyValue and input.KeyCode == aimKeyValue then
+			aiming = false
+		end
+	end)
+)
+
+----- Character spawn handling -----
+table.insert(
+	activeConnections,
+	LocalPlayer.CharacterAdded:Connect(function()
+		task.wait(0.6)
+		if flyEnabled then
+			startFly()
+		end
+	end)
+)
+
+----- Wave event logging -----
+local lastWave = readNumber("Wave", 0) or 0
+local lastBoss = ""
+local lastGamemode = readString("Gamemode", "") or ""
+
+local WaveValueRef = gameValue("Wave")
+if WaveValueRef then
+	table.insert(
+		activeConnections,
+		WaveValueRef:GetPropertyChangedSignal("Value"):Connect(function()
+			local wave = readNumber("Wave", 0) or 0
+			if wave ~= lastWave then
+				lastWave = wave
+				Log:Push("Wave <Accent>" .. tostring(math.floor(wave)) .. "</Accent> started")
+			end
+		end)
+	)
+end
+
+local GamemodeValueRef = gameValue("Gamemode")
+if GamemodeValueRef then
+	table.insert(
+		activeConnections,
+		GamemodeValueRef:GetPropertyChangedSignal("Value"):Connect(function()
+			local mode = readString("Gamemode", "") or ""
+			if mode ~= lastGamemode then
+				lastGamemode = mode
+				Log:Push("Gamemode: <Accent>" .. escapeRichText(mode) .. "</Accent>")
+			end
+		end)
+	)
+end
+
+local currentWaveUnitsFolder = RSValues and RSValues:FindFirstChild("CurrentWaveUnits")
+if currentWaveUnitsFolder then
+	local nextBossValue = currentWaveUnitsFolder:FindFirstChild("NextBoss")
+	if nextBossValue then
+		table.insert(
+			activeConnections,
+			nextBossValue:GetPropertyChangedSignal("Value"):Connect(function()
+				local bossName = readString("NextBoss", "") or ""
+				if bossName ~= "" and bossName ~= lastBoss then
+					lastBoss = bossName
+					Log:Push("Next boss: <Error>" .. escapeRichText(bossName) .. "</Error>")
+					Window:Notify({ Title = "Boss", Content = bossName, Type = "Warning" })
+				end
+			end)
+		)
+	end
+end
+
+----- Main loop -----
+local unitAccumulator = 0
+local espAccumulator = 0
+local glowAccumulator = 0
+local particlesAccumulator = 0
+local automationAccumulator = 0
+
+table.insert(
+	activeConnections,
+	RunService.Heartbeat:Connect(function(deltaTime)
+		unitAccumulator += deltaTime
+		if unitAccumulator >= 0.15 then
+			unitAccumulator = 0
+			liveUnits = scanUnits()
+		end
+
+		updateMovement()
+
+		if aimbotEnabled or autoShoot then
+			updateAim(deltaTime)
+		else
+			currentAimTarget = nil
+		end
+
+		espAccumulator += deltaTime
+		if espAccumulator >= 0.15 then
+			espAccumulator = 0
+			updateEsp()
+		end
+
+		if noParticlesEnabled then
+			particlesAccumulator += deltaTime
+			if particlesAccumulator >= 5 then
+				particlesAccumulator = 0
+				applyParticles()
+			end
+		end
+
+		if glowEnabled then
+			glowAccumulator += deltaTime
+			if glowAccumulator >= 1 then
+				glowAccumulator = 0
+				updateGlow()
+			end
+		end
+
+		automationAccumulator += deltaTime
+		if automationAccumulator >= 0.25 then
+			automationAccumulator = 0
+			automationTick()
+		end
+	end)
+)
+
+----- Initialization -----
+Window:LoadAutoload()
+
+Log:Push(
+	"Hub loaded. Wave <Accent>"
+		.. tostring(math.floor(readNumber("Wave", 0) or 0))
+		.. "</Accent>, gamemode "
+		.. escapeRichText(readString("Gamemode", "--") or "--")
+)
+Window:Notify({ Title = HUB_NAME, Content = "Ready. RightControl toggles the UI", Type = "Success" })
+
+Environment.UgcHubDestroy = function()
+	for _, connection in ipairs(activeConnections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	activeConnections = {}
+	stopFly()
+	clearEsp()
+
+	-- Clean up traces left by the visual features.
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if descendant:IsA("Highlight") and (descendant.Name == "RobScriptHighlight" or descendant.Name == "RobScriptGlow") then
+			pcall(function()
+				descendant:Destroy()
+			end)
+		end
+		if descendant:IsA("BillboardGui") and descendant.Name == "RobScriptESP" then
+			pcall(function()
+				descendant:Destroy()
+			end)
+		end
+	end
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local glow = character and character:FindFirstChild("RobScriptGlow")
+		if glow then
+			glow:Destroy()
+		end
+	end
+
+	if fovCircle then
+		pcall(function()
+			fovCircle:Remove()
+		end)
+		fovCircle = nil
+	end
+end
