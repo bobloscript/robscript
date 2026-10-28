@@ -1,0 +1,1400 @@
+--!strict
+--[[
+    Kontra ESP  (v2)
+
+    Player overlay for "[JUGGERNAUT] Kontra" (place 87204735676240).
+
+    It reads only. No remote calls, no writes to Lighting / Camera / parts.
+
+    What it shows
+      * A box, name, distance and health bar for every character the game
+        currently replicates.
+      * A dim "last seen" marker for a few seconds after the game hides a
+        target again. This exists because Kontra streams only the characters
+        you are allowed to see; hidden players are parked a million studs away
+        and never sent to the client at all.
+
+    Controls
+      RightShift   - overlay on / off
+      RightControl - settings panel on / off
+      Panel rows   - click a row to flip it (number rows cycle on click)
+      Stop         - getgenv().KontraESP.Destroy()
+
+    Settings are saved to "kontra_esp_settings.txt" when writefile exists.
+]]
+
+local Environment = (typeof(getgenv) == "function" and getgenv()) or _G
+
+if Environment.KontraESP then
+    pcall(function()
+        Environment.KontraESP.Destroy()
+    end)
+end
+
+----- Services -----
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+----- Settings -----
+-- Everything here can also be changed from the panel at runtime.
+local CONFIG = {
+    -- Overlay state
+    Enabled = true,
+    ToggleKey = Enum.KeyCode.RightShift,
+    PanelKey = Enum.KeyCode.RightControl,
+    Panel = true,
+
+    -- Renderer: "auto" tries Drawing first, "gui" forces a ScreenGui.
+    Backend = "auto",
+
+    -- What to draw
+    ShowBoxes = true,
+    ShowNames = true,
+    ShowHealth = true,
+    ShowDistance = true,
+    BoxThickness = 1,
+
+    -- Which targets. TeamCheck = false draws teammates too; in this game that
+    -- is usually all the world contains.
+    TeamCheck = false,
+    MaxDistance = 2000,
+
+    -- Last-seen markers
+    LastSeen = true,
+    LastSeenDuration = 6,
+
+    -- Diagnostics
+    SelfTest = true,
+    Debug = false,
+
+    -- Colours
+    TeamColor = Color3.fromRGB(110, 220, 140),
+    GhostColor = Color3.fromRGB(152, 152, 168),
+    CustomColor = Color3.fromRGB(255, 59, 127),
+
+    -- Internal
+    Pool = 10,
+    StudsPerMeter = 0.28,
+    RenderPriority = Enum.RenderPriority.Camera.Value + 1,
+    SettingsFile = "kontra_esp_settings.txt",
+}
+
+local TOGGLE_ROWS = {
+    { Key = "Enabled", Label = "Overlay" },
+    { Key = "ShowBoxes", Label = "Boxes" },
+    { Key = "ShowNames", Label = "Names" },
+    { Key = "ShowHealth", Label = "Health bar" },
+    { Key = "ShowDistance", Label = "Distance" },
+    { Key = "LastSeen", Label = "Last seen" },
+    { Key = "TeamCheck", Label = "Hide teammates" },
+}
+
+local NUMBER_ROWS = {
+    { Key = "MaxDistance", Label = "Radius", Min = 100, Max = 5000, Step = 100, Suffix = " st" },
+    { Key = "LastSeenDuration", Label = "Ghost time", Min = 1, Max = 30, Step = 1, Suffix = " s" },
+}
+
+local TEAM_COLORS = {
+    T = Color3.fromRGB(255, 176, 74),
+    CT = Color3.fromRGB(96, 165, 250),
+    Spectator = Color3.fromRGB(150, 150, 160),
+}
+
+local SAVE_KEYS = {
+    "Enabled",
+    "TeamCheck",
+    "MaxDistance",
+    "ShowBoxes",
+    "ShowNames",
+    "ShowHealth",
+    "ShowDistance",
+    "LastSeen",
+    "LastSeenDuration",
+    "BoxThickness",
+}
+
+local C_BACKGROUND = Color3.fromRGB(16, 16, 20)
+local C_STROKE = Color3.fromRGB(58, 58, 70)
+local C_TEXT = Color3.fromRGB(230, 230, 236)
+local C_MUTED = Color3.fromRGB(141, 141, 153)
+local C_ACCENT = Color3.fromRGB(255, 59, 127)
+
+----- Small helpers -----
+local function randomName(): string
+    local alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    local pieces = {}
+    for _ = 1, 12 do
+        local index = math.random(1, #alphabet)
+        table.insert(pieces, string.sub(alphabet, index, index))
+    end
+    return table.concat(pieces)
+end
+
+local function make(class: string, props: { [string]: any }, parent: Instance?): any
+    local instance = Instance.new(class)
+    for key, value in pairs(props) do
+        instance[key] = value
+    end
+    if parent then
+        instance.Parent = parent
+    end
+    return instance
+end
+
+----- Settings persistence -----
+local function saveSettings()
+    if type(writefile) ~= "function" then
+        return
+    end
+    local lines = {}
+    for _, key in ipairs(SAVE_KEYS) do
+        local value = CONFIG[key]
+        local kind = type(value)
+        if kind == "boolean" or kind == "number" then
+            table.insert(lines, key .. "=" .. tostring(value))
+        end
+    end
+    pcall(writefile, CONFIG.SettingsFile, table.concat(lines, "\n"))
+end
+
+local function loadSettings()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then
+        return
+    end
+    local ok, data = pcall(function()
+        if isfile(CONFIG.SettingsFile) then
+            return readfile(CONFIG.SettingsFile)
+        end
+        return nil
+    end)
+    if not ok or type(data) ~= "string" then
+        return
+    end
+    for line in string.gmatch(data, "[^\n]+") do
+        local key, raw = string.match(line, "^(%w+)=(.-)%s*$")
+        if key and CONFIG[key] ~= nil then
+            if raw == "true" then
+                CONFIG[key] = true
+            elseif raw == "false" then
+                CONFIG[key] = false
+            else
+                local number = tonumber(raw)
+                if number then
+                    CONFIG[key] = number
+                end
+            end
+        end
+    end
+end
+
+loadSettings()
+
+----- GUI plumbing -----
+local uiRoot: ScreenGui? = nil
+
+local function attachGui(gui: Instance): boolean
+    local syn = rawget(Environment, "syn")
+    if type(syn) == "table" and type(syn.protect_gui) == "function" then
+        if pcall(syn.protect_gui, gui) and gui.Parent ~= nil then
+            return true
+        end
+    end
+
+    local protect = rawget(Environment, "protect_gui")
+    if type(protect) == "function" then
+        if pcall(protect, gui) and gui.Parent ~= nil then
+            return true
+        end
+    end
+
+    local okHidden, hidden = pcall(function()
+        return gethui()
+    end)
+    if okHidden and typeof(hidden) == "Instance" then
+        pcall(function()
+            gui.Parent = hidden
+        end)
+        if gui.Parent ~= nil then
+            return true
+        end
+    end
+
+    local okCore, core = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if okCore and core then
+        pcall(function()
+            gui.Parent = core
+        end)
+        if gui.Parent ~= nil then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function ensureGui(): ScreenGui
+    if uiRoot then
+        if uiRoot.Parent == nil then
+            attachGui(uiRoot)
+        end
+        return uiRoot
+    end
+
+    local gui = make("ScreenGui", {
+        Name = randomName(),
+        ResetOnSpawn = false,
+        IgnoreGuiInset = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    attachGui(gui)
+    uiRoot = gui
+    return gui
+end
+
+----- Game readers -----
+local function getCharacters(): { Model }
+    local list: { Model } = {}
+    local folder = Workspace:FindFirstChild("Characters")
+    if folder then
+        for _, child in ipairs(folder:GetChildren()) do
+            if child:IsA("Model") and child:FindFirstChild("HumanoidRootPart") then
+                table.insert(list, child)
+            end
+        end
+        return list
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player.Character
+        if character and character:FindFirstChild("HumanoidRootPart") then
+            table.insert(list, character)
+        end
+    end
+    return list
+end
+
+local function resolvePlayer(character: Model): Player?
+    local tag = character:FindFirstChild("NameTag")
+    local label = tag and (tag :: Instance):FindFirstChild("PlayerName", true)
+    if label and label:IsA("TextLabel") then
+        local player = Players:FindFirstChild(label.Text)
+        if player then
+            return player
+        end
+    end
+    return Players:FindFirstChild(character.Name)
+end
+
+local function readName(character: Model): string
+    local tag = character:FindFirstChild("NameTag")
+    local label = tag and (tag :: Instance):FindFirstChild("PlayerName", true)
+    if label and label:IsA("TextLabel") then
+        return label.Text
+    end
+    local player = resolvePlayer(character)
+    return player and player.Name or character.Name
+end
+
+local function readHealth(character: Model): number
+    local tag = character:FindFirstChild("NameTag")
+    if tag then
+        local label = (tag :: Instance):FindFirstChild("Health", true)
+        if label and label:IsA("TextLabel") then
+            local digits = string.match(label.Text, "%d+")
+            if digits then
+                return tonumber(digits) or 100
+            end
+        end
+    end
+    return 100
+end
+
+local function colorFor(team: any, isTeammate: boolean, player: Player?): Color3
+    if player == nil then
+        return CONFIG.CustomColor
+    end
+    if isTeammate then
+        return CONFIG.TeamColor
+    end
+    return TEAM_COLORS[team] or TEAM_COLORS.Spectator
+end
+
+----- Slot backends -----
+-- Five methods, two implementations: Drawing (preferred) and ScreenGui.
+type Slot = {
+    hide: (self: Slot) -> (),
+    drawBox: (self: Slot, x: number, y: number, width: number, height: number, color: Color3, thickness: number) -> (),
+    drawName: (self: Slot, text: string, x: number, y: number, color: Color3) -> (),
+    drawDistance: (self: Slot, text: string, x: number, y: number, color: Color3) -> (),
+    drawHealth: (self: Slot, fraction: number, x: number, y: number, height: number) -> (),
+}
+
+local DrawingLib = rawget(Environment, "Drawing")
+if type(DrawingLib) ~= "table" then
+    local ok, value = pcall(function()
+        return Drawing
+    end)
+    if ok and type(value) == "table" then
+        DrawingLib = value
+    end
+end
+
+-- Probe the API: some executors expose a Drawing table that renders nothing.
+local function drawingUsable(): boolean
+    if type(DrawingLib) ~= "table" or type(DrawingLib.new) ~= "function" then
+        return false
+    end
+    local ok, probe = pcall(DrawingLib.new, "Square")
+    if not ok or probe == nil then
+        return false
+    end
+    pcall(function()
+        probe:Remove()
+    end)
+    return true
+end
+
+local useDrawing = if CONFIG.Backend == "gui" then false else drawingUsable()
+local backendName: string = if useDrawing then "drawing" else "gui"
+local createSlot: () -> Slot
+local destroyBackend: () -> ()
+
+if useDrawing then
+    local drawingNew = DrawingLib.new
+    local madeObjects = {}
+
+    local function object(class: string): any
+        local instance = drawingNew(class)
+        table.insert(madeObjects, instance)
+        return instance
+    end
+
+    createSlot = function(): Slot
+        local box = object("Square")
+        box.Thickness = CONFIG.BoxThickness
+        box.Filled = false
+        box.Visible = false
+
+        local nameText = object("Text")
+        nameText.Center = true
+        nameText.Outline = true
+        nameText.OutlineColor = Color3.new(0, 0, 0)
+        nameText.Size = 13
+        nameText.Visible = false
+
+        local distanceText = object("Text")
+        distanceText.Center = true
+        distanceText.Outline = true
+        distanceText.OutlineColor = Color3.new(0, 0, 0)
+        distanceText.Size = 11
+        distanceText.Color = Color3.fromRGB(220, 220, 226)
+        distanceText.Visible = false
+
+        local healthBack = object("Square")
+        healthBack.Filled = true
+        healthBack.Color = Color3.fromRGB(18, 18, 22)
+        healthBack.Visible = false
+
+        local healthFill = object("Square")
+        healthFill.Filled = true
+        healthFill.Visible = false
+
+        local slot = {}
+
+        function slot.hide(_self)
+            box.Visible = false
+            nameText.Visible = false
+            distanceText.Visible = false
+            healthBack.Visible = false
+            healthFill.Visible = false
+        end
+
+        function slot.drawBox(_self, x, y, width, height, color, thickness)
+            box.Position = Vector2.new(x, y)
+            box.Size = Vector2.new(width, height)
+            box.Color = color
+            box.Thickness = thickness
+            box.Visible = true
+        end
+
+        function slot.drawName(_self, text, x, y, color)
+            nameText.Text = text
+            nameText.Position = Vector2.new(x, y)
+            nameText.Color = color
+            nameText.Visible = true
+        end
+
+        function slot.drawDistance(_self, text, x, y, color)
+            distanceText.Text = text
+            distanceText.Position = Vector2.new(x, y)
+            distanceText.Color = color
+            distanceText.Visible = true
+        end
+
+        function slot.drawHealth(_self, fraction, x, y, height)
+            healthBack.Position = Vector2.new(x, y)
+            healthBack.Size = Vector2.new(3, height)
+            healthBack.Visible = true
+
+            local clamped = math.clamp(fraction, 0, 1)
+            local fillHeight = math.max(height * clamped, 1)
+            healthFill.Position = Vector2.new(x, y + height - fillHeight)
+            healthFill.Size = Vector2.new(3, fillHeight)
+            healthFill.Color = Color3.fromRGB(70, 220, 110):Lerp(Color3.fromRGB(235, 70, 70), 1 - clamped)
+            healthFill.Visible = true
+        end
+
+        return (slot :: any) :: Slot
+    end
+
+    destroyBackend = function()
+        for _, entry in ipairs(madeObjects) do
+            pcall(function()
+                entry:Remove()
+            end)
+        end
+        madeObjects = {}
+    end
+else
+    local function makeFrame(parent: Instance): Frame
+        return make("Frame", {
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Visible = false,
+        }, parent)
+    end
+
+    createSlot = function(): Slot
+        local gui = ensureGui()
+
+        local box = makeFrame(gui)
+        local stroke = make("UIStroke", {
+            ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+            Thickness = CONFIG.BoxThickness,
+        }, box)
+
+        local nameHolder = makeFrame(gui)
+        local nameLabel = make("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.fromScale(1, 1),
+            Font = Enum.Font.GothamBold,
+            TextSize = 13,
+            TextStrokeTransparency = 0.4,
+            TextStrokeColor3 = Color3.new(0, 0, 0),
+            TextXAlignment = Enum.TextXAlignment.Center,
+            Text = "",
+        }, nameHolder)
+
+        local distanceHolder = makeFrame(gui)
+        local distanceLabel = make("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.fromScale(1, 1),
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            TextColor3 = Color3.fromRGB(220, 220, 226),
+            TextStrokeTransparency = 0.4,
+            TextStrokeColor3 = Color3.new(0, 0, 0),
+            TextXAlignment = Enum.TextXAlignment.Center,
+            Text = "",
+        }, distanceHolder)
+
+        local healthBack = makeFrame(gui)
+        healthBack.BackgroundTransparency = 0
+        healthBack.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+
+        local healthFill = make("Frame", {
+            BorderSizePixel = 0,
+            AnchorPoint = Vector2.new(0, 1),
+            Position = UDim2.fromScale(0, 1),
+            Size = UDim2.fromScale(1, 1),
+        }, healthBack)
+
+        local slot = {}
+
+        function slot.hide(_self)
+            box.Visible = false
+            nameHolder.Visible = false
+            distanceHolder.Visible = false
+            healthBack.Visible = false
+        end
+
+        function slot.drawBox(_self, x, y, width, height, color, thickness)
+            box.Position = UDim2.fromOffset(x, y)
+            box.Size = UDim2.fromOffset(width, height)
+            stroke.Color = color
+            stroke.Thickness = thickness
+            box.Visible = true
+        end
+
+        function slot.drawName(_self, text, x, y, color)
+            nameHolder.Position = UDim2.fromOffset(x - 100, y - 9)
+            nameHolder.Size = UDim2.fromOffset(200, 18)
+            nameHolder.Visible = true
+            nameLabel.Text = text
+            nameLabel.TextColor3 = color
+        end
+
+        function slot.drawDistance(_self, text, x, y, color)
+            distanceHolder.Position = UDim2.fromOffset(x - 100, y - 7)
+            distanceHolder.Size = UDim2.fromOffset(200, 14)
+            distanceHolder.Visible = true
+            distanceLabel.Text = text
+            distanceLabel.TextColor3 = color
+        end
+
+        function slot.drawHealth(_self, fraction, x, y, height)
+            healthBack.Position = UDim2.fromOffset(x, y)
+            healthBack.Size = UDim2.fromOffset(3, height)
+            healthBack.Visible = true
+
+            local clamped = math.clamp(fraction, 0, 1)
+            healthFill.Size = UDim2.fromScale(1, math.max(clamped, 0.01))
+            healthFill.BackgroundColor3 = Color3.fromRGB(70, 220, 110):Lerp(Color3.fromRGB(235, 70, 70), 1 - clamped)
+        end
+
+        return (slot :: any) :: Slot
+    end
+
+    destroyBackend = function()
+        if uiRoot then
+            pcall(function()
+                uiRoot:Destroy()
+            end)
+            uiRoot = nil
+        end
+    end
+end
+
+----- State -----
+local state = {
+    running = true,
+    errors = 0,
+    targets = 0,
+    ghosts = 0,
+    characters = 0,
+    skippedSelf = 0,
+    skippedTeam = 0,
+    outOfRange = 0,
+    offscreen = 0,
+    parked = 0,
+    lastError = "",
+    panelVisible = CONFIG.Panel,
+}
+
+-- Last position the game actually sent for a player, keyed by Player.
+local lastSeen: { [Player]: { position: Vector3, time: number, team: any } } = {}
+
+local slots: { Slot } = {}
+for _ = 1, CONFIG.Pool do
+    table.insert(slots, createSlot())
+end
+
+----- Panel -----
+local panelConnections: { RBXScriptConnection } = {}
+local statusLabel: TextLabel? = nil
+local panelFrame: Frame? = nil
+
+local PANEL_WIDTH = 268
+local ROW_HEIGHT = 22
+
+local function buildPanel(): Frame
+    local gui = ensureGui()
+
+    local frame = make("Frame", {
+        Name = randomName(),
+        Position = UDim2.fromOffset(24, 140),
+        Size = UDim2.fromOffset(PANEL_WIDTH, 408),
+        BackgroundColor3 = C_BACKGROUND,
+        BackgroundTransparency = 0.06,
+        BorderSizePixel = 0,
+        ZIndex = 50,
+        Visible = CONFIG.Panel,
+    }, gui)
+    make("UICorner", { CornerRadius = UDim.new(0, 8) }, frame)
+    make("UIStroke", { Color = C_STROKE }, frame)
+    panelFrame = frame
+
+    local header = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1,
+        ZIndex = 51,
+    }, frame)
+
+    make("TextLabel", {
+        Position = UDim2.fromOffset(12, 0),
+        Size = UDim2.new(1, -46, 1, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = C_TEXT,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "kontra esp",
+        ZIndex = 51,
+    }, header)
+
+    local close = make("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -8, 0.5, 0),
+        Size = UDim2.fromOffset(22, 22),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 16,
+        TextColor3 = C_MUTED,
+        Text = "\u{00d7}",
+        AutoButtonColor = false,
+        ZIndex = 51,
+    }, header)
+
+    close.MouseEnter:Connect(function()
+        close.TextColor3 = C_TEXT
+    end)
+    close.MouseLeave:Connect(function()
+        close.TextColor3 = C_MUTED
+    end)
+    close.MouseButton1Click:Connect(function()
+        state.panelVisible = false
+        frame.Visible = false
+    end)
+
+    local status = make("TextLabel", {
+        Position = UDim2.fromOffset(12, 32),
+        Size = UDim2.new(1, -24, 0, 16),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Code,
+        TextSize = 11,
+        TextColor3 = C_MUTED,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "starting...",
+        ZIndex = 51,
+    }, frame)
+    statusLabel = status
+
+    local y = 56
+
+    local function section(text: string)
+        make("TextLabel", {
+            Position = UDim2.fromOffset(12, y),
+            Size = UDim2.new(1, -24, 0, 14),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            TextSize = 10,
+            TextColor3 = C_MUTED,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = text,
+            ZIndex = 51,
+        }, frame)
+        y += 16
+    end
+
+    -- Clickable row: title on the left, value chip on the right.
+    local function row(title: string, getValue: () -> string, isOn: () -> boolean, onClick: () -> ())
+        local button = make("TextButton", {
+            Position = UDim2.fromOffset(8, y),
+            Size = UDim2.new(1, -16, 0, ROW_HEIGHT - 2),
+            BackgroundTransparency = 1,
+            Text = "",
+            AutoButtonColor = false,
+            ZIndex = 51,
+        }, frame)
+
+        local label = make("TextLabel", {
+            Size = UDim2.new(1, -70, 1, 0),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 12,
+            TextColor3 = C_TEXT,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = title,
+            ZIndex = 51,
+        }, button)
+
+        local value = make("TextLabel", {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.fromScale(1, 0),
+            Size = UDim2.fromOffset(60, ROW_HEIGHT - 2),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            Text = getValue(),
+            ZIndex = 51,
+        }, button)
+
+        local function refresh()
+            value.Text = getValue()
+            local on = isOn()
+            value.TextColor3 = if on then C_ACCENT else C_MUTED
+            label.TextColor3 = if on then C_TEXT else C_MUTED
+        end
+
+        button.MouseEnter:Connect(function()
+            label.TextColor3 = C_ACCENT
+        end)
+        button.MouseLeave:Connect(function()
+            label.TextColor3 = if isOn() then C_TEXT else C_MUTED
+        end)
+        button.MouseButton1Click:Connect(function()
+            onClick()
+            refresh()
+        end)
+
+        refresh()
+        y += ROW_HEIGHT
+        return refresh
+    end
+
+    section("MAIN")
+    for _, entry in ipairs(TOGGLE_ROWS) do
+        row(
+            entry.Label,
+            function()
+                return if CONFIG[entry.Key] == true then "on" else "off"
+            end,
+            function()
+                return CONFIG[entry.Key] == true
+            end,
+            function()
+                CONFIG[entry.Key] = not CONFIG[entry.Key]
+                if not CONFIG.Enabled then
+                    for _, slot in ipairs(slots) do
+                        slot:hide()
+                    end
+                end
+                saveSettings()
+            end
+        )
+    end
+
+    section("RANGE")
+    for _, entry in ipairs(NUMBER_ROWS) do
+        row(
+            entry.Label,
+            function()
+                return tostring(math.floor(CONFIG[entry.Key])) .. entry.Suffix
+            end,
+            function()
+                return true
+            end,
+            function()
+                -- Click cycles up; keeps the panel free of drag sliders.
+                local nextValue = CONFIG[entry.Key] + entry.Step
+                if nextValue > entry.Max then
+                    nextValue = entry.Min
+                end
+                CONFIG[entry.Key] = nextValue
+                saveSettings()
+            end
+        )
+    end
+
+    -- Colour legend, so the boxes on screen are self-explanatory.
+    local legendY = y + 4
+    make("TextLabel", {
+        Position = UDim2.fromOffset(12, legendY),
+        Size = UDim2.new(1, -24, 0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextColor3 = C_MUTED,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "COLOURS",
+        ZIndex = 51,
+    }, frame)
+
+    local legends = {
+        { Label = "T", Color = TEAM_COLORS.T },
+        { Label = "CT", Color = TEAM_COLORS.CT },
+        { Label = "team", Color = CONFIG.TeamColor },
+        { Label = "last seen", Color = CONFIG.GhostColor },
+    }
+
+    for index, entry in ipairs(legends) do
+        local column = (index - 1) % 2
+        local rowIndex = math.floor((index - 1) / 2)
+        local x = 12 + column * 128
+        local ly = legendY + 18 + rowIndex * 18
+
+        make("Frame", {
+            Position = UDim2.fromOffset(x, ly + 3),
+            Size = UDim2.fromOffset(10, 10),
+            BackgroundColor3 = entry.Color,
+            BorderSizePixel = 0,
+            ZIndex = 51,
+        }, frame)
+
+        make("TextLabel", {
+            Position = UDim2.fromOffset(x + 16, ly),
+            Size = UDim2.fromOffset(100, 16),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            TextColor3 = C_TEXT,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = entry.Label,
+            ZIndex = 51,
+        }, frame)
+    end
+
+    -- Small caption: what the overlay can and cannot do.
+    make("TextLabel", {
+        Position = UDim2.fromOffset(12, 344),
+        Size = UDim2.new(1, -24, 0, 42),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 10,
+        TextColor3 = C_MUTED,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        Text = "Boxes show only players the game sends.\n\"hidden\" = the game parked them away.\nThat is how Kontra works, not a bug.",
+        ZIndex = 51,
+    }, frame)
+
+    make("TextLabel", {
+        Position = UDim2.fromOffset(12, 388),
+        Size = UDim2.new(1, -24, 0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Code,
+        TextSize = 10,
+        TextColor3 = C_MUTED,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "RShift on/off  \u{00b7}  RCtrl panel",
+        ZIndex = 51,
+    }, frame)
+
+    -- Drag by the header.
+    local dragging = false
+    local dragStart = Vector2.zero
+    local startPosition = UDim2.fromOffset(0, 0)
+
+    table.insert(panelConnections, header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPosition = frame.Position
+        end
+    end))
+
+    table.insert(panelConnections, UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end))
+
+    table.insert(panelConnections, UserInputService.InputChanged:Connect(function(input)
+        if not dragging or input.UserInputType ~= Enum.UserInputType.MouseMovement then
+            return
+        end
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end))
+
+    return frame
+end
+
+----- Target collection -----
+type Target = {
+    character: Model,
+    player: Player?,
+    team: any,
+    root: BasePart,
+    head: BasePart,
+    distance: number,
+    isTeammate: boolean,
+}
+
+-- Every replicated character worth drawing, nearest first. Sorting matters:
+-- with a small slot pool the closest targets must win the slots.
+local function collectTargets(camera: Camera): { Target }
+    local origin = camera.CFrame.Position
+    local localTeam = LocalPlayer:GetAttribute("Team")
+    local candidates: { Target } = {}
+    local seenPlayers: { [Player]: boolean } = {}
+
+    for _, character in ipairs(getCharacters()) do
+        local player = resolvePlayer(character)
+        if player == LocalPlayer then
+            state.skippedSelf += 1
+            continue
+        end
+        if player and seenPlayers[player] then
+            continue
+        end
+
+        local root = character:FindFirstChild("HumanoidRootPart")
+        local head = character:FindFirstChild("Head")
+        if not (root and root:IsA("BasePart") and head and head:IsA("BasePart")) then
+            continue
+        end
+
+        local rootPart: BasePart = root
+        local headPart: BasePart = head
+        local distance = (rootPart.Position - origin).Magnitude
+
+        if CONFIG.LastSeen and player and distance < 50000 then
+            lastSeen[player] = {
+                position = rootPart.Position,
+                time = os.clock(),
+                team = player:GetAttribute("Team"),
+            }
+        end
+
+        if distance > 50000 then
+            -- Kontra parks characters it hides about a million studs away.
+            state.parked += 1
+            continue
+        end
+
+        local team = player and player:GetAttribute("Team")
+        local isTeammate = team ~= nil and team == localTeam and team ~= "Spectator"
+        if CONFIG.TeamCheck and isTeammate then
+            state.skippedTeam += 1
+            continue
+        end
+
+        if distance > CONFIG.MaxDistance then
+            state.outOfRange += 1
+            continue
+        end
+
+        if player then
+            seenPlayers[player] = true
+        end
+
+        table.insert(candidates, {
+            character = character,
+            player = player,
+            team = team,
+            root = rootPart,
+            head = headPart,
+            distance = distance,
+            isTeammate = isTeammate,
+        })
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    return candidates
+end
+
+----- Drawing -----
+local function drawTarget(slot: Slot, camera: Camera, target: Target): boolean
+    local headPoint = camera:WorldToViewportPoint(target.head.Position + Vector3.new(0, 0.4, 0))
+    local feetPoint = camera:WorldToViewportPoint(target.root.Position - Vector3.new(0, 2.6, 0))
+
+    -- The second return value of WorldToViewportPoint is "on screen"; depth
+    -- lives in .Z. Depth is what we want here: a target whose feet are just
+    -- below the screen edge still deserves a box.
+    if headPoint.Z <= 0 or feetPoint.Z <= 0 then
+        state.offscreen += 1
+        return false
+    end
+
+    local topY = headPoint.Y
+    local height = math.abs(feetPoint.Y - topY)
+    if height <= 6 then
+        state.offscreen += 1
+        return false
+    end
+
+    local width = height * 0.44
+    local centerX = (headPoint.X + feetPoint.X) * 0.5
+    local color = colorFor(target.team, target.isTeammate, target.player)
+
+    if CONFIG.ShowBoxes then
+        slot:drawBox(centerX - width * 0.5, topY, width, height, color, CONFIG.BoxThickness)
+    end
+
+    if CONFIG.ShowNames then
+        local label = readName(target.character)
+        if target.isTeammate then
+            label = label .. " (team)"
+        end
+        slot:drawName(label, centerX, math.max(topY - 12, 8), color)
+    end
+
+    if CONFIG.ShowDistance then
+        slot:drawDistance(
+            string.format("%d m", math.floor(target.distance * CONFIG.StudsPerMeter)),
+            centerX,
+            topY + height + 8,
+            color
+        )
+    end
+
+    if CONFIG.ShowHealth then
+        local maxHealth = (target.player and target.player:GetAttribute("MaxHealth")) or 100
+        slot:drawHealth(readHealth(target.character) / math.max(maxHealth, 1), centerX - width * 0.5 - 6, topY, height)
+    end
+
+    return true
+end
+
+local function drawGhost(slot: Slot, camera: Camera, position: Vector3, color: Color3, age: number, name: string): boolean
+    local top = camera:WorldToViewportPoint(position + Vector3.new(0, 2.2, 0))
+    local bottom = camera:WorldToViewportPoint(position - Vector3.new(0, 2.6, 0))
+
+    if top.Z <= 0 or bottom.Z <= 0 then
+        return false
+    end
+
+    local height = math.abs(bottom.Y - top.Y)
+    if height <= 6 then
+        return false
+    end
+
+    local width = height * 0.44
+    local centerX = (top.X + bottom.X) * 0.5
+
+    if CONFIG.ShowBoxes then
+        slot:drawBox(centerX - width * 0.5, top.Y, width, height, color, CONFIG.BoxThickness)
+    end
+
+    if CONFIG.ShowNames then
+        slot:drawName(name, centerX, math.max(top.Y - 12, 8), color)
+    end
+
+    if CONFIG.ShowDistance then
+        slot:drawDistance(string.format("%.0fs ago", age), centerX, top.Y + height + 8, color)
+    end
+
+    return true
+end
+
+local function update()
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    state.characters = #getCharacters()
+    state.skippedSelf = 0
+    state.skippedTeam = 0
+    state.outOfRange = 0
+    state.offscreen = 0
+    state.parked = 0
+    state.ghosts = 0
+    state.targets = 0
+
+    if not CONFIG.Enabled then
+        for _, slot in ipairs(slots) do
+            slot:hide()
+        end
+        return
+    end
+
+    local used = 0
+    local drawnPlayers: { [Player]: boolean } = {}
+
+    for _, target in ipairs(collectTargets(camera)) do
+        if used >= #slots then
+            break
+        end
+        used += 1
+        local slot = slots[used]
+        slot:hide()
+        if drawTarget(slot, camera, target) then
+            if target.player then
+                drawnPlayers[target.player] = true
+            end
+            state.targets += 1
+        else
+            used -= 1
+        end
+    end
+
+    -- Ghost pass: whatever the game stopped replicating keeps a dim marker at
+    -- its last known position for a few seconds.
+    if CONFIG.LastSeen then
+        local now = os.clock()
+        local localTeam = LocalPlayer:GetAttribute("Team")
+        local origin = camera.CFrame.Position
+
+        for player, record in pairs(lastSeen) do
+            if player.Parent == nil or now - record.time > CONFIG.LastSeenDuration then
+                lastSeen[player] = nil
+            end
+        end
+
+        for player, record in pairs(lastSeen) do
+            if used >= #slots then
+                break
+            end
+
+            local age = now - record.time
+            local hidden = not drawnPlayers[player]
+            local teamAllowed = not CONFIG.TeamCheck
+                or record.team == nil
+                or record.team ~= localTeam
+                or record.team == "Spectator"
+
+            if hidden and age > 0.15 and teamAllowed and (record.position - origin).Magnitude <= CONFIG.MaxDistance then
+                used += 1
+                local slot = slots[used]
+                slot:hide()
+                if drawGhost(slot, camera, record.position, CONFIG.GhostColor, age, player.Name) then
+                    state.ghosts += 1
+                else
+                    used -= 1
+                end
+            end
+        end
+    end
+
+    for index = used + 1, #slots do
+        slots[index]:hide()
+    end
+end
+
+----- Self test -----
+local function showSelfTest()
+    if not CONFIG.SelfTest then
+        return
+    end
+
+    local gui = ensureGui()
+    local marker = make("Frame", {
+        Name = randomName(),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(150, 190),
+        BackgroundTransparency = 1,
+    }, gui)
+    make("UIStroke", { Color = Color3.fromRGB(80, 255, 140), Thickness = 2 }, marker)
+    make("TextLabel", {
+        Size = UDim2.fromScale(1, 0),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = Color3.fromRGB(80, 255, 140),
+        Text = "GUI OK",
+    }, marker)
+
+    task.delay(3, function()
+        pcall(function()
+            marker:Destroy()
+        end)
+    end)
+end
+
+----- Render loop -----
+local renderName = randomName()
+
+RunService:BindToRenderStep(renderName, CONFIG.RenderPriority, function()
+    if not state.running then
+        return
+    end
+
+    local ok, err = pcall(update)
+    if not ok then
+        state.errors += 1
+        state.lastError = tostring(err)
+        if state.errors == 3 then
+            warn("[overlay] render error: " .. tostring(err))
+        elseif state.errors > 20 then
+            state.running = false
+            pcall(function()
+                RunService:UnbindFromRenderStep(renderName)
+            end)
+        end
+    end
+end)
+
+----- Hotkeys -----
+local hotkeyConnection = UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then
+        return
+    end
+
+    if input.KeyCode == CONFIG.ToggleKey then
+        CONFIG.Enabled = not CONFIG.Enabled
+        if not CONFIG.Enabled then
+            for _, slot in ipairs(slots) do
+                slot:hide()
+            end
+        end
+    elseif input.KeyCode == CONFIG.PanelKey and panelFrame then
+        state.panelVisible = not state.panelVisible
+        panelFrame.Visible = state.panelVisible
+    end
+end)
+
+----- Status loop -----
+task.spawn(function()
+    while state.running do
+        if statusLabel then
+            local parts = { backendName }
+            table.insert(parts, string.format("%d live", state.targets))
+            if state.ghosts > 0 then
+                table.insert(parts, string.format("%d ghost", state.ghosts))
+            end
+            if state.parked > 0 then
+                table.insert(parts, string.format("%d hidden", state.parked))
+            end
+            if state.errors > 0 then
+                table.insert(parts, string.format("err %d", state.errors))
+            end
+            statusLabel.Text = table.concat(parts, "  \u{00b7}  ")
+            statusLabel.TextColor3 = if state.errors > 0 then C_ACCENT else C_MUTED
+        end
+
+        if CONFIG.Debug then
+            print(string.format(
+                "[overlay] %s: chars=%d live=%d ghost=%d hidden=%d team=%d range=%d off=%d err=%d",
+                backendName,
+                state.characters,
+                state.targets,
+                state.ghosts,
+                state.parked,
+                state.skippedTeam,
+                state.outOfRange,
+                state.offscreen,
+                state.errors
+            ))
+        end
+
+        task.wait(1)
+    end
+end)
+
+----- Public API -----
+local api = {}
+
+function api.SetEnabled(value: boolean)
+    CONFIG.Enabled = value
+    if not value then
+        for _, slot in ipairs(slots) do
+            slot:hide()
+        end
+    end
+end
+
+function api.Toggle()
+    api.SetEnabled(not CONFIG.Enabled)
+end
+
+function api.SetConfig(key: string, value: any)
+    if CONFIG[key] ~= nil then
+        CONFIG[key] = value
+        saveSettings()
+    end
+end
+
+function api.GetConfig(): { [string]: any }
+    return CONFIG
+end
+
+function api.GetStatus(): { [string]: any }
+    return {
+        backend = backendName,
+        characters = state.characters,
+        targets = state.targets,
+        ghosts = state.ghosts,
+        parked = state.parked,
+        skippedSelf = state.skippedSelf,
+        skippedTeam = state.skippedTeam,
+        outOfRange = state.outOfRange,
+        offscreen = state.offscreen,
+        errors = state.errors,
+        lastError = state.lastError,
+        guiParent = uiRoot and uiRoot.Parent and uiRoot.Parent:GetFullName() or "none",
+    }
+end
+
+function api.Destroy()
+    state.running = false
+    Environment.KontraESP = nil
+
+    pcall(function()
+        RunService:UnbindFromRenderStep(renderName)
+    end)
+    pcall(function()
+        hotkeyConnection:Disconnect()
+    end)
+    for _, connection in ipairs(panelConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    panelConnections = {}
+
+    for _, slot in ipairs(slots) do
+        pcall(function()
+            slot:hide()
+        end)
+    end
+    pcall(destroyBackend)
+
+    if uiRoot then
+        pcall(function()
+            uiRoot:Destroy()
+        end)
+        uiRoot = nil
+    end
+    slots = {}
+end
+
+Environment.KontraESP = api
+
+----- Startup -----
+buildPanel()
+showSelfTest()
+
+print(string.format(
+    "[overlay] ready: %s backend, %d slots, RShift on/off, RCtrl panel",
+    backendName,
+    CONFIG.Pool
+))
+
+
+--[[
+    ===========================================================================
+    HOW THIS ESP WORKS  (and why it sometimes shows nothing at all)
+    ===========================================================================
+
+    This script does not hunt for enemies. It cannot. It only draws what the
+    game has already sent to your computer.
+
+    Kontra streams only the players you are allowed to see. Everyone else is
+    not "hidden behind a wall" -- they are simply not in your copy of the game
+    world. Their leftover models get parked about a million studs away and lose
+    their name tag, so not even those leftovers say where anyone is.
+
+    We checked the network side as well: the packet that carries players
+    arrives with exactly as many entries as the characters you can already see.
+    No extra hidden players inside it. Nothing to decode.
+
+    So:
+      * enemy in front of you    -> box appears
+      * enemy walks behind cover -> the game stops sending him -> box vanishes
+      * that is the game working as intended, not the script failing
+
+    This is why a real "wallhack" ESP is not possible in Kontra. Any script
+    that promises one is either lying or drawing something else entirely.
+
+    What this script does instead: it remembers the last position the game
+    actually sent for a target, and keeps a dim "last seen" box there for a
+    few seconds. That is a memory, not x-ray vision.
+
+    Reading the panel:
+      "4 live"   boxes drawn right now
+      "1 ghost"  last-seen markers still ticking down
+      "5 hidden" characters the game parked away from you
+
+    If live and ghost are 0 while hidden is high, nothing is broken.
+    There is simply nothing on screen worth drawing.
+]]
