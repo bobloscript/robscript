@@ -1,0 +1,3847 @@
+--[[
+    PS99 Hub v3 — «гибрид» для Pet Simulator 99 (placeId 8737899170), Potassium.
+
+    Идея: снаружи 6 простых вкладок, как у Unknown Hub, внутри — готовые режимы
+    (цель → скрипт сам решает, что делать) и тонкая настройка в свёрнутых
+    «Advanced»-секциях, как у Z-Ware.
+
+    Вкладки: Фарм / Ранги и квесты / Питомцы и яйца / Производительность / Разное / Настройки.
+
+    Что проверено в игре 28.10.2026:
+      * брейкаблы — это Model с атрибутами AreaID / BreakableID / BreakableClass;
+      * питомцы ломают брейкаблы сами, если стоять рядом (телепорт-цикл не обязателен);
+      * яйца покупаются только рядом со стойкой яиц (__THINGS.Eggs.Main);
+      * цена яйца видна на капсуле: PriceHUD → Gold Coins / Gold Bars / Locked;
+      * алмазы точно берутся из leaderstats, монеты — из HUD (сокращённые, «909k»);
+      * Ranks_RankUp / Ranks_ClaimAll / Login Streaks работают, квесты читаются из PlayerGui.Rank.
+
+    Клавиша окна: RightControl.
+]]
+
+----- Services -----
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualUser = game:GetService("VirtualUser")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Network = ReplicatedStorage:WaitForChild("Network")
+local Directory = ReplicatedStorage:WaitForChild("__DIRECTORY")
+local Things = Workspace:WaitForChild("__THINGS")
+
+----- UI library -----
+local Airflow = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau"
+))()
+
+local THEME = {
+    Background = Color3.fromHex("#0A0A0C"),
+    Surface = Color3.fromHex("#141418"),
+    Surface2 = Color3.fromHex("#1A1A20"),
+    Surface3 = Color3.fromHex("#2A2A33"),
+    Stroke = Color3.fromHex("#26262E"),
+    StrokeHover = Color3.fromHex("#3C3C49"),
+    Accent = Color3.fromHex("#FF3B7F"),
+    AccentDark = Color3.fromHex("#1A0710"),
+    Text = Color3.fromHex("#F5F5F7"),
+    Muted = Color3.fromHex("#8D8D99"),
+    Success = Color3.fromHex("#5BD68C"),
+    Warning = Color3.fromHex("#F0B06C"),
+    Error = Color3.fromHex("#F06C6C"),
+}
+
+Airflow.ThemePresets.PS99 = THEME
+Airflow:SetDefaultTheme(THEME)
+
+local Window, Log
+
+----- Cleanup of previous versions -----
+local GENERATION = (getgenv().__PS99Gen or 0) + 1
+getgenv().__PS99Gen = GENERATION
+
+-- Both older hubs stop themselves when their generation counter changes.
+getgenv().__PS99SimpleGeneration = (getgenv().__PS99SimpleGeneration or 0) + 1
+getgenv().__PS99HubGeneration = (getgenv().__PS99HubGeneration or 0) + 1
+
+do
+    local old = getgenv().PS99Hub
+    if old then
+        pcall(function()
+            if old.window then
+                old.window:Destroy()
+            end
+        end)
+        pcall(function()
+            if old.stop then
+                old.stop()
+            end
+        end)
+    end
+end
+
+----- Language -----
+local function loadLanguage()
+    local ok, data = pcall(function()
+        if type(isfile) == "function" and isfile("PS99Hub/lang.txt") then
+            return readfile("PS99Hub/lang.txt")
+        end
+    end)
+    if ok and (data == "EN" or data == "RU") then
+        return data
+    end
+    return "RU"
+end
+
+local function saveLanguage(value)
+    pcall(function()
+        if type(writefile) == "function" then
+            if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder("PS99Hub") then
+                makefolder("PS99Hub")
+            end
+            writefile("PS99Hub/lang.txt", value)
+        end
+    end)
+end
+
+local Lang = loadLanguage()
+
+local L = {
+    ru = {
+        tab_farm = "Фарм",
+        tab_ranks = "Ранги",
+        tab_pets = "Питомцы",
+        tab_perf = "Производительность",
+        tab_misc = "Разное",
+        tab_settings = "Настройки",
+
+        status = "Статус",
+        session = "Сессия",
+        quick = "Быстрый старт",
+        advanced = "Тонкая настройка",
+        goal = "Цель",
+        action = "Действие",
+        coins = "Монеты",
+        diamonds = "Алмазы",
+        gold_bars = "Слитки",
+        pets = "Питомцы",
+        breakables = "Брейкаблы",
+        rank = "Ранг",
+
+        start = "Старт",
+        stop = "Стоп",
+        unstuck = "Освободить",
+        now = "Сейчас",
+        on = "вкл",
+        off = "выкл",
+
+        start_afk = "Старт AFK-фарм",
+        stop_all = "Остановить всё",
+        goal_pick = "Выбери цель",
+        goal_coins = "AFK: монеты",
+        goal_diamonds = "AFK: алмазы",
+        goal_rank = "Прокачка ранга",
+        goal_event = "Ивент",
+
+        auto_farm = "Авто-фарм",
+        auto_farm_desc = "Стоять в лучшей зоне — питомцы ломают всё сами",
+        mode = "Режим",
+        mode_afk = "AFK (стоять)",
+        mode_active = "Активный (летать по целям)",
+        target = "Приоритет цели",
+        target_nearest = "Ближайшая",
+        target_best = "Лучшая по цене",
+        target_diamonds = "Алмазы",
+        target_chests = "Сундуки",
+        area = "Зона фарма",
+        zone_pick = "Лучшая зона",
+        zone_auto = "Авто (лучшая)",
+        area_auto = "Авто (Main → Easy)",
+        area_main = "Main",
+        area_easy = "Easy",
+        area_vip = "VIP",
+        diamond_areas = "Алмазные брейкаблы",
+        d_all = "Все загруженные зоны",
+        d_current = "Текущая зона",
+        d_main = "Main",
+        d_easy = "Easy",
+        orbs = "Собирать орбы",
+        respect = "Уважать ввод",
+        respect_desc = "Пауза, пока держишь WASD",
+        vip = "Разрешить VIP-зону",
+        vip_desc = "Только если VIP куплен",
+        movement = "Движение",
+        move_tp = "Телепорт",
+        move_tween = "Tween TP",
+        move_path = "Путь (Pathfinding)",
+        buy_area_auto = "Покупать следующую зону",
+        buy_area_now = "Купить следующую зону",
+        auto_tap = "Auto Tap",
+        auto_tap_desc = "Бьёт цель кликами, не двигая персонажа",
+        tap_interval = "Интервал тапа",
+        auto_hoverboard = "Auto Hoverboard",
+        ultimate = "Auto Ultimate",
+        farm_hint = "AFK-режим не двигает персонажа: он один раз едет в лучшую зону и стоит. Активный — телепорт по целям.",
+
+        earned = "Заработано",
+        per_hour = "Монет/час",
+        hatched = "Вылуплено",
+        spent = "Алмазов потрачено",
+        runtime = "Время",
+
+        rank_ready = "Ранк-ап",
+        ready_yes = "готов",
+        ready_no = "копим",
+        rewards_left = "Наград осталось",
+        auto_rank_up = "Auto Rank Up",
+        auto_rank_up_desc = "Жмёт Ranks_RankUp, когда игра пишет RANKUP READY",
+        auto_rank_quests = "Auto Rank Quests",
+        auto_rank_quests_desc = "Делает действия под квесты ранга",
+        auto_area_quests = "Auto Area Quests",
+        auto_area_quests_desc = "Назначает NPC/зонные квесты",
+        auto_quest_items = "Auto Use Quest Items",
+        auto_quest_items_desc = "Использует зелья под квест «Use N Potions»",
+        auto_fish_dig = "Auto Fishing & Digging",
+        auto_fish_dig_desc = "Бета: только при удочке/лопате в рюкзаке",
+        claim_now = "Забрать награды сейчас",
+        current_quests = "Текущие квесты",
+        empty_quests = "Квесты не найдены",
+        quests_hint = "Квесты читаются прямо из окна Rank — это и есть строка Goal / Action.",
+        rewards = "Награды",
+        claim_rank = "Rank Rewards",
+        claim_login = "Login Streak",
+        claim_mail = "Почта",
+        free_gifts = "Free Gifts",
+        claim_all = "Забрать всё",
+
+        hatching = "Яйца",
+        auto_hatch = "Auto Hatch",
+        auto_hatch_desc = "Ходит к стойке яиц, открывает пачку и возвращается",
+        egg = "Яйцо",
+        egg_best = "Лучшее доступное (монеты)",
+        eggs_per_trip = "Яиц за подход",
+        trip_every = "Подход каждые, сек",
+        hatch_now = "Открыть сейчас",
+        now_opening = "Сейчас открывается",
+        egg_price = "Цена",
+        locked = "закрыто",
+        pets_box = "Питомцы",
+        equip_best = "Equip Best Pets",
+        pet_filter = "Pet Filter",
+        filter_low = "Low Power First",
+        filter_smart = "Smart",
+        keep_shiny = "Keep Shiny Pets",
+        keep_exclusive = "Keep Exclusive Enchants",
+        hatch_hint = "Яйца покупаются только рядом со стойкой. Хаб сам возит туда и обратно.",
+        hatch_full_hint = "Если сервер отказывает даже на дешёвом яйце — скорее всего заполнены слоты питомцев (команда 10/10) или действует кулдаун. Освободи место и попробуй снова.",
+        machines_soon = "Фильтры и защиты пригодятся для фьюз-машины и конвертеров — они в следующем апдейте.",
+
+        perf = "Производительность",
+        perf_mode = "Performance Mode",
+        perf_mode_desc = "Один тумблер: текстуры, питомцы, игроки, эффекты, FPS 60",
+        textures = "Отключить текстуры",
+        own_pets = "Скрыть своих питомцев",
+        other_pets = "Скрыть чужих питомцев",
+        players = "Скрыть игроков",
+        world_fx = "Отключить WorldFX",
+        gui_fx = "Отключить GUIFX",
+        fps_limit = "Ограничить FPS",
+        fps_value = "Лимит FPS",
+        restore_gfx = "Вернуть графику",
+        fps_now = "FPS сейчас",
+        perf_hint = "Для слабого ПК/телефона и долгого AFK. Настройки клиентские, сервер их не видит.",
+
+        walkspeed = "WalkSpeed",
+        fly = "Fly",
+        fly_speed = "Скорость полёта",
+        noclip = "Noclip",
+        anti_afk = "Anti AFK",
+        restore_move = "Вернуть управление",
+        world = "Мир",
+        buy_next = "Купить следующую зону",
+        tp_best = "Телепорт в лучшую зону",
+        activities = "Активности",
+        balloons = "Лопать шарики",
+        relics = "Собирать Shiny Relics",
+        misc_hint = "Активности лучше не включать одновременно с фармом — они будут спорить за персонажа.",
+
+        presets = "Пресеты",
+        preset_afk = "AFK-фарм алмазов",
+        preset_rank = "Прокачка ранга",
+        preset_event = "Ивент",
+        presets_hint = "Пресет ставит цель и все тумблеры сразу. Дальше можно править вручную.",
+        language = "Язык",
+        lang_hint = "Сменится после перезапуска скрипта (RightControl → Stop → Execute).",
+        safety = "Защита",
+        allow_diamonds = "Разрешить тратить алмазы",
+        allow_diamonds_desc = "По умолчанию ВЫКЛ: ни одна авто-функция не тронет алмазы",
+        diamond_warn = "Предупреждать о тратах",
+        min_diamonds = "Не опускать баланс ниже",
+        max_spend = "Максимум за сессию (0 = без лимита)",
+        allow_bars = "Разрешить тратить золотые слитки",
+        allow_bars_desc = "Слитки тоже премиум: по умолчанию яйца за слитки не покупаются",
+        safety_hint = "Алмазы отслеживаются по leaderstats. Если трата случилась при выключенной защите — хаб напишет красным.",
+        about = "О хабе",
+        about_text = "PS99 Hub v3 — гибрид простоты и глубины. 6 вкладок, готовые цели, защиты трат, статистика сессии и русский интерфейс. Поиск по функциям — сверху справа. Клавиша окна — RightControl.",
+
+        act_idle = "Ожидание",
+        act_wait = "Жду респавн брейкаблов",
+        act_farm = "Стою и фармлю",
+        act_travel = "Еду в лучшую зону",
+        act_zone_travel = "Еду в зону: %s",
+        act_zone = "Зона %d · %s · %s",
+        act_target = "Цель",
+        act_hatch = "Открываю яйца",
+        act_hatch_go = "Иду к стойке яиц",
+        act_hatch_back = "Возвращаюсь на фарм",
+        act_claim = "Забираю награды",
+        act_quest = "Квест",
+        act_rankup = "Ранк-ап готов — жму",
+        act_pause = "Пауза: ввод игрока",
+        act_no_eggs = "Нет доступных яиц",
+        act_refused = "Сервер отказал — пауза",
+        act_full = "Питомцы/слоты заполнены",
+        act_egg_travel_fail = "Не добрался до яиц",
+        notif_start = "Всё включено. Приятного фарма.",
+        notif_stop = "Всё выключено, управление возвращено.",
+        notif_goal = "Цель применена",
+        notif_preset = "Пресет применён",
+        notif_diamond = "Потрачены алмазы при выключенной защите!",
+        notif_no_diamonds = "Трата алмазов заблокирована защитой.",
+        notif_no_bars = "Яйцо стоит слитки — трата слитков выключена.",
+        notif_restart = "Язык сохранён. Перезапусти скрипт.",
+        notif_unstuck = "Управление восстановлено.",
+        notif_hatch_done = "Яйца открыты",
+        notif_no_perm = "Нет доступа к файлам — язык не сохранится.",
+        search_hint = "Поиск: сверху справа",
+    },
+    en = {
+        tab_farm = "Farming",
+        tab_ranks = "Ranks",
+        tab_pets = "Pets & Eggs",
+        tab_perf = "Performance",
+        tab_misc = "Misc",
+        tab_settings = "Settings",
+
+        status = "Status",
+        session = "Session",
+        quick = "Quick start",
+        advanced = "Advanced",
+        goal = "Goal",
+        action = "Action",
+        coins = "Coins",
+        diamonds = "Diamonds",
+        gold_bars = "Gold bars",
+        pets = "Pets",
+        breakables = "Breakables",
+        rank = "Rank",
+
+        start = "Start",
+        stop = "Stop",
+        unstuck = "Unstuck",
+        now = "Now",
+        on = "on",
+        off = "off",
+
+        start_afk = "Start AFK farm",
+        stop_all = "Stop everything",
+        goal_pick = "Pick a goal",
+        goal_coins = "AFK: coins",
+        goal_diamonds = "AFK: diamonds",
+        goal_rank = "Rank up",
+        goal_event = "Event",
+
+        auto_farm = "Auto farm",
+        auto_farm_desc = "Stand in the best area — pets break everything",
+        mode = "Mode",
+        mode_afk = "AFK (stand still)",
+        mode_active = "Active (fly to targets)",
+        target = "Target priority",
+        target_nearest = "Nearest",
+        target_best = "Best value",
+        target_diamonds = "Diamonds",
+        target_chests = "Chests",
+        area = "Farm area",
+        zone_pick = "Best zone",
+        zone_auto = "Auto (best)",
+        area_auto = "Auto (Main → Easy)",
+        area_main = "Main",
+        area_easy = "Easy",
+        area_vip = "VIP",
+        diamond_areas = "Diamond breakables",
+        d_all = "All loaded areas",
+        d_current = "Current area",
+        d_main = "Main",
+        d_easy = "Easy",
+        orbs = "Collect orbs",
+        respect = "Respect input",
+        respect_desc = "Pause while WASD is held",
+        vip = "Allow VIP area",
+        vip_desc = "Only if VIP is owned",
+        movement = "Movement",
+        move_tp = "Teleport",
+        move_tween = "Tween TP",
+        move_path = "Pathfinding",
+        buy_area_auto = "Auto buy next area",
+        buy_area_now = "Buy next area now",
+        auto_tap = "Auto Tap",
+        auto_tap_desc = "Clicks the target without moving the character",
+        tap_interval = "Tap interval",
+        auto_hoverboard = "Auto Hoverboard",
+        ultimate = "Auto Ultimate",
+        farm_hint = "AFK mode does not move you: it travels to the best area once and stands. Active mode teleports to targets.",
+
+        earned = "Earned",
+        per_hour = "Coins/hour",
+        hatched = "Hatched",
+        spent = "Diamonds spent",
+        runtime = "Uptime",
+
+        rank_ready = "Rank up",
+        ready_yes = "ready",
+        ready_no = "farming",
+        rewards_left = "Rewards left",
+        auto_rank_up = "Auto Rank Up",
+        auto_rank_up_desc = "Presses Ranks_RankUp on RANKUP READY",
+        auto_rank_quests = "Auto Rank Quests",
+        auto_rank_quests_desc = "Acts on rank quest text",
+        auto_area_quests = "Auto Area Quests",
+        auto_area_quests_desc = "Assigns NPC/zone quests",
+        auto_quest_items = "Auto Use Quest Items",
+        auto_quest_items_desc = "Uses potions for the “Use N Potions” quest",
+        auto_fish_dig = "Auto Fishing & Digging",
+        auto_fish_dig_desc = "Beta: only with a rod/shovel in the backpack",
+        claim_now = "Claim rewards now",
+        current_quests = "Current quests",
+        empty_quests = "No quests detected",
+        quests_hint = "Quests are read from the Rank window — that is the Goal / Action line.",
+        rewards = "Rewards",
+        claim_rank = "Rank Rewards",
+        claim_login = "Login Streak",
+        claim_mail = "Mailbox",
+        free_gifts = "Free Gifts",
+        claim_all = "Claim everything",
+
+        hatching = "Eggs",
+        auto_hatch = "Auto Hatch",
+        auto_hatch_desc = "Walks to the egg stand, opens a batch, comes back",
+        egg = "Egg",
+        egg_best = "Best affordable (coins)",
+        eggs_per_trip = "Eggs per trip",
+        trip_every = "Trip every, sec",
+        hatch_now = "Hatch now",
+        now_opening = "Now opening",
+        egg_price = "Price",
+        locked = "locked",
+        pets_box = "Pets",
+        equip_best = "Equip Best Pets",
+        pet_filter = "Pet Filter",
+        filter_low = "Low Power First",
+        filter_smart = "Smart",
+        keep_shiny = "Keep Shiny Pets",
+        keep_exclusive = "Keep Exclusive Enchants",
+        hatch_hint = "Eggs can only be bought next to the egg stand. The hub travels there and back.",
+        hatch_full_hint = "If the server refuses even the cheapest egg, pet slots are probably full (10/10 team) or a cooldown is active. Free a slot and retry.",
+        machines_soon = "Filters and protections are ready for the fuse machine and converters — next update.",
+
+        perf = "Performance",
+        perf_mode = "Performance Mode",
+        perf_mode_desc = "One switch: textures, pets, players, FX, FPS 60",
+        textures = "Disable textures",
+        own_pets = "Hide own pets",
+        other_pets = "Hide other pets",
+        players = "Hide players",
+        world_fx = "Disable WorldFX",
+        gui_fx = "Disable GUIFX",
+        fps_limit = "Limit FPS",
+        fps_value = "FPS limit",
+        restore_gfx = "Restore graphics",
+        fps_now = "FPS now",
+        perf_hint = "For weak PCs/phones and long AFK. Client-side only, the server does not see it.",
+
+        walkspeed = "WalkSpeed",
+        fly = "Fly",
+        fly_speed = "Fly speed",
+        noclip = "Noclip",
+        anti_afk = "Anti AFK",
+        restore_move = "Restore movement",
+        world = "World",
+        buy_next = "Buy next area",
+        tp_best = "Teleport to best area",
+        activities = "Activities",
+        balloons = "Pop balloons",
+        relics = "Collect Shiny Relics",
+        misc_hint = "Do not run activities together with farming — they fight over the character.",
+
+        presets = "Presets",
+        preset_afk = "AFK diamond farm",
+        preset_rank = "Rank up",
+        preset_event = "Event",
+        presets_hint = "A preset sets the goal and all toggles at once. Tweak afterwards.",
+        language = "Language",
+        lang_hint = "Applies after a script restart (RightControl → Stop → Execute).",
+        safety = "Safety",
+        allow_diamonds = "Allow diamond spending",
+        allow_diamonds_desc = "OFF by default: no auto feature touches diamonds",
+        diamond_warn = "Warn on spending",
+        min_diamonds = "Never drop below",
+        max_spend = "Max per session (0 = no limit)",
+        allow_bars = "Allow spending gold bars",
+        allow_bars_desc = "Bars are premium too: bar eggs are skipped by default",
+        safety_hint = "Diamonds are tracked via leaderstats. A spend while protection is off is logged in red.",
+        about = "About",
+        about_text = "PS99 Hub v3 — a hybrid of simple and deep. 6 tabs, ready goals, spend guards, session stats and a Russian UI. Search is top-right. Window key: RightControl.",
+
+        act_idle = "Idle",
+        act_wait = "Waiting for breakables",
+        act_farm = "Standing and farming",
+        act_travel = "Travelling to the best area",
+        act_zone_travel = "Travelling to: %s",
+        act_zone = "Zone %d · %s · %s",
+        act_target = "Target",
+        act_hatch = "Hatching eggs",
+        act_hatch_go = "Walking to the egg stand",
+        act_hatch_back = "Returning to farm",
+        act_claim = "Claiming rewards",
+        act_quest = "Quest",
+        act_rankup = "Rank up ready — pressing",
+        act_pause = "Paused: player input",
+        act_no_eggs = "No affordable eggs",
+        act_refused = "Server refused — cooling down",
+        act_full = "Pets/slots are full",
+        act_egg_travel_fail = "Could not reach eggs",
+        notif_start = "Everything is on. Happy farming.",
+        notif_stop = "Everything is off, movement restored.",
+        notif_goal = "Goal applied",
+        notif_preset = "Preset applied",
+        notif_diamond = "Diamonds were spent while protection was off!",
+        notif_no_diamonds = "Diamond spend blocked by protection.",
+        notif_no_bars = "This egg costs bars — bar spending is off.",
+        notif_restart = "Language saved. Restart the script.",
+        notif_unstuck = "Movement restored.",
+        notif_hatch_done = "Eggs hatched",
+        notif_no_perm = "No file access — the language will not persist.",
+        search_hint = "Search: top-right",
+    },
+}
+
+local function T(key, ...)
+    local value = (L[Lang] and L[Lang][key]) or L.ru[key] or key
+    if select("#", ...) > 0 then
+        local ok, formatted = pcall(string.format, value, ...)
+        if ok then
+            return formatted
+        end
+    end
+    return value
+end
+
+----- State -----
+local S = {
+    -- farm
+    farm = false,
+    farmMode = "AFK",
+    target = "Nearest",
+    area = "Auto",
+    farmZone = "Auto",
+    diamondAreas = "All",
+    allowVIP = false,
+    respect = true,
+    orbs = false,
+    movement = "Teleport",
+    buyArea = false,
+    autoTap = true,
+    tapInterval = 0.2,
+    hoverboard = false,
+    ultimate = false,
+    unlockedEggTier = 0,
+    zoneSlow = {},
+    zoneLock = nil,
+    zoneCheck = nil,
+    standPos = nil,
+    standZone = nil,
+    standEmptyAt = nil,
+    -- eggs
+    hatch = false,
+    eggChoice = "Best",
+    hatchAmount = 4,
+    hatchEvery = 60,
+    equipBest = false,
+    petFilter = "Low Power First",
+    keepShiny = true,
+    keepExclusive = true,
+    -- ranks
+    rankUp = true,
+    rankQuests = false,
+    areaQuests = false,
+    questItems = true,
+    fishDig = false,
+    claims = false,
+    claimRank = true,
+    claimLogin = true,
+    claimMail = true,
+    freeGifts = false,
+    -- performance
+    perf = false,
+    tex = false,
+    ownPets = false,
+    otherPets = false,
+    players = false,
+    worldFX = false,
+    guiFX = false,
+    fpsLimit = false,
+    fpsValue = 60,
+    -- misc
+    walk = false,
+    walkValue = 32,
+    fly = false,
+    flyValue = 60,
+    noclip = false,
+    antiAfk = true,
+    balloons = false,
+    relics = false,
+    -- safety
+    allowDiamonds = false,
+    diamondWarn = true,
+    minDiamonds = 500,
+    maxSpend = 0,
+    allowBars = false,
+    -- meta
+    goal = "Coins",
+    action = "",
+    actionAt = 0,
+    lastTier = nil,
+    hatchNow = { egg = nil, state = "idle", at = 0 },
+    sessionStart = os.clock(),
+    startCoins = 0,
+    startDiamonds = 0,
+    sessionHatched = 0,
+    sessionSpent = 0,
+    diamondBreach = false,
+    hatchBusy = false,
+    farmAnchor = nil,
+}
+
+----- Helpers: character / movement -----
+local function getCharacter()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return nil
+    end
+    return character, humanoid, root
+end
+
+local function playerIsMoving()
+    return UserInputService:IsKeyDown(Enum.KeyCode.W)
+        or UserInputService:IsKeyDown(Enum.KeyCode.A)
+        or UserInputService:IsKeyDown(Enum.KeyCode.S)
+        or UserInputService:IsKeyDown(Enum.KeyCode.D)
+        or UserInputService:IsKeyDown(Enum.KeyCode.Space)
+end
+
+local currentTween
+local function stopTween()
+    if currentTween then
+        pcall(function()
+            currentTween:Cancel()
+        end)
+        currentTween = nil
+    end
+end
+
+local function teleport(position)
+    local character, _, root = getCharacter()
+    if not character then
+        return false
+    end
+    stopTween()
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = CFrame.new(position + Vector3.new(0, 6, 0))
+    return true
+end
+
+local function tweenTeleport(position, duration)
+    local character, _, root = getCharacter()
+    if not character then
+        return false
+    end
+    stopTween()
+    currentTween = TweenService:Create(
+        root,
+        TweenInfo.new(duration or 0.35, Enum.EasingStyle.Linear),
+        { CFrame = CFrame.new(position + Vector3.new(0, 6, 0)) }
+    )
+    currentTween:Play()
+    return true
+end
+
+local walking = false
+local walkTween
+
+local function stopWalking()
+    walking = false
+    if walkTween then
+        pcall(function()
+            walkTween:Cancel()
+        end)
+        walkTween = nil
+    end
+end
+
+-- PS99 resets Humanoid.MoveDirection every frame, so we glide along a path from
+-- PathfindingService in short steps: it looks like walking and avoids walls.
+local function walkTo(position)
+    if walking then
+        return false
+    end
+    local character, _, root = getCharacter()
+    if not character then
+        return false
+    end
+    walking = true
+    task.spawn(function()
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2.5,
+            AgentHeight = 5,
+            AgentCanJump = true,
+        })
+        local ok = pcall(function()
+            path:ComputeAsync(root.Position, position)
+        end)
+        local waypoints
+        if ok and path.Status == Enum.PathStatus.Success then
+            waypoints = path:GetWaypoints()
+        else
+            waypoints = { { Position = position } }
+        end
+        for _, waypoint in ipairs(waypoints) do
+            if not walking or getgenv().__PS99Gen ~= GENERATION then
+                break
+            end
+            local _, _, liveRoot = getCharacter()
+            if not liveRoot then
+                break
+            end
+            local distance = (waypoint.Position - liveRoot.Position).Magnitude
+            if distance > 1.5 then
+                local duration = math.clamp(distance / 38, 0.05, 30)
+                walkTween = TweenService:Create(
+                    liveRoot,
+                    TweenInfo.new(duration, Enum.EasingStyle.Linear),
+                    { CFrame = CFrame.new(waypoint.Position + Vector3.new(0, 2, 0)) }
+                )
+                walkTween:Play()
+                walkTween.Completed:Wait()
+                walkTween = nil
+            end
+        end
+        walking = false
+    end)
+    return true
+end
+
+local function travelTo(position)
+    local _, _, root = getCharacter()
+    if not root then
+        return false
+    end
+    if S.movement == "Tween TP" then
+        local distance = (position - root.Position).Magnitude
+        return tweenTeleport(position, math.clamp(distance / 250, 0.4, 12))
+    elseif S.movement == "Путь (Pathfinding)" or S.movement == "Pathfinding" then
+        return walkTo(position)
+    end
+    return teleport(position)
+end
+
+local defaultWalkSpeed
+local function restoreMovement()
+    local character, humanoid, root = getCharacter()
+    if not character then
+        return
+    end
+    local body = root:FindFirstChild("PS99HubFly")
+    if body then
+        body:Destroy()
+    end
+    pcall(function()
+        humanoid.PlatformStand = false
+        humanoid.Sit = false
+        humanoid.AutoRotate = true
+    end)
+    local state = humanoid:GetState()
+    if state == Enum.HumanoidStateType.PlatformStanding or state == Enum.HumanoidStateType.Physics then
+        pcall(function()
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end)
+    end
+    if defaultWalkSpeed then
+        humanoid.WalkSpeed = defaultWalkSpeed
+    end
+    root.AssemblyLinearVelocity = Vector3.zero
+    stopWalking()
+    stopTween()
+end
+
+----- Helpers: remotes / numbers -----
+local function invoke(name, ...)
+    local remote = Network:FindFirstChild(name)
+    if not remote or not remote:IsA("RemoteFunction") then
+        return false
+    end
+    local args = table.pack(...)
+    local ok, result = pcall(function()
+        return remote:InvokeServer(table.unpack(args, 1, args.n))
+    end)
+    if not ok then
+        return false
+    end
+    return result
+end
+
+local function fire(name, ...)
+    local remote = Network:FindFirstChild(name)
+    if not remote or not remote:IsA("RemoteEvent") then
+        return false
+    end
+    local args = table.pack(...)
+    pcall(function()
+        remote:FireServer(table.unpack(args, 1, args.n))
+    end)
+    return true
+end
+
+local function shortNumber(value)
+    local text = tostring(value or ""):gsub(",", "")
+    local numberPart, suffix = text:match("^([%d%.]+)([kKmMbBtT]?)$")
+    if not numberPart then
+        return 0
+    end
+    local number = tonumber(numberPart) or 0
+    suffix = suffix:lower()
+    if suffix == "k" then
+        number *= 1e3
+    elseif suffix == "m" then
+        number *= 1e6
+    elseif suffix == "b" then
+        number *= 1e9
+    elseif suffix == "t" then
+        number *= 1e12
+    end
+    return math.floor(number)
+end
+
+local function shortFormat(value)
+    value = tonumber(value) or 0
+    if value >= 1e12 then
+        return string.format("%.2ft", value / 1e12)
+    elseif value >= 1e9 then
+        return string.format("%.2fb", value / 1e9)
+    elseif value >= 1e6 then
+        return string.format("%.2fm", value / 1e6)
+    elseif value >= 1e3 then
+        return string.format("%.1fk", value / 1e3)
+    end
+    return tostring(math.floor(value))
+end
+
+local function formatTime(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    local secs = seconds % 60
+    if hours > 0 then
+        return string.format("%d:%02d:%02d", hours, minutes, secs)
+    end
+    return string.format("%02d:%02d", minutes, secs)
+end
+
+local function hudLabel(frame)
+    if not frame then
+        return nil
+    end
+    for _, node in ipairs(frame:GetDescendants()) do
+        if node:IsA("TextLabel") then
+            return node.Text
+        end
+    end
+end
+
+local function currencyFrame()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local mainLeft = gui and gui:FindFirstChild("MainLeft")
+    local left = mainLeft and mainLeft:FindFirstChild("Left")
+    return left and left:FindFirstChild("Currency")
+end
+
+local function coins()
+    local currency = currencyFrame()
+    local coinsFrame = currency and currency:FindFirstChild("Coins")
+    local goldCoins = coinsFrame and coinsFrame:FindFirstChild("Gold Coins")
+    return shortNumber(hudLabel(goldCoins))
+end
+
+local function goldBars()
+    local currency = currencyFrame()
+    local coinsFrame = currency and currency:FindFirstChild("Coins")
+    local bars = coinsFrame and coinsFrame:FindFirstChild("Gold Bars")
+    return shortNumber(hudLabel(bars))
+end
+
+local function diamonds()
+    local stats = LocalPlayer:FindFirstChild("leaderstats")
+    local value = stats and stats:FindFirstChild("💎 Diamonds")
+    if value then
+        return value.Value
+    end
+    local currency = currencyFrame()
+    local frame = currency and currency:FindFirstChild("Diamonds")
+    return shortNumber(hudLabel(frame))
+end
+
+local function hudPets()
+    local currency = currencyFrame()
+    local frame = currency and currency:FindFirstChild("FarmingAmount")
+    local text = hudLabel(frame) or ""
+    local used, total = text:match("^(%d+)/(%d+)")
+    return tonumber(used), tonumber(total)
+end
+
+----- Action / goal -----
+local function setAction(text)
+    S.action = text or ""
+    S.actionAt = os.clock()
+end
+
+local function currentGoalText()
+    if S.goal == "Diamonds" then
+        return T("goal_diamonds")
+    elseif S.goal == "Rank" then
+        return T("goal_rank")
+    elseif S.goal == "Event" then
+        return T("goal_event")
+    end
+    return T("goal_coins")
+end
+
+local function currentActionText()
+    if S.action ~= "" and os.clock() - S.actionAt < 8 then
+        return S.action
+    end
+    return T("act_idle")
+end
+
+----- Guards: diamonds / bars -----
+local lastSpendWarn = 0
+local diamondNotifiedAt = 0
+
+local function pushWarning(text)
+    if Log then
+        pcall(function()
+            Log:Push("<Warning>" .. text .. "</Warning>")
+        end)
+    end
+end
+
+local function notify(title, content, kind)
+    pcall(function()
+        Window:Notify({ Title = title, Content = content, Type = kind or "Info", Time = 6 })
+    end)
+end
+
+local function registerDiamondSpend(amount, reason)
+    if amount <= 0 then
+        return
+    end
+    S.sessionSpent += amount
+    if not S.allowDiamonds then
+        S.diamondBreach = true
+        pushWarning(string.format("Списано %d алмазов (%s) при выключенной защите", amount, tostring(reason)))
+        if os.clock() - diamondNotifiedAt > 30 then
+            diamondNotifiedAt = os.clock()
+            notify("PS99 Hub", T("notif_diamond"), "Error")
+        end
+    elseif S.minDiamonds > 0 and diamonds() < S.minDiamonds then
+        pushWarning(string.format("Баланс алмазов ниже минимума (%d)", S.minDiamonds))
+    end
+    if S.maxSpend > 0 and S.sessionSpent > S.maxSpend then
+        pushWarning(string.format("Бюджет алмазов за сессию превышен: %d / %d", S.sessionSpent, S.maxSpend))
+    end
+end
+
+local function canSpendDiamonds(amount, reason)
+    if not S.allowDiamonds then
+        if S.diamondWarn and os.clock() - lastSpendWarn > 8 then
+            lastSpendWarn = os.clock()
+            pushWarning("Трата алмазов заблокирована: " .. T("allow_diamonds") .. " выключено (" .. tostring(reason) .. ")")
+        end
+        return false
+    end
+    local balance = diamonds()
+    if amount > 0 and balance - amount < S.minDiamonds then
+        if S.diamondWarn then
+            pushWarning(string.format("Не хочу опускать алмазы ниже %d (сейчас %d)", S.minDiamonds, balance))
+        end
+        return false
+    end
+    if S.maxSpend > 0 and S.sessionSpent + amount > S.maxSpend then
+        if S.diamondWarn then
+            pushWarning(string.format("Бюджет сессии: %d из %d уже потрачено", S.sessionSpent, S.maxSpend))
+        end
+        return false
+    end
+    return true
+end
+
+local function guardedInvoke(name, ...)
+    local before = diamonds()
+    local result = invoke(name, ...)
+    local after = diamonds()
+    if after < before then
+        registerDiamondSpend(before - after, name)
+    end
+    return result
+end
+
+----- Breakables -----
+local breakablesCache = {}
+local breakablesAt = 0
+
+local function breakableValue(identifier)
+    local text = tostring(identifier):lower()
+    if text:find("huge") or text:find("giant") then
+        return 110
+    end
+    if text:find("vault") then
+        return 100
+    end
+    if text:find("diamond") then
+        return 95
+    end
+    if text:find("safe") then
+        return 90
+    end
+    if text:find("chest") then
+        return 85
+    end
+    if text:find("lucky") then
+        return 80
+    end
+    if text:find("crate") then
+        return 70
+    end
+    if text:find("present") then
+        return 65
+    end
+    if text:find("barrel") then
+        return 40
+    end
+    return 30
+end
+
+local function getBreakables()
+    if os.clock() - breakablesAt < 0.8 then
+        return breakablesCache
+    end
+    breakablesAt = os.clock()
+    local list = {}
+    local container = Things:FindFirstChild("Breakables")
+    if not container then
+        breakablesCache = list
+        return list
+    end
+    for _, model in ipairs(container:GetChildren()) do
+        if model:IsA("Model") then
+            local part = model:FindFirstChildWhichIsA("BasePart")
+            if part then
+                list[#list + 1] = {
+                    model = model,
+                    part = part,
+                    area = model:GetAttribute("AreaID") or "",
+                    zone = model:GetAttribute("ParentID") or "",
+                    id = model:GetAttribute("BreakableID") or "",
+                    class = model:GetAttribute("BreakableClass") or "",
+                }
+            end
+        end
+    end
+    breakablesCache = list
+    return list
+end
+
+local function areaAllowed(area)
+    if area == "VIP" and not S.allowVIP then
+        return false
+    end
+    return true
+end
+
+local function targetScore(entry, rootPosition, mode)
+    local distance = (entry.part.Position - rootPosition).Magnitude
+    if mode == "Diamonds" then
+        if not tostring(entry.id):lower():find("diamond") then
+            return nil
+        end
+        if S.diamondAreas == "Main" and entry.area ~= "Main" then
+            return nil
+        elseif S.diamondAreas == "Easy" and entry.area ~= "Easy" then
+            return nil
+        end
+        return 1e6 - distance
+    elseif mode == "Chests" then
+        local text = tostring(entry.id):lower()
+        if not (text:find("chest") or text:find("safe") or text:find("vault")) then
+            return nil
+        end
+        return 1e6 - distance
+    elseif mode == "Best value" then
+        return breakableValue(entry.id) * 100 - distance
+    end
+    return -distance
+end
+
+local function pickTarget(rootPosition)
+    local best, bestScore
+    for _, entry in ipairs(getBreakables()) do
+        if areaAllowed(entry.area) then
+            local score = targetScore(entry, rootPosition, S.target)
+            if score and (not bestScore or score > bestScore) then
+                best, bestScore = entry, score
+            end
+        end
+    end
+    return best
+end
+
+----- Zones -----
+local zoneListCache = { at = 0, list = {}, byName = {} }
+local zoneMetaCache = { at = 0, byNumber = {} }
+
+local function cleanZoneName(name)
+    return (tostring(name):gsub("^%d+%s*|%s*", ""))
+end
+
+local function zoneList()
+    if os.clock() - zoneListCache.at < 30 and #zoneListCache.list > 0 then
+        return zoneListCache.list
+    end
+    local list, byName = {}, {}
+    local map = Workspace:FindFirstChild("Map")
+    if map then
+        for _, folder in ipairs(map:GetChildren()) do
+            local number = tonumber(tostring(folder.Name):match("^(%d+)"))
+            if number then
+                local persistent = folder:FindFirstChild("PERSISTENT")
+                local teleport = persistent and persistent:FindFirstChild("Teleport")
+                local anchor = teleport and teleport.Position
+                if not anchor then
+                    local parts = folder:FindFirstChild("PARTS", true)
+                    local part = parts and parts:FindFirstChildWhichIsA("BasePart", true)
+                    anchor = part and part.Position
+                end
+                local center
+                local parts = folder:FindFirstChild("PARTS")
+                if parts then
+                    local sum, count = Vector3.zero, 0
+                    for _, object in ipairs(parts:GetDescendants()) do
+                        if object:IsA("BasePart") then
+                            sum += object.Position
+                            count += 1
+                        end
+                    end
+                    if count > 0 then
+                        center = sum / count
+                    end
+                end
+                local entry = {
+                    folder = folder,
+                    number = number,
+                    name = folder.Name,
+                    clean = cleanZoneName(folder.Name),
+                    anchor = anchor,
+                    center = center,
+                }
+                list[#list + 1] = entry
+                byName[folder.Name] = entry
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        return a.number < b.number
+    end)
+    zoneListCache = { at = os.clock(), list = list, byName = byName }
+    return list
+end
+
+local function zoneMeta()
+    if os.clock() - zoneMetaCache.at < 60 and next(zoneMetaCache.byNumber) then
+        return zoneMetaCache.byNumber
+    end
+    local byNumber = {}
+    local worlds = Directory:FindFirstChild("Zones")
+    if worlds then
+        for _, world in ipairs(worlds:GetChildren()) do
+            for _, module in ipairs(world:GetChildren()) do
+                local number = tonumber(tostring(module.Name):match("^(%d+)"))
+                if number and not byNumber[number] then
+                    local ok, data = pcall(require, module)
+                    if ok and type(data) == "table" then
+                        byNumber[number] = {
+                            maxEgg = data.MaximumAvailableEgg,
+                            name = data.ZoneName,
+                        }
+                    end
+                end
+            end
+        end
+    end
+    zoneMetaCache = { at = os.clock(), byNumber = byNumber }
+    return byNumber
+end
+
+local function currentZoneInfo()
+    local _, _, root = getCharacter()
+    if not root then
+        return nil
+    end
+    local best, bestDistance
+    for _, zone in ipairs(zoneList()) do
+        if zone.anchor then
+            local distance = (zone.anchor - root.Position).Magnitude
+            if not bestDistance or distance < bestDistance then
+                best, bestDistance = zone, distance
+            end
+        end
+    end
+    if not best then
+        return nil
+    end
+    return { name = best.name, number = best.number, clean = best.clean }
+end
+
+local function currentWorld()
+    local zone = currentZoneInfo()
+    if not zone then
+        return "World 1"
+    end
+    local worlds = Directory:FindFirstChild("Zones")
+    if not worlds then
+        return "World 1"
+    end
+    for _, world in ipairs(worlds:GetChildren()) do
+        for _, module in ipairs(world:GetChildren()) do
+            local number = tonumber(tostring(module.Name):match("^(%d+)"))
+            if number == zone.number then
+                return world.Name
+            end
+        end
+    end
+    return "World 1"
+end
+
+local readCapsules -- defined in the Eggs section below
+
+local function maxUnlockedEggTier()
+    local maxTier = S.unlockedEggTier or 0
+    for tier, capsule in pairs(readCapsules()) do
+        if not capsule.locked and capsule.price and tier > maxTier then
+            maxTier = tier
+        end
+    end
+    S.unlockedEggTier = maxTier
+    return maxTier
+end
+
+local function bestZone()
+    local list = zoneList()
+    if S.farmZone ~= "Auto" then
+        local selected = zoneListCache.byName[S.farmZone]
+        if selected then
+            return selected
+        end
+    end
+    if S.zoneLock and os.clock() - S.zoneLock.at < 600 then
+        local locked = zoneListCache.byName[S.zoneLock.name]
+        if locked then
+            return locked
+        end
+    end
+    local meta = zoneMeta()
+    local limit = maxUnlockedEggTier()
+    if limit > 0 then
+        for index = #list, 1, -1 do
+            local zone = list[index]
+            local info = meta[zone.number]
+            local slow = S.zoneSlow[zone.number]
+            if info and info.maxEgg and info.maxEgg <= limit and zone.anchor
+                and not (slow and os.clock() - slow < 600) then
+                return zone
+            end
+        end
+    end
+    -- No data yet: use the highest zone with loaded breakables.
+    local loaded = {}
+    for _, entry in ipairs(getBreakables()) do
+        loaded[entry.zone] = true
+    end
+    local best
+    for _, zone in ipairs(list) do
+        if loaded[zone.clean] then
+            best = zone
+        end
+    end
+    return best or list[1]
+end
+
+local function snapshotZoneBreakables(cleanName)
+    local set, count = {}, 0
+    for _, entry in ipairs(getBreakables()) do
+        if entry.zone == cleanName then
+            set[entry.model.Name] = true
+            count += 1
+        end
+    end
+    return set, count
+end
+
+local function countZoneDestroyed(set, cleanName)
+    local current = {}
+    for _, entry in ipairs(getBreakables()) do
+        if entry.zone == cleanName then
+            current[entry.model.Name] = true
+        end
+    end
+    local gone = 0
+    for uid in pairs(set) do
+        if not current[uid] then
+            gone += 1
+        end
+    end
+    return gone
+end
+
+-- "Best zone" = the highest zone whose egg tier is already unlocked, not the
+-- closest one. Every Map zone keeps a PERSISTENT.Teleport anchor, so the whole
+-- world can be parsed without waiting for streaming. If the pets cannot break
+-- the zone in 12 seconds, the zone is marked "too tough" and the hub steps down.
+local function bestLocation()
+    local _, _, root = getCharacter()
+    if not root then
+        return nil
+    end
+    local zone = bestZone()
+    if not zone then
+        return nil
+    end
+    local order
+    if S.area == "Main" then
+        order = { "Main" }
+    elseif S.area == "Easy" then
+        order = { "Easy" }
+    elseif S.area == "VIP" then
+        order = { "VIP" }
+    else
+        order = { "Main", "Easy" }
+    end
+    if (S.area == "Auto" or S.area == "VIP") and S.allowVIP then
+        order[#order + 1] = "VIP"
+    end
+    for _, area in ipairs(order) do
+        local nearest, nearestDistance
+        for _, entry in ipairs(getBreakables()) do
+            if entry.zone == zone.clean and entry.area == area then
+                local distance = (entry.part.Position - root.Position).Magnitude
+                if not nearestDistance or distance < nearestDistance then
+                    nearest, nearestDistance = entry, distance
+                end
+            end
+        end
+        if nearest then
+            return {
+                zone = zone,
+                zoneName = zone.name,
+                name = zone.clean .. " · " .. area,
+                area = area,
+                anchor = nearest.part.Position,
+                distance = nearestDistance,
+                target = nearest,
+            }
+        end
+    end
+    local fallback = zone.center or zone.anchor
+    if fallback then
+        return {
+            zone = zone,
+            zoneName = zone.name,
+            name = zone.clean,
+            area = "Main",
+            anchor = fallback,
+            pending = true,
+        }
+    end
+end
+
+local function gateOf(zone)
+    local interact = zone.folder:FindFirstChild("INTERACT")
+    local gate = interact and interact:FindFirstChild("Gate", true)
+    if gate and gate:IsA("BasePart") then
+        return gate
+    end
+end
+
+local function nextBuyGate()
+    for _, zone in ipairs(zoneList()) do
+        local gate = gateOf(zone)
+        local hud = gate and gate:FindFirstChild("GateHUD")
+        if hud and hud.Enabled then
+            return zone, gate, hud
+        end
+    end
+end
+
+local function buyNextLocation()
+    local zone, gate, hud = nextBuyGate()
+    if not zone then
+        return false, "no gate"
+    end
+    local character = getCharacter()
+    if not character then
+        return false, "no character"
+    end
+    local _, _, root = getCharacter()
+    local baseY = gate.Position.Y - gate.Size.Y / 2 + 4
+    root.CFrame = CFrame.new(Vector3.new(gate.Position.X, baseY, gate.Position.Z + 12))
+    task.wait(0.8)
+    local buy = hud:FindFirstChild("Buy", true)
+    if not buy then
+        return false, "no buy button"
+    end
+    local ok, connections = pcall(function()
+        return getconnections(buy.Activated)
+    end)
+    if not ok or not connections or #connections == 0 then
+        return false, "button not wired"
+    end
+    for _, connection in ipairs(connections) do
+        task.spawn(function()
+            pcall(connection.Function)
+        end)
+    end
+    task.wait(1.2)
+    if hud.Enabled == false then
+        return true, zone.name
+    end
+    return false, "need more currency"
+end
+
+----- Eggs -----
+local eggCache = { names = {}, at = 0, world = "World 1" }
+local capsuleCache = { list = {}, at = 0, station = nil }
+
+local function eggNames()
+    if os.clock() - eggCache.at < 10 and next(eggCache.names) then
+        return eggCache.names
+    end
+    local names = {}
+    local world = currentWorld()
+    local rootFolder = Directory:FindFirstChild("Eggs")
+    local zoneEggs = rootFolder and rootFolder:FindFirstChild("Zone Eggs")
+    local worldFolder = zoneEggs and zoneEggs:FindFirstChild(world)
+    if worldFolder then
+        for _, update in ipairs(worldFolder:GetChildren()) do
+            for _, egg in ipairs(update:GetChildren()) do
+                local number = tonumber(tostring(egg.Name):match("^(%d+)"))
+                if number then
+                    names[number] = egg.Name
+                end
+            end
+        end
+    end
+    eggCache = { names = names, at = os.clock(), world = world }
+    return names
+end
+
+readCapsules = function()
+    if os.clock() - capsuleCache.at < 2.5 and next(capsuleCache.list) then
+        return capsuleCache.list, capsuleCache.station
+    end
+    local list = {}
+    local station
+    local model = Things:FindFirstChild("Eggs")
+    local main = model and model:FindFirstChild("Main")
+    local count, sum = 0, Vector3.zero
+    if main then
+        for _, capsule in ipairs(main:GetChildren()) do
+            local tier = tonumber(tostring(capsule.Name):match("^(%d+)"))
+            if tier then
+                local part = capsule:FindFirstChildWhichIsA("BasePart", true)
+                local hud = capsule:FindFirstChild("PriceHUD", true)
+                local locked = false
+                local prices = {}
+                if hud then
+                    local lockGui = hud:FindFirstChild("PriceHUDLocked", true)
+                    if lockGui then
+                        for _, node in ipairs(lockGui:GetDescendants()) do
+                            if node:IsA("TextLabel") and node.Text == "Locked" and node.Visible then
+                                locked = true
+                            end
+                        end
+                    end
+                    local container = hud:FindFirstChild("PriceHUD", true) or hud
+                    for _, frame in ipairs(container:GetChildren()) do
+                        if frame.Name == "Gold Coins" or frame.Name == "Gold Bars" or frame.Name == "Diamonds" then
+                            local amount = frame:FindFirstChild("Amount")
+                            if amount then
+                                local text = amount:IsA("TextLabel") and amount.Text or hudLabel(amount)
+                                prices[frame.Name] = shortNumber(text)
+                            end
+                        end
+                    end
+                end
+                local currency, price
+                if prices["Gold Coins"] and prices["Gold Coins"] > 0 then
+                    currency, price = "Gold Coins", prices["Gold Coins"]
+                elseif prices["Gold Bars"] and prices["Gold Bars"] > 0 then
+                    currency, price = "Gold Bars", prices["Gold Bars"]
+                elseif prices["Diamonds"] and prices["Diamonds"] > 0 then
+                    currency, price = "Diamonds", prices["Diamonds"]
+                end
+                if part then
+                    count += 1
+                    sum += part.Position
+                end
+                list[tier] = {
+                    tier = tier,
+                    pos = part and part.Position,
+                    locked = locked,
+                    prices = prices,
+                    price = price,
+                    currency = currency,
+                }
+            end
+        end
+    end
+    if count > 0 then
+        station = sum / count
+    else
+        local zoneEggs = Things:FindFirstChild("ZoneEggs")
+        local mainZone = zoneEggs and zoneEggs:FindFirstChild("Main")
+        local part = mainZone and mainZone:FindFirstChildWhichIsA("BasePart", true)
+        station = part and part.Position
+    end
+    capsuleCache = { list = list, at = os.clock(), station = station }
+    return list, station
+end
+
+local function eggAtStation()
+    local _, station = readCapsules()
+    local _, _, root = getCharacter()
+    if not station or not root then
+        return false
+    end
+    return (root.Position - station).Magnitude < 55
+end
+
+local function capsulePayment(capsule)
+    local prices = capsule.prices or {}
+    if prices["Gold Coins"] and prices["Gold Coins"] > 0 and prices["Gold Coins"] <= coins() then
+        return "Gold Coins", prices["Gold Coins"]
+    end
+    if prices["Gold Bars"] and prices["Gold Bars"] > 0 and S.allowBars and prices["Gold Bars"] <= goldBars() then
+        return "Gold Bars", prices["Gold Bars"]
+    end
+    if prices["Diamonds"] and prices["Diamonds"] > 0 and S.allowDiamonds and prices["Diamonds"] <= diamonds() then
+        return "Diamonds", prices["Diamonds"]
+    end
+    return nil
+end
+
+local function bestEgg()
+    local capsules = readCapsules()
+    if not next(capsules) then
+        return nil
+    end
+    local best
+    for tier, capsule in pairs(capsules) do
+        if not capsule.locked and capsulePayment(capsule) then
+            if not best or tier > best.tier then
+                best = capsule
+            end
+        end
+    end
+    return best
+end
+
+local function chosenEgg()
+    if S.eggChoice ~= "Best" then
+        local tier = tonumber(tostring(S.eggChoice):match("^(%d+)"))
+        if tier then
+            local capsules = readCapsules()
+            local capsule = capsules[tier]
+            if capsule then
+                return capsule
+            end
+            return { tier = tier, locked = false }
+        end
+    end
+    return bestEgg()
+end
+
+local function eggDisplayName(tier)
+    local names = eggNames()
+    local name = names[tier]
+    if not name then
+        return tostring(tier)
+    end
+    return tostring(tier) .. " · " .. tostring(name):gsub("^%d+%s*|%s*", "")
+end
+
+local function hatchOne(capsule)
+    if not capsule then
+        return false, "no egg"
+    end
+    local names = eggNames()
+    local name = names[capsule.tier]
+    if not name then
+        return false, "no name"
+    end
+    local payment, amount = capsulePayment(capsule)
+    if not payment then
+        local prices = capsule.prices or {}
+        if prices["Gold Bars"] and not S.allowBars then
+            return false, "bars locked"
+        end
+        if prices["Diamonds"] and not S.allowDiamonds then
+            return false, "diamond guard"
+        end
+        if prices["Diamonds"] and not canSpendDiamonds(prices["Diamonds"], "egg") then
+            return false, "diamond guard"
+        end
+        return false, "no coins"
+    end
+    if payment == "Diamonds" and not canSpendDiamonds(amount, "egg") then
+        return false, "diamond guard"
+    end
+    S.hatchNow = { egg = name, state = "trying", at = os.clock() }
+    local ok = guardedInvoke("Eggs_RequestPurchase", name, 1)
+    if ok then
+        S.hatchNow = { egg = name, state = "ok", at = os.clock() }
+        S.sessionHatched += 1
+        S.lastTier = capsule.tier
+    else
+        S.hatchNow = { egg = name, state = "refused", at = os.clock() }
+    end
+    return ok, name
+end
+
+----- Quests / rank -----
+local QUEST_VERBS = {
+    "Hatch", "Break", "Use", "Earn", "Collect", "Open", "Fish", "Dig",
+    "Deal", "Spin", "Pop", "Claim", "Catch", "Defeat", "Upgrade",
+}
+local QUEST_BLOCKED = {
+    "Stars", "Reward", "Claim", "Locked", "Level", "RANKUP", "Unlocked",
+    "Complete", "Points", "Strength", "Re-Roll", "Rank ",
+}
+
+local function textHas(text, words)
+    for _, word in ipairs(words) do
+        if text:find(word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function parseQuests()
+    local quests = {}
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local rankGui = gui and gui:FindFirstChild("Rank")
+    if not rankGui then
+        return quests
+    end
+    local seen = {}
+    for _, node in ipairs(rankGui:GetDescendants()) do
+        if node:IsA("TextLabel") then
+            local text = node.Text
+            if #text >= 8 and #text <= 70 and not seen[text] then
+                if text:match("^%u") and textHas(text, QUEST_VERBS) and not textHas(text, QUEST_BLOCKED) then
+                    seen[text] = true
+                    quests[#quests + 1] = text
+                end
+            end
+        end
+    end
+    return quests
+end
+
+local function rankInfo()
+    local info = { name = "?", number = "?", rewards = nil, ready = false }
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local rankGui = gui and gui:FindFirstChild("Rank")
+    if not rankGui then
+        return info
+    end
+    for _, node in ipairs(rankGui:GetDescendants()) do
+        if node:IsA("TextLabel") then
+            local text = node.Text
+            if node.Name == "Rank" then
+                info.name = text
+            elseif node.Name == "RankNum" then
+                local number = text:match("Rank%s*(%d+)")
+                if number then
+                    info.number = number
+                end
+            elseif node.Name == "ProgressText" then
+                local rewards = text:match("(%d+)%s*Rewards?%s*Left")
+                if rewards then
+                    info.rewards = tonumber(rewards)
+                end
+            end
+            if text:find("RANKUP READY", 1, true) then
+                info.ready = true
+            end
+        end
+    end
+    return info
+end
+
+local function questAction()
+    local quests = parseQuests()
+    if #quests == 0 then
+        return nil
+    end
+    return quests[1]
+end
+
+----- Performance -----
+local perfData = { texture = {}, fx = {}, gui = {}, players = {} }
+
+local function setTextures(enabled)
+    if enabled then
+        if #perfData.texture == 0 then
+            for _, object in ipairs(Workspace:GetDescendants()) do
+                if object:IsA("Decal") or object:IsA("Texture") then
+                    perfData.texture[#perfData.texture + 1] = { object = object, value = object.Transparency }
+                    object.Transparency = 1
+                end
+            end
+        end
+    else
+        for _, entry in ipairs(perfData.texture) do
+            if entry.object.Parent then
+                entry.object.Transparency = entry.value
+            end
+        end
+        perfData.texture = {}
+    end
+end
+
+local function worldFxContainers()
+    local list = {}
+    for _, name in ipairs({ "VFX", "Effects", "RandomEvents" }) do
+        local container = Things:FindFirstChild(name)
+        if container then
+            list[#list + 1] = container
+        end
+    end
+    return list
+end
+
+local function setWorldFX(enabled)
+    if enabled then
+        if #perfData.fx == 0 then
+            for _, container in ipairs(worldFxContainers()) do
+                for _, object in ipairs(container:GetDescendants()) do
+                    if object:IsA("BasePart") then
+                        perfData.fx[#perfData.fx + 1] = { object = object, kind = "part", value = object.LocalTransparencyModifier }
+                        object.LocalTransparencyModifier = 1
+                    elseif object:IsA("ParticleEmitter") or object:IsA("Beam") or object:IsA("Trail") then
+                        perfData.fx[#perfData.fx + 1] = { object = object, kind = "fx", value = object.Enabled }
+                        object.Enabled = false
+                    end
+                end
+            end
+        end
+    else
+        for _, entry in ipairs(perfData.fx) do
+            if entry.object.Parent then
+                if entry.kind == "part" then
+                    entry.object.LocalTransparencyModifier = entry.value
+                else
+                    entry.object.Enabled = entry.value
+                end
+            end
+        end
+        perfData.fx = {}
+    end
+end
+
+local GUI_FX_NAMES = { "GUIFX Holder", "_FullscreenTestGui", "_DeviceTestGui", "ArrowHolder", "RandomDrops" }
+
+local function setGuiFX(enabled)
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then
+        return
+    end
+    if enabled then
+        if #perfData.gui == 0 then
+            for _, name in ipairs(GUI_FX_NAMES) do
+                local object = gui:FindFirstChild(name)
+                if object then
+                    perfData.gui[#perfData.gui + 1] = { object = object, value = object.Enabled }
+                    object.Enabled = false
+                end
+            end
+        end
+    else
+        for _, entry in ipairs(perfData.gui) do
+            if entry.object.Parent then
+                entry.object.Enabled = entry.value
+            end
+        end
+        perfData.gui = {}
+    end
+end
+
+local function setPlayers(enabled)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            for _, object in ipairs(player.Character:GetDescendants()) do
+                if object:IsA("BasePart") then
+                    object.LocalTransparencyModifier = enabled and 1 or 0
+                end
+            end
+        end
+    end
+end
+
+local function setPetsVisibility()
+    local _, _, root = getCharacter()
+    local container = Things:FindFirstChild("Pets")
+    if not container or not root then
+        return
+    end
+    for _, pet in ipairs(container:GetChildren()) do
+        if pet:IsA("Model") then
+            local part = pet:FindFirstChildWhichIsA("BasePart")
+            if part then
+                local near = (part.Position - root.Position).Magnitude < 60
+                local hide = (near and S.ownPets) or (not near and S.otherPets)
+                part.LocalTransparencyModifier = hide and 1 or 0
+            end
+        end
+    end
+end
+
+local function applyFps()
+    if type(setfpscap) == "function" then
+        pcall(setfpscap, (S.fpsLimit and S.fpsValue) or 240)
+    end
+end
+
+local function restoreGraphics()
+    S.perf = false
+    S.tex = false
+    S.worldFX = false
+    S.guiFX = false
+    S.ownPets = false
+    S.otherPets = false
+    S.players = false
+    S.fpsLimit = false
+    setTextures(false)
+    setWorldFX(false)
+    setGuiFX(false)
+    setPlayers(false)
+    setPetsVisibility()
+    applyFps()
+end
+
+local function applyPerformanceState()
+    if S.perf then
+        S.tex, S.worldFX, S.guiFX = true, true, true
+        S.ownPets, S.otherPets, S.players = true, true, true
+        S.fpsLimit = true
+        S.fpsValue = 60
+    else
+        S.tex, S.worldFX, S.guiFX = false, false, false
+        S.ownPets, S.otherPets, S.players = false, false, false
+        S.fpsLimit = false
+    end
+    setTextures(S.tex)
+    setWorldFX(S.worldFX)
+    setGuiFX(S.guiFX)
+    setPetsVisibility()
+    setPlayers(S.players)
+    applyFps()
+end
+
+----- Flags / goals / presets -----
+local function syncFlag(flag, value)
+    local element = Airflow.Flags[flag]
+    if element and element.Set then
+        pcall(function()
+            element:Set(value, true)
+        end)
+    end
+end
+
+local function syncFlags(map)
+    for flag, value in pairs(map) do
+        syncFlag(flag, value)
+    end
+end
+
+local function refreshSession()
+    S.sessionStart = os.clock()
+    S.startCoins = coins()
+    S.startDiamonds = diamonds()
+    S.sessionHatched = 0
+    S.sessionSpent = 0
+    S.diamondBreach = false
+end
+
+local function sessionStats()
+    local elapsed = math.max(0, os.clock() - S.sessionStart)
+    local earned = math.max(0, coins() - S.startCoins)
+    local perHour = 0
+    if elapsed > 15 then
+        perHour = earned / (elapsed / 3600)
+    end
+    return {
+        earned = earned,
+        perHour = perHour,
+        hatched = S.sessionHatched,
+        spent = S.sessionSpent,
+        elapsed = elapsed,
+    }
+end
+
+local function startEverything()
+    S.farm = true
+    S.orbs = true
+    S.claims = true
+    S.claimRank = true
+    S.claimLogin = true
+    S.claimMail = true
+    S.rankUp = true
+    S.equipBest = true
+    S.antiAfk = true
+    syncFlags({
+        FarmEnabled = true,
+        FarmOrbs = true,
+        ClaimRank = true,
+        ClaimLogin = true,
+        ClaimMail = true,
+        AutoRankUp = true,
+        EquipBest = true,
+        AntiAFK = true,
+    })
+    setAction(T("act_farm"))
+    notify("PS99 Hub", T("notif_start"), "Success")
+end
+
+local function stopEverything()
+    S.farm = false
+    S.orbs = false
+    S.hatch = false
+    S.claims = false
+    S.rankUp = false
+    S.equipBest = false
+    S.balloons = false
+    S.relics = false
+    syncFlags({
+        FarmEnabled = false,
+        FarmOrbs = false,
+        AutoHatch = false,
+        ClaimRank = false,
+        ClaimLogin = false,
+        ClaimMail = false,
+        AutoRankUp = false,
+        EquipBest = false,
+        AutoBalloons = false,
+        AutoRelics = false,
+    })
+    restoreMovement()
+    setAction("")
+    notify("PS99 Hub", T("notif_stop"), "Info")
+end
+
+local function applyGoal(goal)
+    S.goal = goal
+    if goal == "Diamonds" then
+        S.farm = true
+        S.farmMode = "Active"
+        S.target = "Diamonds"
+        S.diamondAreas = "All"
+        S.area = "Auto"
+        S.orbs = true
+        S.hatch = false
+        S.rankQuests = false
+        S.claims = true
+        S.perf = true
+        syncFlags({
+            FarmEnabled = true,
+            FarmMode = T("mode_active"),
+            FarmTarget = T("target_diamonds"),
+            DiamondAreas = T("d_all"),
+            FarmArea = T("area_auto"),
+            FarmOrbs = true,
+            AutoHatch = false,
+            PerfMode = true,
+            DisableTextures = true,
+            HideOwnPets = true,
+            HideOtherPets = true,
+            HidePlayers = true,
+            DisableWorldFX = true,
+            DisableGUIFX = true,
+            FPSLimit = true,
+            ClaimRank = true,
+        })
+        applyPerformanceState()
+    elseif goal == "Rank" then
+        S.farm = true
+        S.farmMode = "AFK"
+        S.target = "Nearest"
+        S.area = "Auto"
+        S.orbs = true
+        S.hatch = true
+        S.hatchAmount = 4
+        S.hatchEvery = 45
+        S.rankUp = true
+        S.rankQuests = true
+        S.claims = true
+        S.claimRank = true
+        S.claimLogin = true
+        S.claimMail = true
+        S.questItems = true
+        S.equipBest = true
+        S.antiAfk = true
+        syncFlags({
+            FarmEnabled = true,
+            FarmMode = T("mode_afk"),
+            FarmTarget = T("target_nearest"),
+            FarmArea = T("area_auto"),
+            FarmOrbs = true,
+            AutoHatch = true,
+            HatchAmount = 4,
+            HatchEvery = 45,
+            AutoRankUp = true,
+            AutoRankQuests = true,
+            ClaimRank = true,
+            ClaimLogin = true,
+            ClaimMail = true,
+            AutoQuestItems = true,
+            EquipBest = true,
+            AntiAFK = true,
+        })
+    elseif goal == "Event" then
+        S.farm = true
+        S.farmMode = "AFK"
+        S.target = "Best value"
+        S.area = "Auto"
+        S.orbs = true
+        S.hatch = true
+        S.hatchAmount = 4
+        S.hatchEvery = 60
+        S.claims = true
+        S.rankUp = true
+        S.perf = true
+        syncFlags({
+            FarmEnabled = true,
+            FarmMode = T("mode_afk"),
+            FarmTarget = T("target_best"),
+            FarmArea = T("area_auto"),
+            FarmOrbs = true,
+            AutoHatch = true,
+            HatchAmount = 4,
+            HatchEvery = 60,
+            ClaimRank = true,
+            AutoRankUp = true,
+            PerfMode = true,
+            DisableTextures = true,
+            HideOwnPets = true,
+            HideOtherPets = true,
+            HidePlayers = true,
+            DisableWorldFX = true,
+            DisableGUIFX = true,
+            FPSLimit = true,
+        })
+        applyPerformanceState()
+    else
+        S.farm = true
+        S.farmMode = "AFK"
+        S.target = "Nearest"
+        S.area = "Auto"
+        S.orbs = true
+        S.hatch = false
+        S.rankQuests = false
+        S.claims = true
+        S.claimRank = true
+        syncFlags({
+            FarmEnabled = true,
+            FarmMode = T("mode_afk"),
+            FarmTarget = T("target_nearest"),
+            FarmArea = T("area_auto"),
+            FarmOrbs = true,
+            AutoHatch = false,
+            AutoRankQuests = false,
+            ClaimRank = true,
+        })
+    end
+    setAction(T("act_farm"))
+    notify("PS99 Hub", T("notif_goal") .. ": " .. currentGoalText(), "Success")
+end
+
+local function applyPreset(name)
+    if name == "AFK" then
+        applyGoal("Diamonds")
+    elseif name == "Rank" then
+        applyGoal("Rank")
+    else
+        applyGoal("Event")
+    end
+    notify("PS99 Hub", T("notif_preset") .. ": " .. name, "Success")
+end
+
+----- Hatch trip -----
+local function hatchTrip(manual)
+    if S.hatchBusy then
+        return false, "busy"
+    end
+    S.hatchBusy = true
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local _, _, root = getCharacter()
+            if not root then
+                return
+            end
+            local returnPosition = (S.farm and S.farmAnchor) or root.Position
+            local capsule = chosenEgg()
+            local targetPosition = capsule and capsule.pos
+            if not targetPosition then
+                local _, station = readCapsules()
+                targetPosition = station
+            end
+            if not targetPosition then
+                -- The egg stand may be streamed out; its physical model still has a part.
+                local eggModel = Things:FindFirstChild("Eggs")
+                local main = eggModel and eggModel:FindFirstChild("Main")
+                local part = main and main:FindFirstChildWhichIsA("BasePart", true)
+                targetPosition = part and part.Position
+            end
+            if not targetPosition then
+                setAction(T("act_egg_travel_fail"))
+                return
+            end
+            local _, _, liveRoot = getCharacter()
+            if not liveRoot then
+                return
+            end
+            if (liveRoot.Position - targetPosition).Magnitude > 30 then
+                setAction(T("act_hatch_go"))
+                teleport(targetPosition)
+                task.wait(1.6)
+            end
+            local _, _, afterRoot = getCharacter()
+            if not afterRoot or (afterRoot.Position - targetPosition).Magnitude > 90 then
+                setAction(T("act_egg_travel_fail"))
+                return
+            end
+            capsuleCache.at = 0
+            capsule = chosenEgg()
+            if not capsule then
+                setAction(T("act_no_eggs"))
+                return
+            end
+
+            local amount = math.clamp(tonumber(S.hatchAmount) or 4, 1, 20)
+            local successes = 0
+            for index = 1, amount do
+                if getgenv().__PS99Gen ~= GENERATION then
+                    break
+                end
+                if playerIsMoving() then
+                    setAction(T("act_pause"))
+                    break
+                end
+                local egg = chosenEgg()
+                if not egg then
+                    setAction(T("act_no_eggs"))
+                    break
+                end
+                setAction(string.format("%s: %s (%d/%d)", T("act_hatch"), eggDisplayName(egg.tier), index, amount))
+                local success, info = hatchOne(egg)
+                if success then
+                    successes += 1
+                elseif info == "bars locked" then
+                    pushWarning(T("notif_no_bars"))
+                    break
+                elseif info == "diamond guard" then
+                    break
+                else
+                    setAction(T("act_refused"))
+                    pushWarning("Яйцо не открылось: проверь слоты питомцев или подожди кулдаун")
+                    task.wait(5)
+                    break
+                end
+                task.wait(2.2)
+            end
+
+            if S.farm and returnPosition then
+                setAction(T("act_hatch_back"))
+                teleport(returnPosition)
+                task.wait(0.8)
+            end
+            if successes > 0 then
+                setAction(string.format("%s: %d", T("notif_hatch_done"), successes))
+            end
+        end)
+        if not ok then
+            warn("[PS99 Hub] hatch trip: " .. tostring(err))
+        end
+        S.hatchBusy = false
+    end)
+    return true
+end
+
+----- Window / UI -----
+local fpsNow = 60
+Window = Airflow:CreateWindow({
+    Name = "PS99 Hub",
+    LoadingSubtitle = "v3.1 · гибрид",
+    ToggleUIKeybind = "RightControl",
+    Size = UDim2.fromOffset(840, 580),
+    MinSize = Vector2.new(660, 480),
+    Backdrop = { Weather = "Fireflies", Tint = 0.4 },
+    Theme = THEME,
+    ConfigurationSaving = { Enabled = true, FolderName = "PS99Hub" },
+    Home = false,
+    Search = true,
+    Profile = true,
+    Density = "Compact",
+})
+
+local FarmTab = Window:CreateTab({ Name = T("tab_farm"), Icon = "pickaxe" })
+
+-- Верхняя полоса на всю ширину: цель, действие, кнопки и выбор цели.
+FarmTab:CreateStatus({
+    Name = T("goal"),
+    Style = "Row",
+    Pin = true,
+    UpdateRate = 0.3,
+    Update = function()
+        return "<Accent>" .. currentGoalText() .. "</Accent>"
+    end,
+})
+FarmTab:CreateStatus({
+    Name = T("action"),
+    Style = "Row",
+    Pin = true,
+    UpdateRate = 0.3,
+    Update = function()
+        return currentActionText()
+    end,
+})
+FarmTab:CreateButtonRow({
+    {
+        Name = T("start"),
+        Style = "Primary",
+        Callback = startEverything,
+    },
+    {
+        Name = T("stop"),
+        Style = "Danger",
+        Callback = stopEverything,
+    },
+    {
+        Name = T("unstuck"),
+        Callback = function()
+            restoreMovement()
+            notify("PS99 Hub", T("notif_unstuck"), "Success")
+        end,
+    },
+})
+FarmTab:CreateDropdown({
+    Name = T("goal_pick"),
+    Options = { T("goal_coins"), T("goal_diamonds"), T("goal_rank"), T("goal_event") },
+    CurrentOption = T("goal_coins"),
+    Callback = function(value)
+        if value == T("goal_diamonds") then
+            applyGoal("Diamonds")
+        elseif value == T("goal_rank") then
+            applyGoal("Rank")
+        elseif value == T("goal_event") then
+            applyGoal("Event")
+        else
+            applyGoal("Coins")
+        end
+    end,
+})
+
+local FarmBox = FarmTab:CreateGroupbox({ Name = T("auto_farm"), Icon = "pickaxe", Side = "Left" })
+local SessionBox = FarmTab:CreateGroupbox({ Name = T("session"), Icon = "timer", Side = "Right" })
+local AdvancedBox = FarmTab:CreateGroupbox({ Name = T("advanced"), Icon = "sliders-horizontal", Side = "Left", Collapsed = true })
+local LogBox = FarmTab:CreateGroupbox({ Name = "Лог", Icon = "scroll-text", Side = "Right" })
+
+FarmBox:CreateToggle({
+    Name = T("auto_farm"),
+    Desc = T("auto_farm_desc"),
+    Flag = "FarmEnabled",
+    CurrentValue = false,
+    Callback = function(value)
+        S.farm = value
+        if value then
+            S.farmAnchor = nil
+        else
+            restoreMovement()
+        end
+    end,
+})
+
+local MODE_OPTIONS = { T("mode_afk"), T("mode_active") }
+FarmBox:CreateDropdown({
+    Name = T("mode"),
+    Options = MODE_OPTIONS,
+    CurrentOption = T("mode_afk"),
+    Flag = "FarmMode",
+    Callback = function(value)
+        S.farmMode = (value == T("mode_active")) and "Active" or "AFK"
+    end,
+})
+
+local ZONE_OPTIONS = { T("zone_auto") }
+for _, zone in ipairs(zoneList()) do
+    ZONE_OPTIONS[#ZONE_OPTIONS + 1] = zone.name
+end
+FarmBox:CreateDropdown({
+    Name = T("zone_pick"),
+    Desc = "Парсит все 99 зон и берёт самую высокую открытую",
+    Options = ZONE_OPTIONS,
+    CurrentOption = T("zone_auto"),
+    Flag = "FarmZone",
+    Callback = function(value)
+        S.farmZone = (value == T("zone_auto")) and "Auto" or value
+        S.zoneLock = nil
+        S.zoneCheck = nil
+    end,
+})
+
+local TARGET_OPTIONS = { T("target_nearest"), T("target_best"), T("target_diamonds"), T("target_chests") }
+FarmBox:CreateDropdown({
+    Name = T("target"),
+    Options = TARGET_OPTIONS,
+    CurrentOption = T("target_nearest"),
+    Flag = "FarmTarget",
+    Callback = function(value)
+        if value == T("target_best") then
+            S.target = "Best value"
+        elseif value == T("target_diamonds") then
+            S.target = "Diamonds"
+        elseif value == T("target_chests") then
+            S.target = "Chests"
+        else
+            S.target = "Nearest"
+        end
+    end,
+})
+
+local AREA_OPTIONS = { T("area_auto"), T("area_main"), T("area_easy"), T("area_vip") }
+FarmBox:CreateDropdown({
+    Name = T("area"),
+    Options = AREA_OPTIONS,
+    CurrentOption = T("area_auto"),
+    Flag = "FarmArea",
+    Callback = function(value)
+        if value == T("area_main") then
+            S.area = "Main"
+        elseif value == T("area_easy") then
+            S.area = "Easy"
+        elseif value == T("area_vip") then
+            S.area = "VIP"
+            if not S.allowVIP then
+                pushWarning("VIP выбран, но «Разрешить VIP» выключено")
+            end
+        else
+            S.area = "Auto"
+        end
+    end,
+})
+
+local DIAMOND_AREA_OPTIONS = { T("d_all"), T("d_current"), T("d_main"), T("d_easy") }
+FarmBox:CreateDropdown({
+    Name = T("diamond_areas"),
+    Options = DIAMOND_AREA_OPTIONS,
+    CurrentOption = T("d_all"),
+    Flag = "DiamondAreas",
+    Callback = function(value)
+        if value == T("d_current") then
+            S.diamondAreas = "Current"
+        elseif value == T("d_main") then
+            S.diamondAreas = "Main"
+        elseif value == T("d_easy") then
+            S.diamondAreas = "Easy"
+        else
+            S.diamondAreas = "All"
+        end
+    end,
+})
+
+FarmBox:CreateToggle({
+    Name = T("orbs"),
+    Flag = "FarmOrbs",
+    CurrentValue = false,
+    Callback = function(value)
+        S.orbs = value
+    end,
+})
+FarmBox:CreateToggle({
+    Name = T("respect"),
+    Desc = T("respect_desc"),
+    Flag = "RespectInput",
+    CurrentValue = true,
+    Callback = function(value)
+        S.respect = value
+    end,
+})
+FarmBox:CreateToggle({
+    Name = T("vip"),
+    Desc = T("vip_desc"),
+    Flag = "AllowVIP",
+    CurrentValue = false,
+    Callback = function(value)
+        S.allowVIP = value
+        if value then
+            pushWarning("VIP включён: убедись, что зона куплена")
+        end
+    end,
+})
+FarmBox:CreateToggle({
+    Name = T("auto_tap"),
+    Desc = T("auto_tap_desc"),
+    Flag = "AutoTap",
+    CurrentValue = true,
+    Callback = function(value)
+        S.autoTap = value
+    end,
+})
+FarmBox:CreateSlider({
+    Name = T("tap_interval"),
+    Range = { 50, 500 },
+    Increment = 10,
+    CurrentValue = 200,
+    Suffix = " ms",
+    Flag = "TapInterval",
+    Callback = function(value)
+        S.tapInterval = value / 1000
+    end,
+})
+
+-- Баланс и сессия — в правой колонке.
+SessionBox:CreateStatus({
+    Name = T("coins"),
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        return shortFormat(coins())
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("diamonds"),
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        return string.format("<Accent>%d</Accent>", diamonds())
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("gold_bars"),
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        return shortFormat(goldBars())
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("pets"),
+    Style = "Row",
+    UpdateRate = 1,
+    Update = function()
+        local used, total = hudPets()
+        if used and total then
+            return used .. "/" .. total
+        end
+        return "?"
+    end,
+})
+SessionBox:CreateDivider()
+SessionBox:CreateStatus({
+    Name = T("earned"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        return shortFormat(sessionStats().earned)
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("per_hour"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        return shortFormat(sessionStats().perHour)
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("hatched"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        return tostring(sessionStats().hatched)
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("spent"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        if S.diamondBreach then
+            return "<Error>" .. tostring(sessionStats().spent) .. "</Error>"
+        end
+        return tostring(sessionStats().spent)
+    end,
+})
+SessionBox:CreateStatus({
+    Name = T("runtime"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        return formatTime(sessionStats().elapsed)
+    end,
+})
+
+Log = LogBox:CreateLog({
+    Name = "События",
+    MaxEntries = 120,
+    MaxRows = 7,
+    Timestamps = true,
+    EmptyText = "—",
+})
+
+local MOVEMENT_OPTIONS = { T("move_tp"), T("move_tween"), T("move_path") }
+AdvancedBox:CreateDropdown({
+    Name = T("movement"),
+    Options = MOVEMENT_OPTIONS,
+    CurrentOption = T("move_tp"),
+    Flag = "MoveMode",
+    Callback = function(value)
+        if value == T("move_tween") then
+            S.movement = "Tween TP"
+        elseif value == T("move_path") then
+            S.movement = "Pathfinding"
+        else
+            S.movement = "Teleport"
+        end
+    end,
+})
+AdvancedBox:CreateToggle({
+    Name = T("buy_area_auto"),
+    Flag = "AutoBuyArea",
+    CurrentValue = false,
+    Callback = function(value)
+        S.buyArea = value
+    end,
+})
+AdvancedBox:CreateButton({
+    Name = T("buy_area_now"),
+    Icon = "door-open",
+    Callback = function()
+        local ok, info = buyNextLocation()
+        if ok then
+            notify("PS99 Hub", "Куплено: " .. tostring(info), "Success")
+        else
+            pushWarning("Не куплено: " .. tostring(info))
+        end
+    end,
+})
+AdvancedBox:CreateToggle({
+    Name = T("ultimate"),
+    Flag = "Ultimate",
+    CurrentValue = false,
+    Callback = function(value)
+        S.ultimate = value
+    end,
+})
+AdvancedBox:CreateParagraph({
+    Title = T("advanced"),
+    Content = T("farm_hint"),
+})
+----- Ranks tab -----
+local RanksTab = Window:CreateTab({ Name = T("tab_ranks"), Icon = "list-checks" })
+local RankBox = RanksTab:CreateGroupbox({ Name = T("rank"), Icon = "trophy", Side = "Left" })
+local QuestBox = RanksTab:CreateGroupbox({ Name = T("current_quests"), Icon = "scroll-text", Side = "Right" })
+local RewardsBox = RanksTab:CreateGroupbox({ Name = T("rewards"), Icon = "gift", Side = "Right" })
+
+RankBox:CreateStatus({
+    Name = T("rank"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        local info = rankInfo()
+        return info.name .. " · " .. info.number
+    end,
+})
+RankBox:CreateStatus({
+    Name = T("rewards_left"),
+    Style = "Row",
+    UpdateRate = 1,
+    Update = function()
+        local info = rankInfo()
+        if info.rewards then
+            return tostring(info.rewards)
+        end
+        return "?"
+    end,
+})
+RankBox:CreateStatus({
+    Name = T("rank_ready"),
+    Style = "Badge",
+    UpdateRate = 1,
+    Update = function()
+        local info = rankInfo()
+        if info.ready then
+            return T("ready_yes"), "Success"
+        end
+        return T("ready_no"), "Muted"
+    end,
+})
+RankBox:CreateToggle({
+    Name = T("auto_rank_up"),
+    Desc = T("auto_rank_up_desc"),
+    Flag = "AutoRankUp",
+    CurrentValue = true,
+    Callback = function(value)
+        S.rankUp = value
+    end,
+})
+RankBox:CreateToggle({
+    Name = T("auto_rank_quests"),
+    Desc = T("auto_rank_quests_desc"),
+    Flag = "AutoRankQuests",
+    CurrentValue = false,
+    Callback = function(value)
+        S.rankQuests = value
+    end,
+})
+RankBox:CreateToggle({
+    Name = T("auto_area_quests"),
+    Desc = T("auto_area_quests_desc"),
+    Flag = "AutoAreaQuests",
+    CurrentValue = false,
+    Callback = function(value)
+        S.areaQuests = value
+    end,
+})
+RankBox:CreateToggle({
+    Name = T("auto_quest_items"),
+    Desc = T("auto_quest_items_desc"),
+    Flag = "AutoQuestItems",
+    CurrentValue = true,
+    Callback = function(value)
+        S.questItems = value
+    end,
+})
+RankBox:CreateToggle({
+    Name = T("auto_fish_dig"),
+    Desc = T("auto_fish_dig_desc"),
+    Flag = "AutoFishDig",
+    CurrentValue = false,
+    Callback = function(value)
+        S.fishDig = value
+    end,
+})
+RankBox:CreateButton({
+    Name = T("claim_now"),
+    Icon = "hand-coins",
+    Style = "Primary",
+    Callback = function()
+        fire("Ranks_ClaimAll")
+        invoke("Login Streaks: Claim")
+        invoke("Mailbox: Claim All")
+        setAction(T("act_claim"))
+        notify("PS99 Hub", T("act_claim"), "Success")
+    end,
+})
+
+QuestBox:CreateStatusList({
+    Name = "",
+    MaxRows = 7,
+    EmptyText = T("empty_quests"),
+    UpdateRate = 1,
+    Update = function()
+        local rows = {}
+        for _, quest in ipairs(parseQuests()) do
+            rows[#rows + 1] = quest
+        end
+        return rows
+    end,
+})
+QuestBox:CreateParagraph({
+    Title = T("current_quests"),
+    Content = T("quests_hint"),
+})
+
+RewardsBox:CreateToggle({
+    Name = T("claim_rank"),
+    Flag = "ClaimRank",
+    CurrentValue = true,
+    Callback = function(value)
+        S.claimRank = value
+    end,
+})
+RewardsBox:CreateToggle({
+    Name = T("claim_login"),
+    Flag = "ClaimLogin",
+    CurrentValue = true,
+    Callback = function(value)
+        S.claimLogin = value
+    end,
+})
+RewardsBox:CreateToggle({
+    Name = T("claim_mail"),
+    Flag = "ClaimMail",
+    CurrentValue = true,
+    Callback = function(value)
+        S.claimMail = value
+    end,
+})
+RewardsBox:CreateToggle({
+    Name = T("free_gifts"),
+    Flag = "FreeGifts",
+    CurrentValue = false,
+    Callback = function(value)
+        S.freeGifts = value
+    end,
+})
+RewardsBox:CreateButton({
+    Name = T("claim_all"),
+    Icon = "package-check",
+    Callback = function()
+        fire("Ranks_ClaimAll")
+        invoke("Login Streaks: Claim")
+        invoke("Mailbox: Claim All")
+        for index = 1, 12 do
+            invoke("Redeem Free Gift", index)
+        end
+        notify("PS99 Hub", T("act_claim"), "Success")
+    end,
+})
+
+----- Pets & Eggs tab -----
+local PetsTab = Window:CreateTab({ Name = T("tab_pets"), Icon = "egg" })
+local HatchBox = PetsTab:CreateGroupbox({ Name = T("hatching"), Icon = "egg", Side = "Left" })
+local PetBox = PetsTab:CreateGroupbox({ Name = T("pets_box"), Icon = "paw-print", Side = "Right" })
+
+local EGG_OPTIONS = { T("egg_best") }
+do
+    local names = eggNames()
+    local tiers = {}
+    for tier in pairs(names) do
+        tiers[#tiers + 1] = tier
+    end
+    table.sort(tiers)
+    for _, tier in ipairs(tiers) do
+        EGG_OPTIONS[#EGG_OPTIONS + 1] = eggDisplayName(tier)
+    end
+end
+
+HatchBox:CreateToggle({
+    Name = T("auto_hatch"),
+    Desc = T("auto_hatch_desc"),
+    Flag = "AutoHatch",
+    CurrentValue = false,
+    Callback = function(value)
+        S.hatch = value
+    end,
+})
+HatchBox:CreateDropdown({
+    Name = T("egg"),
+    Options = EGG_OPTIONS,
+    CurrentOption = T("egg_best"),
+    Flag = "EggChoice",
+    Callback = function(value)
+        if value == T("egg_best") then
+            S.eggChoice = "Best"
+        else
+            S.eggChoice = value
+        end
+    end,
+})
+HatchBox:CreateSlider({
+    Name = T("eggs_per_trip"),
+    Range = { 1, 12 },
+    Increment = 1,
+    CurrentValue = 4,
+    Flag = "HatchAmount",
+    Callback = function(value)
+        S.hatchAmount = value
+    end,
+})
+HatchBox:CreateSlider({
+    Name = T("trip_every"),
+    Range = { 20, 180 },
+    Increment = 5,
+    CurrentValue = 60,
+    Suffix = "s",
+    Flag = "HatchEvery",
+    Callback = function(value)
+        S.hatchEvery = value
+    end,
+})
+HatchBox:CreateButton({
+    Name = T("hatch_now"),
+    Icon = "egg",
+    Style = "Primary",
+    Callback = function()
+        hatchTrip(true)
+    end,
+})
+HatchBox:CreateStatus({
+    Name = T("now_opening"),
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        local state = S.hatchNow.state
+        local egg = S.hatchNow.egg
+        if not egg then
+            return "<Muted>—</Muted>"
+        end
+        if state == "ok" then
+            return "<Success>" .. eggDisplayName(tonumber(egg:match("^(%d+)")) or 0):gsub("^%d+ · ", "") .. "</Success>"
+        elseif state == "refused" then
+            return "<Warning>" .. egg .. "</Warning>"
+        end
+        return "<Accent>" .. egg .. "</Accent>"
+    end,
+})
+
+local function eggPriceText()
+    local capsule = chosenEgg()
+    if not capsule then
+        return "—"
+    end
+    if capsule.locked then
+        return T("locked")
+    end
+    local parts = {}
+    local prices = capsule.prices or {}
+    for _, currency in ipairs({ "Gold Coins", "Gold Bars", "Diamonds" }) do
+        local value = prices[currency]
+        if value and value > 0 then
+            parts[#parts + 1] = shortFormat(value) .. " " .. currency
+        end
+    end
+    if #parts > 0 then
+        return table.concat(parts, " / ")
+    end
+    if capsule.price then
+        return shortFormat(capsule.price) .. " " .. tostring(capsule.currency)
+    end
+    return "?"
+end
+
+HatchBox:CreateStatus({
+    Name = T("egg_price"),
+    Style = "Plain",
+    UpdateRate = 1,
+    Update = eggPriceText,
+})
+HatchBox:CreateParagraph({
+    Title = T("hatching"),
+    Content = T("hatch_hint") .. "\n\n" .. T("hatch_full_hint"),
+})
+
+PetBox:CreateToggle({
+    Name = T("equip_best"),
+    Flag = "EquipBest",
+    CurrentValue = false,
+    Callback = function(value)
+        S.equipBest = value
+    end,
+})
+PetBox:CreateDropdown({
+    Name = T("pet_filter"),
+    Options = { T("filter_low"), T("filter_smart") },
+    CurrentOption = T("filter_low"),
+    Flag = "PetFilter",
+    Callback = function(value)
+        S.petFilter = value
+    end,
+})
+PetBox:CreateToggle({
+    Name = T("keep_shiny"),
+    Flag = "KeepShiny",
+    CurrentValue = true,
+    Callback = function(value)
+        S.keepShiny = value
+    end,
+})
+PetBox:CreateToggle({
+    Name = T("keep_exclusive"),
+    Flag = "KeepExclusive",
+    CurrentValue = true,
+    Callback = function(value)
+        S.keepExclusive = value
+    end,
+})
+PetBox:CreateParagraph({
+    Title = T("pet_filter"),
+    Content = T("machines_soon"),
+})
+
+----- Performance tab -----
+local PerfTab = Window:CreateTab({ Name = T("tab_perf"), Icon = "gauge" })
+local PerfBox = PerfTab:CreateGroupbox({ Name = T("perf_mode"), Icon = "zap", Side = "Left" })
+local FpsBox = PerfTab:CreateGroupbox({ Name = T("fps_limit"), Icon = "activity", Side = "Right" })
+
+PerfBox:CreateToggle({
+    Name = T("perf_mode"),
+    Desc = T("perf_mode_desc"),
+    Flag = "PerfMode",
+    CurrentValue = false,
+    Callback = function(value)
+        S.perf = value
+        applyPerformanceState()
+        syncFlags({
+            DisableTextures = S.tex,
+            HideOwnPets = S.ownPets,
+            HideOtherPets = S.otherPets,
+            HidePlayers = S.players,
+            DisableWorldFX = S.worldFX,
+            DisableGUIFX = S.guiFX,
+            FPSLimit = S.fpsLimit,
+            FPSValue = S.fpsValue,
+        })
+    end,
+})
+PerfBox:CreateToggle({
+    Name = T("textures"),
+    Flag = "DisableTextures",
+    CurrentValue = false,
+    Callback = function(value)
+        S.tex = value
+        setTextures(value)
+    end,
+})
+PerfBox:CreateToggle({
+    Name = T("own_pets"),
+    Flag = "HideOwnPets",
+    CurrentValue = false,
+    Callback = function(value)
+        S.ownPets = value
+        setPetsVisibility()
+    end,
+})
+PerfBox:CreateToggle({
+    Name = T("other_pets"),
+    Flag = "HideOtherPets",
+    CurrentValue = false,
+    Callback = function(value)
+        S.otherPets = value
+        setPetsVisibility()
+    end,
+})
+PerfBox:CreateToggle({
+    Name = T("players"),
+    Flag = "HidePlayers",
+    CurrentValue = false,
+    Callback = function(value)
+        S.players = value
+        setPlayers(value)
+    end,
+})
+PerfBox:CreateToggle({
+    Name = T("world_fx"),
+    Flag = "DisableWorldFX",
+    CurrentValue = false,
+    Callback = function(value)
+        S.worldFX = value
+        setWorldFX(value)
+    end,
+})
+PerfBox:CreateToggle({
+    Name = T("gui_fx"),
+    Flag = "DisableGUIFX",
+    CurrentValue = false,
+    Callback = function(value)
+        S.guiFX = value
+        setGuiFX(value)
+    end,
+})
+
+FpsBox:CreateToggle({
+    Name = T("fps_limit"),
+    Flag = "FPSLimit",
+    CurrentValue = false,
+    Callback = function(value)
+        S.fpsLimit = value
+        applyFps()
+    end,
+})
+FpsBox:CreateSlider({
+    Name = T("fps_value"),
+    Range = { 30, 240 },
+    Increment = 5,
+    CurrentValue = 60,
+    Flag = "FPSValue",
+    Callback = function(value)
+        S.fpsValue = value
+        if S.fpsLimit then
+            applyFps()
+        end
+    end,
+})
+FpsBox:CreateStatus({
+    Name = T("fps_now"),
+    Style = "Stat",
+    UpdateRate = 1,
+    Update = function()
+        return tostring(fpsNow)
+    end,
+})
+FpsBox:CreateButton({
+    Name = T("restore_gfx"),
+    Icon = "refresh-cw",
+    Callback = function()
+        restoreGraphics()
+        syncFlags({
+            PerfMode = false,
+            DisableTextures = false,
+            HideOwnPets = false,
+            HideOtherPets = false,
+            HidePlayers = false,
+            DisableWorldFX = false,
+            DisableGUIFX = false,
+            FPSLimit = false,
+        })
+        notify("PS99 Hub", T("restore_gfx"), "Success")
+    end,
+})
+FpsBox:CreateParagraph({
+    Title = T("perf"),
+    Content = T("perf_hint"),
+})
+
+----- Misc tab -----
+local MiscTab = Window:CreateTab({ Name = T("tab_misc"), Icon = "wrench" })
+local MoveBox = MiscTab:CreateGroupbox({ Name = T("movement"), Icon = "move", Side = "Left" })
+local WorldBox = MiscTab:CreateGroupbox({ Name = T("world"), Icon = "globe", Side = "Right" })
+
+MoveBox:CreateToggle({
+    Name = T("walkspeed"),
+    Flag = "WalkSpeed",
+    CurrentValue = false,
+    Callback = function(value)
+        S.walk = value
+    end,
+})
+MoveBox:CreateSlider({
+    Name = "Скорость",
+    Range = { 16, 200 },
+    Increment = 1,
+    CurrentValue = 32,
+    Flag = "WalkValue",
+    Callback = function(value)
+        S.walkValue = value
+    end,
+})
+MoveBox:CreateToggle({
+    Name = T("fly"),
+    Desc = "WASD + Space / LeftControl",
+    Flag = "Fly",
+    CurrentValue = false,
+    Callback = function(value)
+        S.fly = value
+        if not value then
+            local _, _, root = getCharacter()
+            local body = root and root:FindFirstChild("PS99HubFly")
+            if body then
+                body:Destroy()
+            end
+        end
+    end,
+})
+MoveBox:CreateSlider({
+    Name = T("fly_speed"),
+    Range = { 20, 250 },
+    Increment = 5,
+    CurrentValue = 60,
+    Flag = "FlyValue",
+    Callback = function(value)
+        S.flyValue = value
+    end,
+})
+MoveBox:CreateToggle({
+    Name = T("auto_hoverboard"),
+    Flag = "AutoHoverboard",
+    CurrentValue = false,
+    Callback = function(value)
+        S.hoverboard = value
+        if value then
+            fire("Hoverboard_RequestEquip")
+        else
+            fire("Hoverboard_RequestUnequip")
+        end
+    end,
+})
+MoveBox:CreateToggle({
+    Name = T("noclip"),
+    Flag = "Noclip",
+    CurrentValue = false,
+    Callback = function(value)
+        S.noclip = value
+    end,
+})
+MoveBox:CreateToggle({
+    Name = T("anti_afk"),
+    Flag = "AntiAFK",
+    CurrentValue = true,
+    Callback = function(value)
+        S.antiAfk = value
+    end,
+})
+MoveBox:CreateButton({
+    Name = T("restore_move"),
+    Icon = "life-buoy",
+    Callback = function()
+        restoreMovement()
+        notify("PS99 Hub", T("notif_unstuck"), "Success")
+    end,
+})
+
+WorldBox:CreateButton({
+    Name = T("buy_next"),
+    Icon = "door-open",
+    Callback = function()
+        local ok, info = buyNextLocation()
+        if ok then
+            notify("PS99 Hub", "Куплено: " .. tostring(info), "Success")
+        else
+            pushWarning("Не куплено: " .. tostring(info))
+        end
+    end,
+})
+WorldBox:CreateButton({
+    Name = T("tp_best"),
+    Icon = "map-pin",
+    Callback = function()
+        local best = bestLocation()
+        if best then
+            teleport(best.anchor)
+            notify("PS99 Hub", best.name, "Success")
+        else
+            pushWarning("Лучшая зона не найдена")
+        end
+    end,
+})
+WorldBox:CreateToggle({
+    Name = T("balloons"),
+    Flag = "AutoBalloons",
+    CurrentValue = false,
+    Callback = function(value)
+        S.balloons = value
+    end,
+})
+WorldBox:CreateToggle({
+    Name = T("relics"),
+    Flag = "AutoRelics",
+    CurrentValue = false,
+    Callback = function(value)
+        S.relics = value
+    end,
+})
+WorldBox:CreateParagraph({
+    Title = T("activities"),
+    Content = T("misc_hint"),
+})
+
+----- Settings tab -----
+local SettingsTab = Window:CreateTab({ Name = T("tab_settings"), Icon = "settings" })
+local PresetBox = SettingsTab:CreateGroupbox({ Name = T("presets"), Icon = "sparkles", Side = "Left" })
+local SafetyBox = SettingsTab:CreateGroupbox({ Name = T("safety"), Icon = "shield-check", Side = "Left" })
+local LanguageBox = SettingsTab:CreateGroupbox({ Name = T("language"), Icon = "languages", Side = "Left" })
+local AboutBox = SettingsTab:CreateGroupbox({ Name = T("about"), Icon = "info", Side = "Left" })
+
+PresetBox:CreateButton({
+    Name = T("preset_afk"),
+    Desc = "Active · алмазы · Performance",
+    Icon = "gem",
+    Style = "Primary",
+    Callback = function()
+        applyPreset("AFK")
+    end,
+})
+PresetBox:CreateButton({
+    Name = T("preset_rank"),
+    Desc = "AFK · яйца · квесты · награды",
+    Icon = "trophy",
+    Callback = function()
+        applyPreset("Rank")
+    end,
+})
+PresetBox:CreateButton({
+    Name = T("preset_event"),
+    Desc = "AFK · награды · яйца",
+    Icon = "party-popper",
+    Callback = function()
+        applyPreset("Event")
+    end,
+})
+PresetBox:CreateParagraph({
+    Title = T("presets"),
+    Content = T("presets_hint"),
+})
+
+SafetyBox:CreateToggle({
+    Name = T("allow_diamonds"),
+    Desc = T("allow_diamonds_desc"),
+    Flag = "AllowDiamonds",
+    CurrentValue = false,
+    Callback = function(value)
+        S.allowDiamonds = value
+        if value then
+            pushWarning("Защита алмазов снята")
+        end
+    end,
+})
+SafetyBox:CreateToggle({
+    Name = T("diamond_warn"),
+    Flag = "DiamondWarnings",
+    CurrentValue = true,
+    Callback = function(value)
+        S.diamondWarn = value
+    end,
+})
+SafetyBox:CreateSlider({
+    Name = T("min_diamonds"),
+    Range = { 0, 50000 },
+    Increment = 100,
+    CurrentValue = 500,
+    Flag = "MinDiamonds",
+    Callback = function(value)
+        S.minDiamonds = value
+    end,
+})
+SafetyBox:CreateSlider({
+    Name = T("max_spend"),
+    Range = { 0, 100000 },
+    Increment = 100,
+    CurrentValue = 0,
+    Flag = "MaxDiamondSpend",
+    Callback = function(value)
+        S.maxSpend = value
+    end,
+})
+SafetyBox:CreateToggle({
+    Name = T("allow_bars"),
+    Desc = T("allow_bars_desc"),
+    Flag = "AllowBars",
+    CurrentValue = false,
+    Callback = function(value)
+        S.allowBars = value
+        if value then
+            pushWarning("Трата золотых слитков разрешена")
+        end
+    end,
+})
+SafetyBox:CreateParagraph({
+    Title = T("safety"),
+    Content = T("safety_hint"),
+})
+
+LanguageBox:CreateDropdown({
+    Name = T("language"),
+    Options = { "Русский", "English" },
+    CurrentOption = (Lang == "EN") and "English" or "Русский",
+    Flag = "Language",
+    Callback = function(value)
+        local code = (value == "English") and "EN" or "RU"
+        saveLanguage(code)
+        notify("PS99 Hub", T("notif_restart"), "Warning")
+    end,
+})
+LanguageBox:CreateParagraph({
+    Title = T("language"),
+    Content = T("lang_hint"),
+})
+
+AboutBox:CreateParagraph({
+    Title = "PS99 Hub v3",
+    Content = T("about_text"),
+})
+
+SettingsTab:CreateConfigManager({ Name = "Конфиги", Side = "Right" })
+SettingsTab:CreateThemeManager({ Name = "Тема", Side = "Right" })
+
+----- Scheduler -----
+local tasks = {}
+
+local function addTask(interval, callback)
+    tasks[#tasks + 1] = { interval = interval, nextAt = 0, callback = callback }
+end
+
+local frameCount = 0
+RunService.RenderStepped:Connect(function()
+    frameCount += 1
+end)
+
+RunService.Heartbeat:Connect(function()
+    if getgenv().__PS99Gen ~= GENERATION then
+        return
+    end
+    local now = os.clock()
+    for _, entry in ipairs(tasks) do
+        if now >= entry.nextAt then
+            entry.nextAt = now + entry.interval
+            local ok, err = pcall(entry.callback)
+            if not ok then
+                warn("[PS99 Hub] task: " .. tostring(err))
+            end
+        end
+    end
+end)
+
+addTask(1, function()
+    fpsNow = frameCount
+    frameCount = 0
+end)
+
+-- Remember the game's own walk speed once.
+addTask(1, function()
+    local _, humanoid = getCharacter()
+    if humanoid and not defaultWalkSpeed then
+        defaultWalkSpeed = humanoid.WalkSpeed
+    end
+end)
+
+----- Farm loop -----
+local lastTravelAt = 0
+
+addTask(0.5, function()
+    if not S.farm or S.hatchBusy then
+        return
+    end
+    local _, humanoid, root = getCharacter()
+    if not root then
+        return
+    end
+    if S.respect and playerIsMoving() then
+        setAction(T("act_pause"))
+        return
+    end
+    if S.farmMode == "AFK" then
+        local best = bestLocation()
+        if not best then
+            setAction(T("act_wait"))
+            return
+        end
+        if not S.standPos or S.standZone ~= best.zone.number then
+            S.standPos = best.anchor
+            S.standZone = best.zone.number
+            S.standEmptyAt = nil
+            S.zoneCheck = nil
+        end
+        S.farmAnchor = S.standPos
+        local distance = (root.Position - S.standPos).Magnitude
+        local needTravel = distance > 40 or (best.pending and distance > 25)
+        if needTravel and os.clock() - lastTravelAt > 6 then
+            lastTravelAt = os.clock()
+            setAction(string.format(T("act_zone_travel"), best.zoneName))
+            travelTo(S.standPos)
+        elseif not needTravel then
+            setAction(string.format(T("act_zone"), best.zone.number, best.zone.clean, best.area))
+            -- AFK means stand. Taps reach 85 studs; if nothing is near for 12 s,
+            -- move to the next cluster instead of chasing every breakable.
+            local hasNear = false
+            for _, entry in ipairs(getBreakables()) do
+                if entry.zone == best.zone.clean and (entry.part.Position - root.Position).Magnitude < 50 then
+                    hasNear = true
+                    break
+                end
+            end
+            if hasNear then
+                S.standEmptyAt = nil
+            elseif not S.standEmptyAt then
+                S.standEmptyAt = os.clock()
+            elseif os.clock() - S.standEmptyAt > 12 then
+                S.standPos = best.anchor
+                S.standZone = best.zone.number
+                S.standEmptyAt = nil
+                lastTravelAt = os.clock()
+                travelTo(S.standPos)
+                setAction(string.format(T("act_zone_travel"), best.zoneName))
+            end
+            if S.farmZone == "Auto" and not S.zoneLock and not best.pending then
+                local zone = best.zone
+                if S.zoneCheck and S.zoneCheck.zone == zone.number and os.clock() - S.zoneCheck.at >= 12 then
+                    if S.zoneCheck.count >= 5 then
+                        local gone = countZoneDestroyed(S.zoneCheck.uids, zone.clean)
+                        if gone >= 2 then
+                            S.zoneLock = { name = zone.name, at = os.clock() }
+                            pushWarning("Зона " .. zone.name .. " закреплена: " .. tostring(gone) .. " брейкаблов за 12 с")
+                        else
+                            S.zoneSlow[zone.number] = os.clock()
+                            pushWarning("Зона " .. zone.name .. " слишком крепкая — ищу зону ниже")
+                        end
+                    end
+                    S.zoneCheck = nil
+                elseif not S.zoneCheck then
+                    local uids, count = snapshotZoneBreakables(zone.clean)
+                    S.zoneCheck = { zone = zone.number, at = os.clock(), uids = uids, count = count }
+                end
+            end
+        end
+    else
+        local target = pickTarget(root.Position)
+        if not target then
+            setAction(T("act_wait"))
+            return
+        end
+        setAction(T("act_target") .. ": " .. tostring(target.id) .. " · " .. tostring(target.area))
+        if os.clock() - lastTravelAt > 0.35 then
+            lastTravelAt = os.clock()
+            teleport(target.part.Position)
+        end
+    end
+end)
+
+----- Orbs (safe: ignore the pooled orbs under the map) -----
+addTask(0.9, function()
+    if not S.orbs or S.hatchBusy or playerIsMoving() then
+        return
+    end
+    local _, _, root = getCharacter()
+    local container = Things:FindFirstChild("Orbs")
+    if not root or not container then
+        return
+    end
+    local best, bestDistance
+    for _, orb in ipairs(container:GetChildren()) do
+        if orb:IsA("BasePart") and orb.Position.Y > -100 then
+            local distance = (orb.Position - root.Position).Magnitude
+            if not bestDistance or distance < bestDistance then
+                best, bestDistance = orb, distance
+            end
+        end
+    end
+    if best and bestDistance < 400 then
+        teleport(best.Position)
+    end
+end)
+
+----- Auto tap: clicks the nearest breakable without moving the character -----
+local lastTapAt = 0
+addTask(0.05, function()
+    if not S.autoTap or not S.farm then
+        return
+    end
+    if S.respect and playerIsMoving() then
+        return
+    end
+    local interval = math.clamp(tonumber(S.tapInterval) or 0.2, 0.05, 1)
+    if os.clock() - lastTapAt < interval then
+        return
+    end
+    local _, _, root = getCharacter()
+    if not root then
+        return
+    end
+    local nearest, nearestDistance
+    for _, entry in ipairs(getBreakables()) do
+        if entry.area ~= "VIP" or S.allowVIP then
+            local distance = (entry.part.Position - root.Position).Magnitude
+            if distance < 45 and (not nearestDistance or distance < nearestDistance) then
+                nearest, nearestDistance = entry, distance
+            end
+        end
+    end
+    if not nearest then
+        return
+    end
+    lastTapAt = os.clock()
+    fire("Click")
+    if type(fireclickdetector) == "function" then
+        local detector = nearest.model:FindFirstChildWhichIsA("ClickDetector", true)
+        if detector then
+            -- Distance and click type matter: fireclickdetector(det, 0) is ignored by PS99.
+            pcall(fireclickdetector, detector, 32, 1)
+        end
+    end
+end)
+
+----- Auto hoverboard -----
+addTask(15, function()
+    if S.hoverboard then
+        fire("Hoverboard_RequestEquip")
+    end
+end)
+
+----- Auto buy next area -----
+local nextBuyAt = 0
+addTask(10, function()
+    if not S.buyArea then
+        return
+    end
+    if os.clock() < nextBuyAt then
+        return
+    end
+    nextBuyAt = os.clock() + 300
+    local ok, info = buyNextLocation()
+    if ok then
+        notify("PS99 Hub", "Куплено: " .. tostring(info), "Success")
+    else
+        pushWarning("Зона не куплена: " .. tostring(info))
+    end
+end)
+
+----- Auto hatch -----
+local hatchAt = 0
+addTask(1, function()
+    if not S.hatch then
+        hatchAt = 0
+        return
+    end
+    if S.hatchBusy then
+        return
+    end
+    if os.clock() < hatchAt then
+        return
+    end
+    hatchAt = os.clock() + math.max(20, S.hatchEvery)
+    hatchTrip(false)
+end)
+
+----- Rank up -----
+local lastRankUpAt = 0
+addTask(6, function()
+    if not S.rankUp then
+        return
+    end
+    local info = rankInfo()
+    if info.ready and os.clock() - lastRankUpAt > 20 then
+        lastRankUpAt = os.clock()
+        if not S.hatchBusy then
+            setAction(T("act_rankup"))
+        end
+        fire("Ranks_RankUp")
+    end
+end)
+
+----- Area quests -----
+addTask(15, function()
+    if not S.areaQuests then
+        return
+    end
+    invoke("NPC Quests: Ensure")
+    fire("NPC Quests: Assign")
+end)
+
+----- Rank quests: potions and hatching -----
+local lastQuestHatchAt = 0
+local lastPotionAt = 0
+
+addTask(6, function()
+    if not S.rankQuests then
+        return
+    end
+    local quests = parseQuests()
+    if #quests == 0 then
+        return
+    end
+    local joined = table.concat(quests, " "):lower()
+
+    if joined:find("hatch", 1, true) and not S.hatch and not S.hatchBusy then
+        if os.clock() - lastQuestHatchAt > 75 then
+            lastQuestHatchAt = os.clock()
+            hatchTrip(false)
+        end
+    end
+
+    if S.questItems and joined:find("potion", 1, true) then
+        if os.clock() - lastPotionAt > 12 then
+            lastPotionAt = os.clock()
+            fire("Potions: Consume", "Damage")
+            setAction(T("act_quest") .. ": " .. quests[1])
+        end
+    end
+end)
+
+----- Fishing / digging quests (beta) -----
+addTask(10, function()
+    if not S.fishDig then
+        return
+    end
+    local quests = parseQuests()
+    local joined = table.concat(quests, " "):lower()
+    if not (joined:find("fish", 1, true) or joined:find("dig", 1, true)) then
+        return
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local tool
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                local name = item.Name:lower()
+                if name:find("rod", 1, true) or name:find("shovel", 1, true) then
+                    tool = item
+                    break
+                end
+            end
+        end
+    end
+    if not tool then
+        setAction("Нужна удочка/лопата")
+        return
+    end
+    local character = LocalPlayer.Character
+    if not character then
+        return
+    end
+    pcall(function()
+        tool.Parent = character
+    end)
+    task.wait(0.2)
+    if tool.Name:lower():find("rod", 1, true) then
+        invoke("FishingEvent_Cast", tool.Name)
+        setAction(T("act_quest") .. ": Fishing")
+    end
+end)
+
+----- Claims -----
+addTask(60, function()
+    if S.claimRank or S.claims then
+        fire("Ranks_ClaimAll")
+    end
+    if S.claimLogin then
+        invoke("Login Streaks: Claim")
+    end
+    if S.claimMail then
+        invoke("Mailbox: Claim All")
+    end
+end)
+
+addTask(120, function()
+    if not S.freeGifts then
+        return
+    end
+    for index = 1, 12 do
+        invoke("Redeem Free Gift", index)
+    end
+end)
+
+----- Equip best -----
+addTask(90, function()
+    if S.equipBest then
+        fire("Pets_EquipBest")
+    end
+end)
+
+----- Movement / fly / noclip -----
+addTask(0.2, function()
+    local character, humanoid = getCharacter()
+    if not character then
+        return
+    end
+    if S.walk then
+        humanoid.WalkSpeed = S.walkValue
+    elseif defaultWalkSpeed then
+        humanoid.WalkSpeed = defaultWalkSpeed
+    end
+    if S.noclip then
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+    end
+end)
+
+addTask(0.1, function()
+    local _, _, root = getCharacter()
+    if not root then
+        return
+    end
+    if not S.fly then
+        local stale = root:FindFirstChild("PS99HubFly")
+        if stale then
+            stale:Destroy()
+        end
+        return
+    end
+    local body = root:FindFirstChild("PS99HubFly")
+    if not body then
+        body = Instance.new("BodyVelocity")
+        body.Name = "PS99HubFly"
+        body.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        body.Velocity = Vector3.zero
+        body.Parent = root
+    end
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return
+    end
+    local direction = Vector3.zero
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+        direction += camera.CFrame.LookVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+        direction -= camera.CFrame.LookVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+        direction += camera.CFrame.RightVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+        direction -= camera.CFrame.RightVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+        direction += Vector3.yAxis
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+        direction -= Vector3.yAxis
+    end
+    body.Velocity = direction.Magnitude > 0 and direction.Unit * S.flyValue or Vector3.zero
+end)
+
+----- Anti AFK -----
+addTask(60, function()
+    if not S.antiAfk then
+        return
+    end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.zero)
+    end)
+end)
+
+----- Performance re-apply -----
+addTask(2, function()
+    if S.players then
+        setPlayers(true)
+    end
+    if S.ownPets or S.otherPets then
+        setPetsVisibility()
+    end
+end)
+
+----- Activities -----
+addTask(2, function()
+    if not S.balloons and not S.relics then
+        return
+    end
+    local _, _, root = getCharacter()
+    if not root then
+        return
+    end
+    local function nearestPart(container)
+        local best, bestDistance
+        if not container then
+            return nil
+        end
+        for _, object in ipairs(container:GetChildren()) do
+            local part = object:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                local distance = (part.Position - root.Position).Magnitude
+                if not bestDistance or distance < bestDistance then
+                    best, bestDistance = part, distance
+                end
+            end
+        end
+        return best, bestDistance
+    end
+    if S.balloons then
+        local part = nearestPart(Things:FindFirstChild("BalloonGifts"))
+        if part then
+            teleport(part.Position)
+        end
+    elseif S.relics then
+        local part = nearestPart(Things:FindFirstChild("ShinyRelics"))
+        if part then
+            teleport(part.Position)
+        end
+    end
+end)
+
+----- Auto tap / ultimate -----
+addTask(0.3, function()
+    if S.autoTap then
+        fire("Click")
+    end
+end)
+
+addTask(45, function()
+    if S.ultimate then
+        fire("Ultimates: Activate")
+    end
+end)
+
+----- Boot -----
+Window:LoadAutoload()
+
+refreshSession()
+
+task.defer(function()
+    task.wait(2)
+    refreshSession()
+    setAction("")
+end)
+
+Window:Notify({
+    Title = "PS99 Hub v3.1",
+    Content = "Лучшая зона · Auto Tap · Auto Hoverboard · новая раскладка Фарма.",
+    Type = "Success",
+    Time = 8,
+})
+
+if Log then
+    pcall(function()
+        Log:Push("<Accent>PS99 Hub v3 загружен · " .. tostring(Lang) .. "</Accent>")
+    end)
+end
+
+getgenv().PS99Hub = {
+    version = "3.1",
+    window = Window,
+    state = S,
+    start = startEverything,
+    stop = stopEverything,
+    hatch = function()
+        return hatchTrip(true)
+    end,
+    hatchNow = function()
+        return S.hatchNow
+    end,
+    coins = coins,
+    diamonds = diamonds,
+    goldBars = goldBars,
+    quests = parseQuests,
+    rank = rankInfo,
+    best = bestLocation,
+    unstuck = restoreMovement,
+    buyNext = function()
+        return buyNextLocation()
+    end,
+    applyGoal = applyGoal,
+    applyPreset = applyPreset,
+    restore = restoreGraphics,
+    stats = sessionStats,
+    eggs = function()
+        return readCapsules()
+    end,
+}
