@@ -1,0 +1,1738 @@
+--[[
+    ── Still Water Hub ──────────────────────────────────────────────────────────
+    Game:   Still Water  (placeId 139386728420706, group 1065149497)
+    Loader: Potassium, or any executor with loadstring + game:HttpGet
+    UI:     Airflow (OuroFlow) — the library kept in the Obsidian vault
+            (note "Great Wall Hub" → Robly_Airflow)
+
+    Contents:
+      • ESP with its own settings: pick what is drawn and how it is drawn
+      • Listener radar, proximity alarm
+      • Puzzle helpers: room 9 door code, room 7 memory bridge
+      • One movement feature: Speed boost
+
+    Speed boost, honestly:
+      The game rewrites Humanoid.WalkSpeed every frame, so the boost is applied
+      as a LinearVelocity constraint instead. Exactly one constraint is ever
+      created, it ramps up over ~0.3 s rather than jumping, it only pushes on
+      the horizontal axes so gravity and jump height are untouched, it is off
+      in water, and it is capped.
+      A raw jump to a high velocity is what a server-side movement check reacts
+      to; a smooth, capped push in the direction you already walk is the least
+      suspicious thing this kind of feature can do.
+
+    Terminology:
+      Listener   — the monster (Config.Run.CREATURE.STYLE is literally "Listener")
+      Highlight  — a Roblox `Highlight` instance: the through-wall outline
+      Billboard  — a `BillboardGui`: the floating label above a part
+      Tag        — a Roblox attribute, e.g. `Platform`, `Safe`, `MemTile`, `State`
+]]
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local SoundService      = game:GetService("SoundService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  0. UI library
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Airflow has two incompatible branches; only the full one exposes Colorize
+-- (and groupboxes, statuses, themes), so we detect it instead of trusting a URL.
+local AIRFLOW_URLS = {
+    "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+    "https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(AIRFLOW_URLS) do
+    local ok, library = pcall(function()
+        return loadstring(game:HttpGet(url))()
+    end)
+    if ok and type(library) == "table" and library.CreateWindow and library.Colorize then
+        Airflow = library
+        break
+    end
+end
+
+if not Airflow then
+    error("[StillWaterHub] could not load Airflow (the full Robly_Airflow branch is required)")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  1. Game data, copied from ReplicatedStorage.Config.*
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local GAME = {
+    rooms = {
+        [1] = { name = "PILLAR HALL",        hint = "Jump across the platforms to the exit." },
+        [2] = { name = "BROKEN WALKWAY",     hint = "Narrow ledges with short jumps." },
+        [3] = { name = "SINKING PLATFORMS",  hint = "Platforms sink while you stand on them." },
+        [4] = { name = "ROTATING BRIDGE",    hint = "Ride the rotating bridges; time the jumps." },
+        [5] = { name = "MOVING PLATFORMS",   hint = "Every platform moves." },
+        [6] = { name = "DRIFTING PLATFORMS", hint = "The arrows push you; do not get carried into the water." },
+        [7] = { name = "MEMORY BRIDGE",      hint = "Remember which tiles lit up." },
+        [8] = { name = "CRUSHING WALLS",     hint = "The walls slide in; one lane always stays open." },
+        [9] = { name = "LOCKED EXIT",        hint = "Find the 4 digits on the pillars and photograph each one." },
+    },
+    modes = {
+        STARTER = { mult = 0.5, monsters = 1, roomLength = 780  },
+        EASY    = { mult = 1.0, monsters = 3, roomLength = 1300 },
+        HARD    = { mult = 1.5, monsters = 5, roomLength = 1690 },
+    },
+    listener = {
+        patrolSpeed = 16, chaseSpeed = 120, killRange = 10,
+        searchTime = 2.2, attackTime = 0.55,
+    },
+    movement = { walk = 22, wade = 10, jump = 56 },
+    rewards = { rooms = { 20, 30, 40, 50, 50, 55, 60, 65, 70 }, escape = 100, noSplash = 30, rescue = 10 },
+    upgrades = {
+        { id = "Range",       name = "Throwing Range", price = { 150, 400, 900 } },
+        { id = "Skip",        name = "Pebble Skipping", price = { 150, 400, 900 } },
+        { id = "Battery",     name = "Toy Battery",    price = { 150, 400, 900 } },
+        { id = "FlareRadius", name = "Flare Radius",   price = { 150, 400, 900 } },
+        { id = "RopeReach",   name = "Rope Reach",     price = { 150, 400, 900 } },
+        { id = "RescueSpeed", name = "Rescue Speed",   price = { 150, 400, 900 } },
+    },
+    equipment = {
+        { id = "Pebble", name = "Pebbles",     unlock = 0,   desc = "Skips across the water and leads the Listener away." },
+        { id = "Bottle", name = "Bottles",     unlock = 150, desc = "One loud splash; pulls it there from far away." },
+        { id = "Toy",    name = "Wind-up Toy", unlock = 300, desc = "Waddles through the water, making noise." },
+        { id = "Flare",  name = "Flare",       unlock = 450, desc = "Stuns it for 5 s, then it is immune for 8 s." },
+        { id = "Rope",   name = "Rescue Rope", unlock = 250, desc = "Pull a teammate onto a platform, once per room." },
+    },
+}
+
+local STATE_COLORS = {
+    Patrol = Color3.fromRGB(80, 255, 150),
+    Search = Color3.fromRGB(255, 210, 60),
+    Hunt   = Color3.fromRGB(255, 140, 40),
+    Chase  = Color3.fromRGB(255, 60, 60),
+    Attack = Color3.fromRGB(255, 40, 180),
+    Caught = Color3.fromRGB(200, 0, 255),
+}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  2. Lookups and formatters
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- The map lives under Workspace.StillWater: the creatures, the lobby,
+-- Room1..Room9, Corridor1..Corridor8 and the escape corridor.
+local function stillWater()
+    return workspace:FindFirstChild("StillWater")
+end
+
+local function listenerFolder()
+    local root = stillWater()
+    return root and root:FindFirstChild("Creatures")
+end
+
+local function pebbleFolder()
+    local root = stillWater()
+    return root and root:FindFirstChild("PebblePickups")
+end
+
+local function character()
+    return LocalPlayer.Character
+end
+
+local function humanoid()
+    local model = character()
+    return model and model:FindFirstChildOfClass("Humanoid")
+end
+
+local function rootPart()
+    local model = character()
+    return model and model:FindFirstChild("HumanoidRootPart")
+end
+
+local function playerGui()
+    return LocalPlayer:FindFirstChildOfClass("PlayerGui")
+end
+
+-- Reads a TextLabel by GUI path, e.g. ("StillWaterUI", "ClientHUD", "Timer").
+local function guiText(guiName, ...)
+    local gui = playerGui() and playerGui():FindFirstChild(guiName)
+    if not gui then return nil end
+    local node = gui
+    for _, name in ipairs({ ... }) do
+        node = node and node:FindFirstChild(name)
+    end
+    return node and node:IsA("TextLabel") and node.Text or nil
+end
+
+local function stateColor(state)
+    return STATE_COLORS[state] or Color3.fromRGB(180, 180, 200)
+end
+
+local function distanceTo(position)
+    local root = rootPart()
+    if not root or not position then return math.huge end
+    return (position - root.Position).Magnitude
+end
+
+local function formatStuds(distance)
+    if distance == math.huge then return "—" end
+    return string.format("%d", math.floor(distance + 0.5))
+end
+
+-- Rooms sit 830 studs apart on +Z (centres 390, 1220, 2050, ...), lobby at Z < 8.
+local function currentRoomIndex()
+    local root = rootPart()
+    if not root then return 0 end
+    local z = root.Position.Z
+    if z < 8 then return 0 end
+    return math.clamp(math.floor((z + 8) / 830) + 1, 1, 9)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  3. Settings — every control in the UI writes here
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local CFG = {
+    -- WHAT is drawn (one switch per kind of object)
+    showListener        = true,
+    showTeammates       = false,
+    showPickups         = false,
+    showPlatforms       = false,
+    platformSafeOnly    = false,
+    showExits           = false,
+    showCode            = true,
+    showMemoryNumbers   = false,
+
+    -- HOW it is drawn
+    highlights          = true,
+    labels              = true,
+    labelDistance       = true,
+    listenerTarget      = false,
+    maxDistance         = 0,      -- 0 = draw at any distance
+    fillOpacity         = 0.55,   -- Highlight.FillTransparency
+
+    -- danger awareness (off by default: the radar statuses are enough)
+    alarmEnabled        = false,
+    alarmDistance       = 60,
+    alarmFlash          = false,
+
+    -- movement
+    speedEnabled        = false,
+    speedValue          = 30,
+}
+
+-- Hard limits for the movement feature. Above roughly 40 studs/s the server's
+-- movement check has something to notice, and the boost stops being worth it.
+local SPEED_MIN = 24
+local SPEED_MAX = 40
+
+local CONNECTIONS = {}
+local STOPPED = false
+
+local function keep(connection)
+    if connection then table.insert(CONNECTIONS, connection) end
+    return connection
+end
+
+local function stopAll()
+    STOPPED = true
+    for _, connection in ipairs(CONNECTIONS) do
+        pcall(function() connection:Disconnect() end)
+    end
+    CONNECTIONS = {}
+end
+
+-- Reloading shuts the previous instance down first, so no duplicate loops,
+-- duplicate highlights, and above all no duplicate velocity constraints.
+do
+    local previous = getgenv and getgenv().StillWaterHub
+    if previous and previous.unload then
+        pcall(previous.unload)
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  4. ESP engine
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- visuals[part] = { hl = Highlight, bb = BillboardGui, label = TextLabel,
+--                   marker = Part, tag = "listener" | "platform" | ... }
+local visuals = {}
+
+-- Distance gate used by every ESP pass. 0 means "no limit".
+local function inRange(position)
+    if CFG.maxDistance <= 0 then return true end
+    return distanceTo(position) <= CFG.maxDistance
+end
+
+local function makeHighlight(part, color)
+    local highlight = Instance.new("Highlight")
+    highlight.Adornee = part
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillColor = color
+    highlight.FillTransparency = CFG.fillOpacity
+    highlight.OutlineColor = color
+    highlight.OutlineTransparency = 0.1
+    highlight.Parent = part
+    return highlight
+end
+
+local function makeBillboard(part, offsetY, size)
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "SWHubTag"
+    billboard.Size = size or UDim2.fromOffset(190, 34)
+    billboard.StudsOffset = Vector3.new(0, offsetY or 3, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
+    billboard.LightInfluence = 0
+    billboard.Adornee = part
+    billboard.Parent = part
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Text"
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = Enum.Font.GothamBold
+    label.TextScaled = true
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextStrokeTransparency = 0.25
+    label.TextStrokeColor3 = Color3.new(0, 0, 0)
+    label.RichText = true
+    label.Text = ""
+    label.Parent = billboard
+
+    local constraint = Instance.new("UITextSizeConstraint")
+    constraint.MaxTextSize = 18
+    constraint.Parent = label
+
+    return billboard, label
+end
+
+local function dropVisual(part)
+    local entry = visuals[part]
+    if not entry then return end
+    if entry.hl then entry.hl:Destroy() end
+    if entry.bb then entry.bb:Destroy() end
+    visuals[part] = nil
+end
+
+local function getVisual(part)
+    local entry = visuals[part]
+    if not entry then
+        entry = {}
+        visuals[part] = entry
+    end
+    return entry
+end
+
+-- Drops entries whose part is gone (room regenerated, creature removed).
+local function pruneVisuals()
+    for part, entry in pairs(visuals) do
+        if not part.Parent then
+            if entry.marker then entry.marker:Destroy() end
+            visuals[part] = nil
+        end
+    end
+end
+
+-- Removes every visual belonging to one category (used by toggles and filters).
+local function dropByTag(tag)
+    for part, entry in pairs(visuals) do
+        if entry.tag == tag then dropVisual(part) end
+    end
+end
+
+-- Applies the current "how to draw" settings to an existing entry.
+local function styleHighlight(entry, color)
+    if not CFG.highlights then
+        if entry.hl then entry.hl:Destroy(); entry.hl = nil end
+        return
+    end
+    if not entry.hl then entry.hl = makeHighlight(entry.part, color) end
+    entry.hl.FillColor = color
+    entry.hl.OutlineColor = color
+    entry.hl.FillTransparency = CFG.fillOpacity
+end
+
+-- ── Listeners ───────────────────────────────────────────────────────────────
+
+local function listeners()
+    local folder = listenerFolder()
+    if not folder then return {} end
+    local list = {}
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:IsA("BasePart") then table.insert(list, child) end
+    end
+    return list
+end
+
+local function updateListenerVisuals()
+    if not CFG.showListener then
+        dropByTag("listener")
+        return
+    end
+
+    for _, part in ipairs(listeners()) do
+        if inRange(part.Position) then
+            local entry = getVisual(part)
+            entry.tag = "listener"
+            entry.part = part
+
+            -- Tags on each Listener: State, Room, Target, Home, Speed.
+            local state = tostring(part:GetAttribute("State") or "?")
+            local color = stateColor(state)
+            local red   = math.floor(color.R * 255)
+            local green = math.floor(color.G * 255)
+            local blue  = math.floor(color.B * 255)
+
+            styleHighlight(entry, color)
+
+            if CFG.labels then
+                if not entry.bb then
+                    entry.bb, entry.label = makeBillboard(part, 4, UDim2.fromOffset(220, 46))
+                end
+                entry.bb.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
+                local room = tostring(part:GetAttribute("Room") or "?")
+                local tail = CFG.labelDistance
+                    and string.format('<font color="rgb(%d,%d,%d)">%s</font> · %s studs',
+                        red, green, blue, state, formatStuds(distanceTo(part.Position)))
+                    or string.format('<font color="rgb(%d,%d,%d)">%s</font>', red, green, blue, state)
+                entry.label.Text = string.format(
+                    '<font color="rgb(%d,%d,%d)">LISTENER</font> <font color="rgb(200,200,200)">Room %s</font>\n%s',
+                    red, green, blue, room, tail)
+            elseif entry.bb then
+                entry.bb:Destroy(); entry.bb = nil; entry.label = nil
+            end
+
+            -- Marker on `Target`: where the server is steering it right now.
+            local target = part:GetAttribute("Target")
+            if CFG.listenerTarget and typeof(target) == "Vector3" then
+                if not entry.marker or not entry.marker.Parent then
+                    local marker = Instance.new("Part")
+                    marker.Name = "SWHubTargetMarker"
+                    marker.Shape = Enum.PartType.Ball
+                    marker.Size = Vector3.new(2, 2, 2)
+                    marker.Material = Enum.Material.Neon
+                    marker.Anchored = true
+                    marker.CanCollide = false
+                    marker.CanQuery = false
+                    marker.CanTouch = false
+                    marker.Transparency = 0.35
+                    marker.Parent = workspace
+                    entry.marker = marker
+                end
+                entry.marker.Position = target
+                entry.marker.Color = color
+            elseif entry.marker then
+                entry.marker:Destroy(); entry.marker = nil
+            end
+        else
+            local entry = visuals[part]
+            if entry and entry.tag == "listener" then dropVisual(part) end
+        end
+    end
+end
+
+-- ── Jump platforms ──────────────────────────────────────────────────────────
+
+-- Generated geometry lives in each room's `Gen` folder; every jumpable part
+-- carries `Platform = true`. Room 3 adds `Safe = true`, room 7 adds `MemTile`.
+local function collectPlatforms()
+    local list = {}
+    local root = stillWater()
+    if not root then return list end
+    for _, room in ipairs(root:GetChildren()) do
+        local gen = room:FindFirstChild("Gen")
+        if gen then
+            for _, part in ipairs(gen:GetChildren()) do
+                if part:IsA("BasePart") and part:GetAttribute("Platform") == true then
+                    table.insert(list, part)
+                end
+            end
+        end
+    end
+    return list
+end
+
+local platformCache = { at = 0, list = {} }
+
+local function updatePlatformVisuals()
+    if not CFG.showPlatforms or not CFG.highlights then
+        dropByTag("platform")
+        return
+    end
+
+    -- Refreshing the list touches dozens of rooms, so do it rarely.
+    if (os.clock() - platformCache.at) > 3 then
+        platformCache.list = collectPlatforms()
+        platformCache.at = os.clock()
+    end
+
+    for _, part in ipairs(platformCache.list) do
+        if part.Parent then
+            local safe   = part:GetAttribute("Safe") == true
+            local memory = part:GetAttribute("MemTile") == true
+            local show = ((not CFG.platformSafeOnly) or safe or memory) and inRange(part.Position)
+
+            if show then
+                local entry = getVisual(part)
+                local color = safe and Color3.fromRGB(70, 220, 255)
+                    or (memory and Color3.fromRGB(200, 120, 255)
+                        or Color3.fromRGB(110, 255, 160))
+                -- Hundreds of platforms: set the colour once, not every tick.
+                if not entry.hl or entry.tag ~= "platform" then
+                    styleHighlight(entry, color)
+                    entry.tag = "platform"
+                end
+            else
+                local entry = visuals[part]
+                if entry and entry.tag == "platform" then dropVisual(part) end
+            end
+        end
+    end
+end
+
+-- ── Pebble pickups ──────────────────────────────────────────────────────────
+
+local function updatePickupVisuals()
+    if not CFG.showPickups or not CFG.highlights then
+        dropByTag("pickup")
+        return
+    end
+
+    local folder = pebbleFolder()
+    if not folder then return end
+
+    for _, pile in ipairs(folder:GetChildren()) do
+        for _, part in ipairs(pile:GetChildren()) do
+            if part:IsA("BasePart") and inRange(part.Position) then
+                local entry = getVisual(part)
+                entry.tag = "pickup"
+                if not entry.hl then
+                    styleHighlight(entry, Color3.fromRGB(255, 245, 140))
+                end
+            end
+        end
+    end
+end
+
+-- ── Teammates ───────────────────────────────────────────────────────────────
+
+local function updatePlayerVisuals()
+    if not CFG.showTeammates or not CFG.highlights then
+        dropByTag("teammate")
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local model = player.Character
+            local part = model and model:FindFirstChild("HumanoidRootPart")
+            if part and inRange(part.Position) then
+                local entry = getVisual(part)
+                entry.tag = "teammate"
+                if not entry.hl then
+                    styleHighlight(entry, Color3.fromRGB(255, 170, 220))
+                end
+            end
+        end
+    end
+end
+
+-- ── Checkpoints and the final door ──────────────────────────────────────────
+
+local function updateExitVisuals()
+    if not CFG.showExits then
+        dropByTag("exit")
+        return
+    end
+
+    local root = stillWater()
+    if not root then return end
+
+    local targets = {}
+    local function add(part, text, color)
+        if part and part:IsA("BasePart") then
+            table.insert(targets, { part = part, text = text, color = color })
+        end
+    end
+
+    -- CheckpointN sits in CorridorN, at the end of room N.
+    for index = 1, 8 do
+        local corridor = root:FindFirstChild("Corridor" .. index)
+        add(corridor and corridor:FindFirstChild("Checkpoint" .. index),
+            "CHECKPOINT " .. index, Color3.fromRGB(120, 220, 255))
+    end
+
+    local room9 = root:FindFirstChild("Room9_LockedExit")
+    local shell9 = room9 and room9:FindFirstChild("Shell")
+    add(shell9 and shell9:FindFirstChild("ExitDeck"), "ROOM 9 EXIT", Color3.fromRGB(255, 220, 90))
+    add(room9 and room9:FindFirstChild("FinalDoor"), "FINAL DOOR", Color3.fromRGB(255, 220, 90))
+    add(room9 and room9:FindFirstChild("DoorLamp"), "FINAL DOOR", Color3.fromRGB(255, 220, 90))
+
+    local lobby = root:FindFirstChild("Lobby")
+    local back = lobby and lobby:FindFirstChild("BackToLobby")
+    add(back and back:FindFirstChild("DoorGlow"), "BACK TO LOBBY", Color3.fromRGB(180, 180, 255))
+
+    for _, item in ipairs(targets) do
+        if inRange(item.part.Position) then
+            local entry = getVisual(item.part)
+            entry.tag = "exit"
+            entry.part = item.part
+            styleHighlight(entry, item.color)
+            if CFG.labels then
+                if not entry.bb then
+                    entry.bb, entry.label = makeBillboard(item.part, 4, UDim2.fromOffset(160, 26))
+                end
+                entry.bb.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
+                entry.label.Text = item.text
+                entry.label.TextColor3 = item.color
+            elseif entry.bb then
+                entry.bb:Destroy(); entry.bb = nil; entry.label = nil
+            end
+        else
+            local entry = visuals[item.part]
+            if entry and entry.tag == "exit" then dropVisual(item.part) end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  5. Door code (room 9)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- The server places four CodeNumber parts in Room9_LockedExit.Gen. Each carries
+-- the tag CodeIndex (1..4) and a SurfaceGui whose TextLabel holds one digit.
+local function readDoorCode()
+    local root = stillWater()
+    local room = root and root:FindFirstChild("Room9_LockedExit")
+    local gen = room and room:FindFirstChild("Gen")
+    if not gen then return nil end
+
+    local digits = {}
+    for _, part in ipairs(gen:GetChildren()) do
+        if part:IsA("BasePart") and part.Name == "CodeNumber" then
+            local index = part:GetAttribute("CodeIndex")
+            local text
+            local surface = part:FindFirstChildOfClass("SurfaceGui")
+            if surface then
+                for _, descendant in ipairs(surface:GetDescendants()) do
+                    if descendant:IsA("TextLabel") and descendant.Text ~= "" and descendant.Text ~= " " then
+                        text = descendant.Text
+                        break
+                    end
+                end
+            end
+            if index and text then digits[index] = text end
+        end
+    end
+
+    local out = {}
+    for index = 1, 4 do out[index] = digits[index] or "?" end
+    return table.concat(out, " ")
+end
+
+local function readDigitFrom(part)
+    local surface = part:FindFirstChildOfClass("SurfaceGui")
+    if not surface then return "?" end
+    for _, descendant in ipairs(surface:GetDescendants()) do
+        if descendant:IsA("TextLabel") and descendant.Text ~= "" then
+            return descendant.Text
+        end
+    end
+    return "?"
+end
+
+local function updateCodeLabels()
+    if not CFG.showCode then
+        dropByTag("code")
+        return
+    end
+
+    local root = stillWater()
+    local room = root and root:FindFirstChild("Room9_LockedExit")
+    local gen = room and room:FindFirstChild("Gen")
+    if not gen then return end
+
+    for _, part in ipairs(gen:GetChildren()) do
+        if part:IsA("BasePart") and part.Name == "CodeNumber" then
+            if inRange(part.Position) then
+                local entry = getVisual(part)
+                entry.tag = "code"
+                entry.part = part
+
+                if CFG.labels then
+                    if not entry.bb then
+                        entry.bb, entry.label = makeBillboard(part, 2.2, UDim2.fromOffset(90, 90))
+                        if entry.label then entry.label.TextStrokeTransparency = 0.1 end
+                    end
+                    entry.bb.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
+                    entry.label.Text = string.format(
+                        '#%s\n<font color="rgb(255,255,255)">%s</font>',
+                        tostring(part:GetAttribute("CodeIndex") or "?"), readDigitFrom(part))
+                elseif entry.bb then
+                    entry.bb:Destroy(); entry.bb = nil; entry.label = nil
+                end
+
+                styleHighlight(entry, Color3.fromRGB(120, 255, 255))
+            else
+                local entry = visuals[part]
+                if entry and entry.tag == "code" then dropVisual(part) end
+            end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  6. Room 7 — record the order in which the memory tiles light up
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Tiles carry MemTile = true and a stable MemId. We watch colour, material,
+-- transparency and reflectance; a tile counts as lit when it becomes clearly
+-- brighter or more solid. Heuristic — the numbers are a fallback either way.
+local memory = {
+    baseline = {},
+    active = {},
+    sequence = {},
+    lastAt = 0,
+    finished = nil,
+}
+
+local function memoryTiles()
+    local root = stillWater()
+    local room = root and root:FindFirstChild("Room7_MemoryBridge")
+    local gen = room and room:FindFirstChild("Gen")
+    local list = {}
+    if gen then
+        for _, part in ipairs(gen:GetChildren()) do
+            if part:IsA("BasePart") and part:GetAttribute("MemTile") == true then
+                table.insert(list, part)
+            end
+        end
+    end
+    return list
+end
+
+local function luma(color)
+    return 0.299 * color.R + 0.587 * color.G + 0.114 * color.B
+end
+
+local function tileSignature(part)
+    return table.concat({
+        tostring(part.Color), tostring(part.Material),
+        tostring(part.Transparency), tostring(part.Reflectance),
+    }, "|")
+end
+
+local function memoryStep()
+    local tiles = memoryTiles()
+    if #tiles == 0 then
+        memory.active = {}
+        return
+    end
+
+    local now = os.clock()
+
+    for _, part in ipairs(tiles) do
+        local signature = tileSignature(part)
+        local previous = memory.baseline[part]
+
+        if previous == nil then
+            memory.baseline[part] = signature
+        elseif previous ~= signature then
+            local lit = (not memory.active[part]) and (
+                part.Transparency < 0.5
+                or luma(part.Color) > 0.55
+                or part.Material == Enum.Material.Neon
+            )
+
+            if lit then
+                memory.active[part] = true
+                memory.lastAt = now
+                local id = part:GetAttribute("MemId")
+                if id and not table.find(memory.sequence, id) then
+                    table.insert(memory.sequence, id)
+                end
+            elseif memory.active[part] and part.Transparency >= 0.5 and luma(part.Color) < 0.4 then
+                memory.active[part] = nil
+            end
+            memory.baseline[part] = signature
+        end
+    end
+
+    -- A pause longer than 3 s means the flash is over: freeze the sequence.
+    if #memory.sequence > 0 and (now - memory.lastAt) > 3 then
+        memory.finished = table.concat(memory.sequence, " → ")
+        memory.sequence = {}
+    end
+end
+
+local function memoryText()
+    if #memory.sequence > 0 then
+        local parts = {}
+        for _, id in ipairs(memory.sequence) do parts[#parts + 1] = tostring(id) end
+        return table.concat(parts, " → ")
+    end
+    return memory.finished or "<Muted>waiting for the flash…</Muted>"
+end
+
+local function updateMemoryVisuals()
+    if not CFG.showMemoryNumbers then
+        dropByTag("memory")
+        return
+    end
+
+    for _, part in ipairs(memoryTiles()) do
+        if inRange(part.Position) then
+            local entry = getVisual(part)
+            entry.tag = "memory"
+            entry.part = part
+
+            if CFG.labels then
+                if not entry.bb then
+                    entry.bb, entry.label = makeBillboard(part, 2, UDim2.fromOffset(70, 40))
+                    if entry.label then entry.label.TextColor3 = Color3.fromRGB(210, 150, 255) end
+                end
+                local order = table.find(memory.sequence, part:GetAttribute("MemId"))
+                entry.label.Text = order
+                    and ('<font color="rgb(120,255,140)">' .. order .. "</font>")
+                    or tostring(part:GetAttribute("MemId") or "")
+            elseif entry.bb then
+                entry.bb:Destroy(); entry.bb = nil; entry.label = nil
+            end
+
+            local color = memory.active[part]
+                and Color3.fromRGB(120, 255, 140)
+                or Color3.fromRGB(210, 150, 255)
+            styleHighlight(entry, color)
+        else
+            local entry = visuals[part]
+            if entry and entry.tag == "memory" then dropVisual(part) end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  7. Danger awareness: nearest Listener, alarm flash, beep
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local alarmGui, alarmFrame
+local beep
+
+local function ensureAlarmGui()
+    if alarmGui and alarmGui.Parent then return end
+    local parent = playerGui()
+    if not parent then return end
+
+    alarmGui = Instance.new("ScreenGui")
+    alarmGui.Name = "SWHubAlarm"
+    alarmGui.IgnoreGuiInset = true
+    alarmGui.ResetOnSpawn = false
+    alarmGui.DisplayOrder = 999
+    alarmGui.Parent = parent
+
+    alarmFrame = Instance.new("Frame")
+    alarmFrame.Size = UDim2.fromScale(1, 1)
+    alarmFrame.BackgroundColor3 = Color3.fromRGB(255, 30, 30)
+    alarmFrame.BackgroundTransparency = 1
+    alarmFrame.BorderSizePixel = 0
+    alarmFrame.Parent = alarmGui
+end
+
+local function flashAlarm()
+    if not CFG.alarmFlash then return end
+    ensureAlarmGui()
+    if not alarmFrame then return end
+    alarmFrame.BackgroundTransparency = 0.55
+    TweenService:Create(alarmFrame, TweenInfo.new(0.55, Enum.EasingStyle.Quad), {
+        BackgroundTransparency = 1,
+    }):Play()
+end
+
+-- Reuses one of the game's own sound assets, so no external asset id is needed.
+local function playBeep()
+    if beep and beep.Parent then
+        beep:Play()
+        return
+    end
+
+    local ok, sounds = pcall(function()
+        return require(ReplicatedStorage.Config.Sounds)
+    end)
+    if not ok or type(sounds) ~= "table" then return end
+
+    local soundId
+    for _, key in ipairs({ "ERROR", "ROOMTONE", "CLICK" }) do
+        local value = sounds[key]
+        if type(value) == "string" then
+            soundId = value
+        elseif type(value) == "number" then
+            soundId = "rbxassetid://" .. tostring(value)
+        elseif type(value) == "table" then
+            local id = value.Id or value.SoundId or value.id
+            if type(id) == "string" then
+                soundId = id
+            elseif type(id) == "number" then
+                soundId = "rbxassetid://" .. tostring(id)
+            end
+        end
+        if soundId then break end
+    end
+    if not soundId then return end
+    if not soundId:match("^rbxassetid://") and not soundId:match("^rbxasset") then
+        soundId = "rbxassetid://" .. soundId
+    end
+
+    beep = Instance.new("Sound")
+    beep.SoundId = soundId
+    beep.Volume = 0.35
+    beep.PlaybackSpeed = 1.6
+    beep.Parent = SoundService
+end
+
+local nearest = { part = nil, distance = math.huge, state = nil, room = nil }
+
+local function updateNearest()
+    local best, bestDistance = nil, math.huge
+    for _, part in ipairs(listeners()) do
+        local distance = distanceTo(part.Position)
+        if distance < bestDistance then
+            best, bestDistance = part, distance
+        end
+    end
+    nearest = {
+        part = best,
+        distance = bestDistance,
+        state = best and tostring(best:GetAttribute("State") or "?") or nil,
+        room = best and tostring(best:GetAttribute("Room") or "?") or nil,
+    }
+    return nearest
+end
+
+local lastAlarmAt = 0
+
+local function dangerStep()
+    local current = updateNearest()
+    local aggressive = current.state ~= nil and current.state ~= "Patrol"
+
+    if CFG.alarmEnabled and current.part then
+        if current.distance <= CFG.alarmDistance or aggressive then
+            local now = os.clock()
+            local interval = aggressive and 0.8 or 1.6
+            if now - lastAlarmAt > interval then
+                lastAlarmAt = now
+                flashAlarm()
+                playBeep()
+            end
+        end
+    end
+end
+
+-- "It is hunting me": an aggressive state whose destination is close to us.
+-- This fires before you can possibly see it.
+local function huntingMe()
+    local root = rootPart()
+    if not root then return false end
+    for _, part in ipairs(listeners()) do
+        local state = tostring(part:GetAttribute("State") or "")
+        if state == "Chase" or state == "Hunt" or state == "Attack" then
+            local target = part:GetAttribute("Target")
+            if typeof(target) == "Vector3" and (target - root.Position).Magnitude < 70 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  8. Speed boost — the only movement feature
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Rules that keep it from tripping a movement check:
+--   • exactly one constraint, always reused, cleaned on spawn and on unload
+--   • ramps from the current speed instead of jumping to the target
+--   • pushes on the horizontal axes only, so gravity and jumps are untouched
+--   • never in water; airborne is fine, that is when you jump between platforms
+--   • capped, and always horizontal (gravity keeps working normally)
+
+local BOOST_NAME = "SWHubBoostVelocity"
+local BOOST_RAMP = 10         -- higher = snappier ramp, lower = smoother
+local boost = { constraint = nil, attachment = nil, current = 0 }
+
+local function purgeBoostParts(model)
+    if not model then return end
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant.Name == BOOST_NAME then descendant:Destroy() end
+    end
+end
+
+local boostFailureAt = 0
+
+local function ensureBoostConstraint()
+    local root = rootPart()
+    if not root then return nil end
+
+    if boost.constraint and boost.constraint.Parent == root
+        and boost.attachment and boost.attachment.Parent == root then
+        return boost.constraint
+    end
+
+    -- Do not spin if the engine ever refuses to build the constraint.
+    if os.clock() - boostFailureAt < 2 then return nil end
+
+    -- Stale objects from an older character or an older run of this script.
+    purgeBoostParts(root)
+    boost.constraint = nil
+    boost.attachment = nil
+
+    local ok, constraint = pcall(function()
+        local attachment = Instance.new("Attachment")
+        attachment.Name = BOOST_NAME
+        attachment.Parent = root
+
+        local velocity = Instance.new("LinearVelocity")
+        velocity.Name = BOOST_NAME
+        velocity.Attachment0 = attachment
+        velocity.MaxForce = 1e5
+        velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+        -- Plane mode drives velocity only inside the X/Z plane. Y is left alone,
+        -- so gravity and jump height stay exactly as the game intends.
+        velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+        velocity.PrimaryTangentAxis = Vector3.new(1, 0, 0)
+        velocity.SecondaryTangentAxis = Vector3.new(0, 0, 1)
+        velocity.PlaneVelocity = Vector2.zero
+        velocity.Enabled = false
+        velocity.Parent = root
+        return velocity
+    end)
+
+    if not ok or not constraint then
+        boostFailureAt = os.clock()
+        purgeBoostParts(root)
+        boost.constraint = nil
+        boost.attachment = nil
+        return nil
+    end
+
+    boost.attachment = constraint.Attachment0
+    boost.constraint = constraint
+    boost.current = 0
+    return constraint
+end
+
+local function releaseBoost(constraint, root)
+    boost.current = 0
+    if constraint then
+        constraint.Enabled = false
+        constraint.VectorVelocity = Vector3.zero
+    end
+    boost.constraint = nil
+    boost.attachment = nil
+    purgeBoostParts(root)
+end
+
+local function onSolidGround()
+    local hum = humanoid()
+    if not hum then return false end
+    return hum.FloorMaterial ~= Enum.Material.Air
+end
+
+local function inWater()
+    return LocalPlayer:GetAttribute("InWater") == true
+end
+
+local function boostStep(deltaTime)
+    local root = rootPart()
+    local hum = humanoid()
+
+    if not root or not hum then
+        boost.constraint = nil
+        boost.attachment = nil
+        boost.current = 0
+        return
+    end
+
+    if not CFG.speedEnabled then
+        if boost.constraint then releaseBoost(boost.constraint, root) end
+        return
+    end
+
+    local constraint = ensureBoostConstraint()
+    if not constraint then return end
+
+    local move = hum.MoveDirection
+    local walking = move.Magnitude > 0.05
+    -- Airborne is allowed: only X and Z are constrained, so a jump keeps its
+    -- own vertical velocity and the boost simply carries it forward.
+    local allowed = walking and not inWater()
+
+    local target = 0
+    if allowed then
+        target = math.clamp(CFG.speedValue, SPEED_MIN, SPEED_MAX)
+    end
+
+    -- Exponential ramp: no instant 0 → 40 spike for the server to notice.
+    local alpha = 1 - math.exp(-BOOST_RAMP * deltaTime)
+    boost.current = boost.current + (target - boost.current) * alpha
+    if boost.current < 0.3 and target == 0 then
+        boost.current = 0
+    end
+
+    if boost.current > 0.3 and walking then
+        local direction = Vector3.new(move.X, 0, move.Z)
+        if direction.Magnitude > 0 then direction = direction.Unit end
+        -- Only the planar part is driven; whatever the character is doing on Y
+        -- (jumping, falling, walking on flat ground) is untouched.
+        constraint.PlaneVelocity = Vector2.new(
+            direction.X * boost.current,
+            direction.Z * boost.current
+        )
+        constraint.Enabled = true
+    else
+        constraint.Enabled = false
+        constraint.PlaneVelocity = Vector2.zero
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  9. UI
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- The library draws into gethui() when the executor has one; clean leftovers
+-- from a previous run so windows never stack up.
+local function uiParent()
+    local ok, hidden = pcall(function()
+        return gethui and gethui()
+    end)
+    if ok and hidden then return hidden end
+    return LocalPlayer:FindFirstChildOfClass("PlayerGui") or game:GetService("CoreGui")
+end
+
+do
+    for _, gui in ipairs(uiParent():GetChildren()) do
+        if gui:IsA("ScreenGui") and (gui.Name == "Still Water Hub" or gui.Name == "SWHubAlarm") then
+            gui:Destroy()
+        end
+    end
+end
+
+local Window = Airflow:CreateWindow({
+    Name = "Still Water Hub",
+    LoadingSubtitle = "ESP · radar · puzzle solvers",
+    ToggleUIKeybind = "RightControl",
+    ConfigurationSaving = { Enabled = true, FolderName = "StillWaterHub" },
+    Home = false,
+})
+
+local EspTab      = Window:CreateTab({ Name = "ESP",       Icon = "eye" })
+local ListenerTab = Window:CreateTab({ Name = "Listener",  Icon = "ear" })
+local PuzzleTab   = Window:CreateTab({ Name = "Puzzles",   Icon = "puzzle" })
+local MoveTab     = Window:CreateTab({ Name = "Movement",  Icon = "move" })
+local InfoTab     = Window:CreateTab({ Name = "Game Info", Icon = "book-open" })
+local SettingsTab = Window:CreateTab({ Name = "Settings",  Icon = "settings" })
+
+-- ── ESP: what is drawn ──────────────────────────────────────────────────────
+
+local targetsGroup = EspTab:CreateGroupbox({ Name = "What to show", Side = "Left" })
+local styleGroup   = EspTab:CreateGroupbox({ Name = "How to show it", Side = "Right" })
+
+targetsGroup:CreateToggle({
+    Name = "Listener",
+    Desc = "The monster, one per room",
+    Flag = "ShowListener",
+    CurrentValue = true,
+    Callback = function(on) CFG.showListener = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Teammates",
+    Desc = "Other players through walls",
+    Flag = "ShowTeammates",
+    CurrentValue = false,
+    Callback = function(on) CFG.showTeammates = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Pebble piles",
+    Desc = "Pickups you can refill from",
+    Flag = "ShowPickups",
+    CurrentValue = false,
+    Callback = function(on) CFG.showPickups = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Platforms",
+    Desc = "Every jumpable part in every room",
+    Flag = "ShowPlatforms",
+    CurrentValue = false,
+    Callback = function(on) CFG.showPlatforms = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Safe platforms only",
+    Desc = "Room 3 safe platforms and room 7 memory tiles",
+    Flag = "PlatformSafeOnly",
+    CurrentValue = false,
+    Callback = function(on) CFG.platformSafeOnly = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Checkpoints and final door",
+    Desc = "All 8 checkpoints, the room 9 exit, the way back",
+    Flag = "ShowExits",
+    CurrentValue = false,
+    Callback = function(on) CFG.showExits = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Door code digits",
+    Desc = "The numbers on the room 9 pillars",
+    Flag = "ShowCode",
+    CurrentValue = true,
+    Callback = function(on) CFG.showCode = on end,
+})
+
+targetsGroup:CreateToggle({
+    Name = "Memory tile numbers",
+    Desc = "Room 7 tile ids",
+    Flag = "ShowMemoryNumbers",
+    CurrentValue = false,
+    Callback = function(on) CFG.showMemoryNumbers = on end,
+})
+
+styleGroup:CreateToggle({
+    Name = "Highlights",
+    Desc = "The through-wall outline itself",
+    Flag = "Highlights",
+    CurrentValue = true,
+    Callback = function(on)
+        CFG.highlights = on
+        if not on then
+            for _, entry in pairs(visuals) do
+                if entry.hl then entry.hl:Destroy(); entry.hl = nil end
+            end
+        end
+    end,
+})
+
+styleGroup:CreateToggle({
+    Name = "Labels",
+    Desc = "The floating text above objects",
+    Flag = "Labels",
+    CurrentValue = true,
+    Callback = function(on)
+        CFG.labels = on
+        if not on then
+            for _, entry in pairs(visuals) do
+                if entry.bb then entry.bb:Destroy(); entry.bb = nil; entry.label = nil end
+            end
+        end
+    end,
+})
+
+styleGroup:CreateToggle({
+    Name = "Distance in labels",
+    Desc = "Show studs next to the Listener state",
+    Flag = "LabelDistance",
+    CurrentValue = true,
+    Callback = function(on) CFG.labelDistance = on end,
+})
+
+styleGroup:CreateToggle({
+    Name = "Listener destination marker",
+    Desc = "A sphere where it is heading right now",
+    Flag = "ListenerTarget",
+    CurrentValue = false,
+    Callback = function(on) CFG.listenerTarget = on end,
+})
+
+styleGroup:CreateSlider({
+    Name = "Max distance",
+    Desc = "0 means no limit",
+    Range = { 0, 500 },
+    Increment = 10,
+    CurrentValue = 0,
+    Suffix = " studs",
+    Flag = "MaxDistance",
+    Callback = function(value) CFG.maxDistance = value end,
+})
+
+styleGroup:CreateSlider({
+    Name = "Fill opacity",
+    Range = { 0, 80 },
+    Increment = 5,
+    CurrentValue = 55,
+    Suffix = "%",
+    Flag = "FillOpacity",
+    Callback = function(value) CFG.fillOpacity = 1 - (value / 100) end,
+})
+
+styleGroup:CreateButton({
+    Name = "Clear all ESP",
+    Callback = function()
+        for part in pairs(visuals) do dropVisual(part) end
+        CFG.showListener = false
+        CFG.showTeammates = false
+        CFG.showPickups = false
+        CFG.showPlatforms = false
+        CFG.showExits = false
+        CFG.showCode = false
+        CFG.showMemoryNumbers = false
+        Window:Notify({ Title = "ESP cleared", Duration = 3 })
+    end,
+})
+
+-- ── Listener radar ──────────────────────────────────────────────────────────
+
+local radarGroup = ListenerTab:CreateGroupbox({ Name = "Radar", Side = "Left" })
+local roomsGroup = ListenerTab:CreateGroupbox({ Name = "Rooms by threat", Side = "Right" })
+
+radarGroup:CreateStatus({
+    Name = "Nearest Listener",
+    Style = "Row",
+    Pin = true,
+    Update = function()
+        local current = updateNearest()
+        if not current.part then return "<Muted>no data</Muted>" end
+        local color = stateColor(current.state)
+        local red   = math.floor(color.R * 255)
+        local green = math.floor(color.G * 255)
+        local blue  = math.floor(color.B * 255)
+        local close = current.distance < 25 and " <Error>CLOSE</Error>" or ""
+        return string.format('%s · <font color="rgb(%d,%d,%d)">%d studs</font>%s',
+            current.state, red, green, blue, current.distance, close)
+    end,
+})
+
+radarGroup:CreateStatus({
+    Name = "Hunting me",
+    Style = "Row",
+    Update = function()
+        return huntingMe() and "<Error>YES</Error>" or "<Success>no</Success>"
+    end,
+})
+
+radarGroup:CreateToggle({
+    Name = "Proximity alarm",
+    Desc = "Screen flash and a beep when it gets close",
+    Flag = "AlarmEnabled",
+    CurrentValue = false,
+    Callback = function(on) CFG.alarmEnabled = on end,
+})
+
+radarGroup:CreateSlider({
+    Name = "Alarm distance",
+    Range = { 15, 200 },
+    Increment = 5,
+    CurrentValue = 60,
+    Suffix = " studs",
+    Flag = "AlarmDistance",
+    Callback = function(value) CFG.alarmDistance = value end,
+})
+
+radarGroup:CreateToggle({
+    Name = "Red screen flash",
+    Flag = "AlarmFlash",
+    CurrentValue = false,
+    Callback = function(on) CFG.alarmFlash = on end,
+})
+
+roomsGroup:CreateStatusList({
+    Rows = 9,
+    MaxRows = 9,
+    Update = function()
+        local rows = {}
+        local list = listeners()
+        table.sort(list, function(a, b)
+            return (a:GetAttribute("Room") or 0) < (b:GetAttribute("Room") or 0)
+        end)
+        for _, part in ipairs(list) do
+            local room = tostring(part:GetAttribute("Room") or "?")
+            local state = tostring(part:GetAttribute("State") or "?")
+            local color = stateColor(state)
+            local red   = math.floor(color.R * 255)
+            local green = math.floor(color.G * 255)
+            local blue  = math.floor(color.B * 255)
+            table.insert(rows, {
+                Text = "Room " .. room,
+                Value = string.format('<font color="rgb(%d,%d,%d)">%s</font> · %d studs',
+                    red, green, blue, state, distanceTo(part.Position)),
+                Tone = state == "Patrol" and "Muted" or "Error",
+            })
+        end
+        return rows
+    end,
+})
+
+-- ── Puzzles ─────────────────────────────────────────────────────────────────
+
+local codeGroup   = PuzzleTab:CreateGroupbox({ Name = "Door code (room 9)", Side = "Left" })
+local memoryGroup = PuzzleTab:CreateGroupbox({ Name = "Memory bridge (room 7)", Side = "Right" })
+
+codeGroup:CreateLabel({
+    Text = "<Muted>waiting for the pillars…</Muted>",
+    Update = function()
+        local code = readDoorCode()
+        if not code then return "<Muted>this room is not in the world</Muted>" end
+        if code == "? ? ? ?" then return "<Muted>digits not drawn yet</Muted>" end
+        return "<Accent>CODE: " .. code .. "</Accent>"
+    end,
+})
+
+codeGroup:CreateButton({
+    Name = "Copy code",
+    Icon = "copy",
+    Callback = function()
+        local code = readDoorCode()
+        if not code or code == "? ? ? ?" then
+            Window:Notify({
+                Title = "Code is not known yet",
+                Content = "Walk up to the room 9 pillars first",
+                Type = "Warning",
+                Duration = 4,
+            })
+            return
+        end
+        local ok = pcall(function() Window:CopyToClipboard(code) end)
+        if not ok then pcall(function() setclipboard(code) end) end
+        Window:Notify({ Title = "Door code", Content = code, Type = "Success", Duration = 5 })
+    end,
+})
+
+codeGroup:CreateParagraph({
+    Title = "How it works",
+    Content = "The server places four CodeNumber parts in the room, each with a CodeIndex tag and a "
+        .. "SurfaceGui holding one digit. The script reads those digits straight from the world, so "
+        .. "the camera puzzle can be skipped entirely.",
+})
+
+memoryGroup:CreateLabel({
+    Text = "<Muted>waiting for the flash…</Muted>",
+    Update = function() return memoryText() end,
+})
+
+memoryGroup:CreateButton({
+    Name = "Reset recording",
+    Callback = function()
+        memory.sequence = {}
+        memory.finished = nil
+        memory.baseline = {}
+        memory.active = {}
+        Window:Notify({ Title = "Recording cleared", Duration = 3 })
+    end,
+})
+
+memoryGroup:CreateParagraph({
+    Title = "How it works",
+    Content = "The MemTile tiles in room 7 light up one after another. The script watches their colour, "
+        .. "material and transparency and records the order. If nothing is recorded, turn on "
+        .. "\"Memory tile numbers\" and read the ids by eye.",
+})
+
+-- ── Movement: speed boost only ──────────────────────────────────────────────
+
+local boostGroup = MoveTab:CreateGroupbox({ Name = "Speed boost", Side = "Left" })
+
+boostGroup:CreateToggle({
+    Name = "Speed boost",
+    Desc = "Horizontal only: jumping works normally while it is on",
+    Flag = "SpeedEnabled",
+    CurrentValue = false,
+    Callback = function(on) CFG.speedEnabled = on end,
+})
+
+boostGroup:CreateSlider({
+    Name = "Speed",
+    Range = { SPEED_MIN, SPEED_MAX },
+    Increment = 1,
+    CurrentValue = 30,
+    Suffix = " studs/s",
+    Flag = "SpeedValue",
+    Callback = function(value) CFG.speedValue = value end,
+})
+
+boostGroup:CreateStatus({
+    Name = "Current speed",
+    Style = "Row",
+    Update = function()
+        if not CFG.speedEnabled then return "<Muted>off</Muted>" end
+        if inWater() then return "<Warning>paused: in water</Warning>" end
+        local suffix = onSolidGround() and "" or " · airborne"
+        return string.format("%.0f studs/s%s", boost.current, suffix)
+    end,
+})
+
+boostGroup:CreateParagraph({
+    Title = "How it works, and why it is capped",
+    Content = "The game rewrites Humanoid.WalkSpeed every frame, so the boost is a LinearVelocity "
+        .. "constraint instead. It ramps over about a third of a second, applies only to the direction "
+        .. "you already walk, and pushes on the horizontal axes only — gravity and jumps are left "
+        .. "alone, so you keep full jump height while it is running. The slider stops at 40 on purpose: "
+        .. "a raw jump to a high velocity is exactly what a server-side movement check looks for.",
+})
+
+boostGroup:CreateParagraph({
+    Title = "If the position gets corrected",
+    Content = "That is the server's movement check. Lower the speed, keep the boost off while "
+        .. "swimming and jumping, and do not stack it with anything else that moves you.",
+})
+
+-- ── Game info ───────────────────────────────────────────────────────────────
+
+local aboutGroup    = InfoTab:CreateGroupbox({ Name = "About this game", Side = "Left" })
+local mechanicGroup = InfoTab:CreateGroupbox({ Name = "Mechanics", Side = "Right" })
+
+aboutGroup:CreateParagraph({
+    Title = "Still Water — a co-op horror run through flooded poolrooms",
+    Content = "Nine obstacle rooms joined by corridors with checkpoints. Each room holds one Listener: "
+        .. "it cannot see you, it hears you — footsteps in water and splashes. You cannot outrun it "
+        .. "(patrol 16, chase 120, your walk 22), so the game is about staying quiet.",
+})
+
+aboutGroup:CreateStatusList({
+    Rows = 9,
+    MaxRows = 9,
+    Update = function()
+        local rows = {}
+        local here = currentRoomIndex()
+        for roomIndex = 1, 9 do
+            local room = GAME.rooms[roomIndex]
+            table.insert(rows, {
+                Text = (roomIndex == here and "<Accent>▶ " or "   ") .. roomIndex .. ". " .. room.name,
+                Value = "",
+                Tone = (roomIndex == here) and "Accent" or "Muted",
+            })
+        end
+        return rows
+    end,
+})
+
+aboutGroup:CreateStatus({
+    Name = "Current room",
+    Style = "Row",
+    Update = function()
+        local index = currentRoomIndex()
+        if index == 0 then return "Lobby" end
+        local room = GAME.rooms[index]
+        return index .. ". " .. (room and room.name or "?")
+    end,
+})
+
+mechanicGroup:CreateParagraph({
+    Title = "Rewards",
+    Content = "20–70 coins per room (room 1 to room 9), +100 for escaping, +30 for a clean run, "
+        .. "+10 per rescue (capped at 20). Mode multiplier: STARTER x0.5, EASY x1, HARD x1.5.",
+})
+
+mechanicGroup:CreateParagraph({
+    Title = "Equipment",
+    Content = "Pebble is free, Bottle 150, Toy 300, Flare 450, Rescue Rope 250. A flare stuns it for "
+        .. "5 seconds, then it is immune for 8.",
+})
+
+mechanicGroup:CreateParagraph({
+    Title = "Upgrades",
+    Content = "Range, Skip, Battery, FlareRadius, RopeReach, RescueSpeed — 150, 400 and 900 coins per level.",
+})
+
+-- ── Settings ────────────────────────────────────────────────────────────────
+
+SettingsTab:CreateConfigManager({ Side = "Left" })
+SettingsTab:CreateThemeManager({ Side = "Right" })
+
+local sessionGroup = SettingsTab:CreateGroupbox({ Name = "Session", Side = "Left" })
+local miscGroup    = SettingsTab:CreateGroupbox({ Name = "Misc", Side = "Right" })
+
+sessionGroup:CreateStatus({
+    Name = "Run mode",
+    Style = "Row",
+    Pin = true,
+    Update = function()
+        local root = stillWater()
+        local mode = root and tostring(root:GetAttribute("Mode") or "—") or "—"
+        local data = GAME.modes[mode]
+        return data and string.format("%s x%.1f", mode, data.mult) or mode
+    end,
+})
+
+sessionGroup:CreateStatus({
+    Name = "Run timer",
+    Style = "Row",
+    Update = function()
+        return guiText("StillWaterUI", "ClientHUD", "Timer") or "—"
+    end,
+})
+
+sessionGroup:CreateStatus({
+    Name = "Coins this run",
+    Style = "Row",
+    Update = function()
+        return guiText("StillWaterRunUI", "RunUI", "Coins", "Amount") or "—"
+    end,
+})
+
+sessionGroup:CreateStatusList({
+    Rows = 4,
+    MaxRows = 6,
+    Update = function()
+        local gui = playerGui() and playerGui():FindFirstChild("StillWaterRunUI")
+        local runGui = gui and gui:FindFirstChild("RunUI")
+        local hotbar = runGui and runGui:FindFirstChild("Hotbar")
+        if not hotbar then return { "<Muted>hotbar not available</Muted>" } end
+
+        local rows = {}
+        for _, slot in ipairs(hotbar:GetChildren()) do
+            if slot:IsA("TextButton") then
+                local count = slot:FindFirstChild("Count")
+                local tag = slot:FindFirstChild("Tag")
+                local used = slot:FindFirstChild("Used")
+                local label = (tag and tag.Text ~= "" and tag.Text) or slot.Name
+                local amount = count and count.Text or "0"
+                local spent = (used and used.Text == "USED") and " <Muted>(used)</Muted>" or ""
+                table.insert(rows, string.format("%s x %s%s", label, amount, spent))
+            end
+        end
+        if #rows == 0 then rows[1] = "<Muted>empty</Muted>" end
+        return rows
+    end,
+})
+
+miscGroup:CreateButton({
+    Name = "Rejoin this server",
+    Style = "Danger",
+    Confirm = true,
+    Callback = function()
+        local ok = pcall(function() Window:Rejoin() end)
+        if not ok then
+            pcall(function()
+                game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            end)
+        end
+    end,
+})
+
+miscGroup:CreateButton({
+    Name = "Reset all ESP settings",
+    Callback = function()
+        CFG.showListener = true
+        CFG.showTeammates = false
+        CFG.showPickups = false
+        CFG.showPlatforms = false
+        CFG.platformSafeOnly = false
+        CFG.showExits = false
+        CFG.showCode = true
+        CFG.showMemoryNumbers = false
+        CFG.highlights = true
+        CFG.labels = true
+        CFG.labelDistance = true
+        CFG.listenerTarget = false
+        CFG.maxDistance = 0
+        CFG.fillOpacity = 0.55
+        Window:Notify({ Title = "ESP settings reset", Duration = 3 })
+    end,
+})
+
+Window:LoadAutoload()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 10. Loops
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local lastFrameAt = os.clock()
+
+keep(RunService.RenderStepped:Connect(function()
+    local now = os.clock()
+    local deltaTime = math.clamp(now - lastFrameAt, 0.001, 0.2)
+    lastFrameAt = now
+    boostStep(deltaTime)
+end))
+
+keep(RunService.Heartbeat:Connect(function()
+    dangerStep()
+end))
+
+task.spawn(function()
+    local frame = 0
+    while not STOPPED do
+        task.wait(0.1)
+        frame = frame + 1
+
+        pcall(pruneVisuals)
+        pcall(updateListenerVisuals)
+
+        -- Expensive passes run less often: platform ESP touches hundreds of parts.
+        if frame % 10 == 0 then
+            pcall(updatePlatformVisuals)
+            pcall(updateCodeLabels)
+            pcall(updateMemoryVisuals)
+        end
+        if frame % 3 == 0 then
+            pcall(updatePickupVisuals)
+            pcall(updatePlayerVisuals)
+            pcall(updateExitVisuals)
+        end
+
+        pcall(memoryStep)
+    end
+end)
+
+keep(LocalPlayer.CharacterAdded:Connect(function(model)
+    task.wait(1)
+    purgeBoostParts(model)
+    boost.constraint = nil
+    boost.attachment = nil
+    boost.current = 0
+end))
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 11. Public API
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local api = {
+    cfg = CFG,
+    window = Window,
+
+    -- { part, distance, state, room } for the closest Listener
+    listener = function() return updateNearest() end,
+
+    -- "2 8 8 9", or nil when room 9 is not loaded
+    code = function() return readDoorCode() end,
+
+    -- last recorded memory-bridge sequence
+    memory = function() return memoryText() end,
+
+    -- current boost output in studs/s (0 when paused)
+    boostSpeed = function() return boost.current end,
+
+    clearEsp = function()
+        for part in pairs(visuals) do dropVisual(part) end
+    end,
+
+    unload = function()
+        stopAll()
+        for part, entry in pairs(visuals) do
+            if entry.marker then pcall(function() entry.marker:Destroy() end) end
+            dropVisual(part)
+        end
+        purgeBoostParts(rootPart())
+        boost.constraint = nil
+        boost.attachment = nil
+        boost.current = 0
+        pcall(function() Window:Destroy() end)
+        if alarmGui then pcall(function() alarmGui:Destroy() end) end
+        if getgenv then getgenv().StillWaterHub = nil end
+    end,
+}
+
+if getgenv then getgenv().StillWaterHub = api end
+
+Window:Notify({
+    Title = "Still Water Hub loaded",
+    Content = "RightControl opens the window. ESP is already on.",
+    Type = "Success",
+    Duration = 6,
+})
+
+return api
