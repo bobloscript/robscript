@@ -1,5 +1,5 @@
 --[[
-    ── Still Water Hub ──────────────────────────────────────────────────────────
+    ── Robscript.com ────────────────────────────────────────────────────────────
     Game:   Still Water  (placeId 139386728420706, group 1065149497)
     Loader: Potassium, or any executor with loadstring + game:HttpGet
     UI:     Airflow (OuroFlow) — the library kept in the Obsidian vault
@@ -60,7 +60,7 @@ for _, url in ipairs(AIRFLOW_URLS) do
 end
 
 if not Airflow then
-    error("[StillWaterHub] could not load Airflow (the full Robly_Airflow branch is required)")
+    error("[Robscript.com] could not load Airflow (the full Robly_Airflow branch is required)")
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -206,11 +206,13 @@ local CFG = {
 
     -- HOW it is drawn
     highlights          = true,
+    boxes               = true,   -- BoxHandleAdornment for bulk geometry
     labels              = true,
     labelDistance       = true,
     listenerTarget      = false,
     maxDistance         = 0,      -- 0 = draw at any distance
     fillOpacity         = 0.55,   -- Highlight.FillTransparency
+    boxOpacity          = 0.6,    -- BoxHandleAdornment.Transparency
 
     -- danger awareness (off by default: the radar statuses are enough)
     alarmEnabled        = false,
@@ -246,7 +248,7 @@ end
 -- Reloading shuts the previous instance down first, so no duplicate loops,
 -- duplicate highlights, and above all no duplicate velocity constraints.
 do
-    local previous = getgenv and getgenv().StillWaterHub
+    local previous = getgenv and (getgenv().Robscript or getgenv().StillWaterHub)
     if previous and previous.unload then
         pcall(previous.unload)
     end
@@ -256,9 +258,30 @@ end
 --  4. ESP engine
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- visuals[part] = { hl = Highlight, bb = BillboardGui, label = TextLabel,
---                   marker = Part, tag = "listener" | "platform" | ... }
+-- visuals[part] = { hl = Highlight, box = BoxHandleAdornment, bb = BillboardGui,
+--                   label = TextLabel, marker = Part, tag = "listener" | ... }
 local visuals = {}
+
+-- The engine only renders 255 Highlight instances at once and silently drops
+-- the rest, so a map with 650 platforms cannot be drawn with highlights. Bulk
+-- geometry uses BoxHandleAdornment instead, and Highlights are reserved for the
+-- few things that must read at a glance: the Listener, teammates, doors, code.
+local HIGHLIGHT_BUDGET = 240
+local highlightCount = 0
+local MARKS_NAME = "RobscriptMarks"
+local marksFolder
+
+local function marks()
+    if marksFolder and marksFolder.Parent then return marksFolder end
+    local existing = workspace:FindFirstChild(MARKS_NAME)
+    if not existing then
+        existing = Instance.new("Folder")
+        existing.Name = MARKS_NAME
+        existing.Parent = workspace
+    end
+    marksFolder = existing
+    return marksFolder
+end
 
 -- Distance gate used by every ESP pass. 0 means "no limit".
 local function inRange(position)
@@ -267,27 +290,58 @@ local function inRange(position)
 end
 
 local function makeHighlight(part, color)
+    if highlightCount >= HIGHLIGHT_BUDGET then return nil end
     local highlight = Instance.new("Highlight")
+    highlight.Name = "RobscriptHighlight"
     highlight.Adornee = part
     highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     highlight.FillColor = color
     highlight.FillTransparency = CFG.fillOpacity
     highlight.OutlineColor = color
     highlight.OutlineTransparency = 0.1
-    highlight.Parent = part
+    highlight.Parent = marks()
+    highlightCount = highlightCount + 1
     return highlight
 end
 
-local function makeBillboard(part, offsetY, size)
+local function releaseHighlight(entry)
+    if not entry or not entry.hl then return end
+    entry.hl:Destroy()
+    entry.hl = nil
+    highlightCount = math.max(0, highlightCount - 1)
+end
+
+-- BoxHandleAdornment draws an outline without consuming a Highlight slot, so
+-- every platform and every pebble can stay visible at the same time.
+local function makeBox(part, color, transparency)
+    local adornment = Instance.new("BoxHandleAdornment")
+    adornment.Name = "RobscriptBox"
+    adornment.Adornee = part
+    adornment.Size = part.Size + Vector3.new(0.08, 0.08, 0.08)
+    adornment.Color3 = color
+    adornment.Transparency = transparency or CFG.boxOpacity
+    adornment.AlwaysOnTop = true
+    adornment.ZIndex = 2
+    adornment.Parent = marks()
+    return adornment
+end
+
+-- `worldOffset` places the label a fixed number of studs above the adornee,
+-- which keeps it clear of tall parts such as the final door.
+local function makeBillboard(part, offsetY, size, worldOffset)
     local billboard = Instance.new("BillboardGui")
-    billboard.Name = "SWHubTag"
+    billboard.Name = "RobscriptTag"
     billboard.Size = size or UDim2.fromOffset(190, 34)
-    billboard.StudsOffset = Vector3.new(0, offsetY or 3, 0)
+    if worldOffset then
+        billboard.StudsOffsetWorldSpace = Vector3.new(0, offsetY or 3, 0)
+    else
+        billboard.StudsOffset = Vector3.new(0, offsetY or 3, 0)
+    end
     billboard.AlwaysOnTop = true
     billboard.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
     billboard.LightInfluence = 0
     billboard.Adornee = part
-    billboard.Parent = part
+    billboard.Parent = marks()
 
     local label = Instance.new("TextLabel")
     label.Name = "Text"
@@ -312,16 +366,22 @@ end
 local function dropVisual(part)
     local entry = visuals[part]
     if not entry then return end
-    if entry.hl then entry.hl:Destroy() end
+    releaseHighlight(entry)
+    if entry.box then entry.box:Destroy() end
     if entry.bb then entry.bb:Destroy() end
+    if entry.marker then entry.marker:Destroy() end
     visuals[part] = nil
 end
 
 local function getVisual(part)
     local entry = visuals[part]
     if not entry then
-        entry = {}
+        -- `part` is stored on the entry because every style helper needs an
+        -- Adornee; without it a Highlight is created but never renders.
+        entry = { part = part }
         visuals[part] = entry
+    else
+        entry.part = part
     end
     return entry
 end
@@ -330,6 +390,9 @@ end
 local function pruneVisuals()
     for part, entry in pairs(visuals) do
         if not part.Parent then
+            releaseHighlight(entry)
+            if entry.box then entry.box:Destroy() end
+            if entry.bb then entry.bb:Destroy() end
             if entry.marker then entry.marker:Destroy() end
             visuals[part] = nil
         end
@@ -343,16 +406,31 @@ local function dropByTag(tag)
     end
 end
 
--- Applies the current "how to draw" settings to an existing entry.
+-- Applies the current "how to show it" settings to an existing entry.
 local function styleHighlight(entry, color)
     if not CFG.highlights then
-        if entry.hl then entry.hl:Destroy(); entry.hl = nil end
+        releaseHighlight(entry)
         return
     end
     if not entry.hl then entry.hl = makeHighlight(entry.part, color) end
+    if not entry.hl then return end
     entry.hl.FillColor = color
     entry.hl.OutlineColor = color
     entry.hl.FillTransparency = CFG.fillOpacity
+end
+
+local function styleBox(entry, color, transparency)
+    if not CFG.boxes then
+        if entry.box then entry.box:Destroy(); entry.box = nil end
+        return
+    end
+    if entry.box and not entry.box.Parent then entry.box = nil end
+    if not entry.box then
+        entry.box = makeBox(entry.part, color, transparency)
+    else
+        entry.box.Color3 = color
+        if transparency then entry.box.Transparency = transparency end
+    end
 end
 
 -- ── Listeners ───────────────────────────────────────────────────────────────
@@ -387,6 +465,9 @@ local function updateListenerVisuals()
             local blue  = math.floor(color.B * 255)
 
             styleHighlight(entry, color)
+            -- If the highlight budget is exhausted, fall back to a box so the
+            -- most important thing on screen never disappears.
+            if CFG.highlights and not entry.hl then styleBox(entry, color, 0.45) end
 
             if CFG.labels then
                 if not entry.bb then
@@ -410,7 +491,7 @@ local function updateListenerVisuals()
             if CFG.listenerTarget and typeof(target) == "Vector3" then
                 if not entry.marker or not entry.marker.Parent then
                     local marker = Instance.new("Part")
-                    marker.Name = "SWHubTargetMarker"
+                    marker.Name = "RobscriptTargetMarker"
                     marker.Shape = Enum.PartType.Ball
                     marker.Size = Vector3.new(2, 2, 2)
                     marker.Material = Enum.Material.Neon
@@ -436,8 +517,18 @@ end
 
 -- ── Jump platforms ──────────────────────────────────────────────────────────
 
--- Generated geometry lives in each room's `Gen` folder; every jumpable part
+-- Generated geometry lives in each room's `Gen` folder and every jumpable part
 -- carries `Platform = true`. Room 3 adds `Safe = true`, room 7 adds `MemTile`.
+-- The extra tag names are a fallback in case the game renames `Platform`.
+local PLATFORM_TAGS = { "Platform", "IsPlatform", "Safe", "MemTile", "CanSink", "IsSinking", "Sinking", "Stable" }
+
+local function platformTag(part)
+    for _, name in ipairs(PLATFORM_TAGS) do
+        if part:GetAttribute(name) == true then return name end
+    end
+    return nil
+end
+
 local function collectPlatforms()
     local list = {}
     local root = stillWater()
@@ -446,7 +537,7 @@ local function collectPlatforms()
         local gen = room:FindFirstChild("Gen")
         if gen then
             for _, part in ipairs(gen:GetChildren()) do
-                if part:IsA("BasePart") and part:GetAttribute("Platform") == true then
+                if part:IsA("BasePart") and platformTag(part) then
                     table.insert(list, part)
                 end
             end
@@ -457,8 +548,22 @@ end
 
 local platformCache = { at = 0, list = {} }
 
+-- Platforms and memory tiles share one pass: the tiles are platforms too, and
+-- the memory pass only adds labels on top of whatever this pass drew.
 local function updatePlatformVisuals()
-    if not CFG.showPlatforms or not CFG.highlights then
+    if not CFG.boxes then
+        -- Keep memory labels alive when the boxes are switched off; only the
+        -- box itself is removed here.
+        for part, entry in pairs(visuals) do
+            if entry.tag == "platform" then
+                if entry.box then entry.box:Destroy(); entry.box = nil end
+                if not entry.bb then visuals[part] = nil end
+            end
+        end
+        return
+    end
+
+    if not (CFG.showPlatforms or CFG.showMemoryNumbers) then
         dropByTag("platform")
         return
     end
@@ -473,16 +578,21 @@ local function updatePlatformVisuals()
         if part.Parent then
             local safe   = part:GetAttribute("Safe") == true
             local memory = part:GetAttribute("MemTile") == true
-            local show = ((not CFG.platformSafeOnly) or safe or memory) and inRange(part.Position)
+            -- The safe-only filter belongs to the platform category; memory
+            -- tiles are shown whenever the memory labels are requested.
+            local allowed = CFG.showPlatforms
+                and ((not CFG.platformSafeOnly) or safe or memory)
+                or (CFG.showMemoryNumbers and memory)
+            local show = allowed and inRange(part.Position)
 
             if show then
                 local entry = getVisual(part)
-                local color = safe and Color3.fromRGB(70, 220, 255)
-                    or (memory and Color3.fromRGB(200, 120, 255)
-                        or Color3.fromRGB(110, 255, 160))
-                -- Hundreds of platforms: set the colour once, not every tick.
-                if not entry.hl or entry.tag ~= "platform" then
-                    styleHighlight(entry, color)
+                if not entry.box or entry.tag ~= "platform" then
+                    local color = safe and Color3.fromRGB(70, 220, 255)
+                        or (memory and Color3.fromRGB(200, 120, 255)
+                            or Color3.fromRGB(110, 255, 160))
+                    -- Hundreds of boxes: set the colour once, not every tick.
+                    styleBox(entry, color)
                     entry.tag = "platform"
                 end
             else
@@ -496,7 +606,7 @@ end
 -- ── Pebble pickups ──────────────────────────────────────────────────────────
 
 local function updatePickupVisuals()
-    if not CFG.showPickups or not CFG.highlights then
+    if not CFG.showPickups or not CFG.boxes then
         dropByTag("pickup")
         return
     end
@@ -508,9 +618,9 @@ local function updatePickupVisuals()
         for _, part in ipairs(pile:GetChildren()) do
             if part:IsA("BasePart") and inRange(part.Position) then
                 local entry = getVisual(part)
-                entry.tag = "pickup"
-                if not entry.hl then
-                    styleHighlight(entry, Color3.fromRGB(255, 245, 140))
+                if not entry.box or entry.tag ~= "pickup" then
+                    styleBox(entry, Color3.fromRGB(255, 245, 140), 0.35)
+                    entry.tag = "pickup"
                 end
             end
         end
@@ -532,9 +642,8 @@ local function updatePlayerVisuals()
             if part and inRange(part.Position) then
                 local entry = getVisual(part)
                 entry.tag = "teammate"
-                if not entry.hl then
-                    styleHighlight(entry, Color3.fromRGB(255, 170, 220))
-                end
+                styleHighlight(entry, Color3.fromRGB(255, 170, 220))
+                if not entry.hl then styleBox(entry, Color3.fromRGB(255, 170, 220), 0.55) end
             end
         end
     end
@@ -579,14 +688,18 @@ local function updateExitVisuals()
         if inRange(item.part.Position) then
             local entry = getVisual(item.part)
             entry.tag = "exit"
-            entry.part = item.part
             styleHighlight(entry, item.color)
             if CFG.labels then
                 if not entry.bb then
-                    entry.bb, entry.label = makeBillboard(item.part, 4, UDim2.fromOffset(160, 26))
+                    -- Offset from the part's own half-height so the label clears
+                    -- tall geometry such as the 20 stud door.
+                    local offset = item.part.Size.Y * 0.5 + 2.5
+                    entry.bb, entry.label = makeBillboard(item.part, offset, UDim2.fromOffset(170, 26), true)
                 end
                 entry.bb.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
-                entry.label.Text = item.text
+                entry.label.Text = CFG.labelDistance
+                    and string.format("%s · %s studs", item.text, formatStuds(distanceTo(item.part.Position)))
+                    or item.text
                 entry.label.TextColor3 = item.color
             elseif entry.bb then
                 entry.bb:Destroy(); entry.bb = nil; entry.label = nil
@@ -664,7 +777,8 @@ local function updateCodeLabels()
 
                 if CFG.labels then
                     if not entry.bb then
-                        entry.bb, entry.label = makeBillboard(part, 2.2, UDim2.fromOffset(90, 90))
+                        local offset = part.Size.Y * 0.5 + 1.5
+                        entry.bb, entry.label = makeBillboard(part, offset, UDim2.fromOffset(90, 90), true)
                         if entry.label then entry.label.TextStrokeTransparency = 0.1 end
                     end
                     entry.bb.MaxDistance = CFG.maxDistance > 0 and CFG.maxDistance or 4000
@@ -777,21 +891,22 @@ local function memoryText()
     return memory.finished or "<Muted>waiting for the flash…</Muted>"
 end
 
+-- The platform pass already draws the box for every tile, so this pass only
+-- adds the id label and tints the box green while a tile is lit. It must not
+-- take the "platform" tag over, or the two passes would fight over one part.
 local function updateMemoryVisuals()
-    if not CFG.showMemoryNumbers then
-        dropByTag("memory")
-        return
-    end
-
     for _, part in ipairs(memoryTiles()) do
-        if inRange(part.Position) then
-            local entry = getVisual(part)
-            entry.tag = "memory"
-            entry.part = part
+        local entry = visuals[part]
+        local showing = CFG.showMemoryNumbers and inRange(part.Position)
+
+        if showing then
+            entry = getVisual(part)
+            entry.memory = true
 
             if CFG.labels then
                 if not entry.bb then
-                    entry.bb, entry.label = makeBillboard(part, 2, UDim2.fromOffset(70, 40))
+                    local offset = part.Size.Y * 0.5 + 1.5
+                    entry.bb, entry.label = makeBillboard(part, offset, UDim2.fromOffset(70, 40), true)
                     if entry.label then entry.label.TextColor3 = Color3.fromRGB(210, 150, 255) end
                 end
                 local order = table.find(memory.sequence, part:GetAttribute("MemId"))
@@ -802,13 +917,13 @@ local function updateMemoryVisuals()
                 entry.bb:Destroy(); entry.bb = nil; entry.label = nil
             end
 
-            local color = memory.active[part]
-                and Color3.fromRGB(120, 255, 140)
-                or Color3.fromRGB(210, 150, 255)
-            styleHighlight(entry, color)
-        else
-            local entry = visuals[part]
-            if entry and entry.tag == "memory" then dropVisual(part) end
+            if memory.active[part] and entry.box then
+                entry.box.Color3 = Color3.fromRGB(120, 255, 140)
+            end
+        elseif entry and entry.memory then
+            if entry.bb then entry.bb:Destroy(); entry.bb = nil; entry.label = nil end
+            if entry.box then entry.box.Color3 = Color3.fromRGB(200, 120, 255) end
+            entry.memory = nil
         end
     end
 end
@@ -826,7 +941,7 @@ local function ensureAlarmGui()
     if not parent then return end
 
     alarmGui = Instance.new("ScreenGui")
-    alarmGui.Name = "SWHubAlarm"
+    alarmGui.Name = "RobscriptAlarm"
     alarmGui.IgnoreGuiInset = true
     alarmGui.ResetOnSpawn = false
     alarmGui.DisplayOrder = 999
@@ -957,7 +1072,7 @@ end
 --   • never in water; airborne is fine, that is when you jump between platforms
 --   • capped, and always horizontal (gravity keeps working normally)
 
-local BOOST_NAME = "SWHubBoostVelocity"
+local BOOST_NAME = "RobscriptBoostVelocity"
 local BOOST_RAMP = 10         -- higher = snappier ramp, lower = smoother
 local boost = { constraint = nil, attachment = nil, current = 0 }
 
@@ -1112,17 +1227,21 @@ end
 
 do
     for _, gui in ipairs(uiParent():GetChildren()) do
-        if gui:IsA("ScreenGui") and (gui.Name == "Still Water Hub" or gui.Name == "SWHubAlarm") then
+        if gui:IsA("ScreenGui")
+            and (gui.Name == "Robscript.com" or gui.Name == "Still Water Hub" or gui.Name == "RobscriptAlarm") then
             gui:Destroy()
         end
     end
+    -- Marks folder from a run that died before it could unload itself.
+    local staleMarks = workspace:FindFirstChild(MARKS_NAME)
+    if staleMarks then staleMarks:Destroy() end
 end
 
 local Window = Airflow:CreateWindow({
-    Name = "Still Water Hub",
-    LoadingSubtitle = "ESP · radar · puzzle solvers",
+    Name = "Robscript.com",
+    LoadingSubtitle = "Still Water · ESP · radar",
     ToggleUIKeybind = "RightControl",
-    ConfigurationSaving = { Enabled = true, FolderName = "StillWaterHub" },
+    ConfigurationSaving = { Enabled = true, FolderName = "Robscript" },
     Home = false,
 })
 
@@ -1204,14 +1323,27 @@ targetsGroup:CreateToggle({
 
 styleGroup:CreateToggle({
     Name = "Highlights",
-    Desc = "The through-wall outline itself",
+    Desc = "Through-wall fill for the Listener, teammates, doors and code",
     Flag = "Highlights",
     CurrentValue = true,
     Callback = function(on)
         CFG.highlights = on
         if not on then
+            for _, entry in pairs(visuals) do releaseHighlight(entry) end
+        end
+    end,
+})
+
+styleGroup:CreateToggle({
+    Name = "Box outlines",
+    Desc = "Platforms and pebbles; they do not use up the highlight limit",
+    Flag = "BoxOutlines",
+    CurrentValue = true,
+    Callback = function(on)
+        CFG.boxes = on
+        if not on then
             for _, entry in pairs(visuals) do
-                if entry.hl then entry.hl:Destroy(); entry.hl = nil end
+                if entry.box then entry.box:Destroy(); entry.box = nil end
             end
         end
     end,
@@ -1267,6 +1399,32 @@ styleGroup:CreateSlider({
     Suffix = "%",
     Flag = "FillOpacity",
     Callback = function(value) CFG.fillOpacity = 1 - (value / 100) end,
+})
+
+styleGroup:CreateSlider({
+    Name = "Box opacity",
+    Range = { 10, 90 },
+    Increment = 5,
+    CurrentValue = 60,
+    Suffix = "%",
+    Flag = "BoxOpacity",
+    Callback = function(value) CFG.boxOpacity = value / 100 end,
+})
+
+styleGroup:CreateStatus({
+    Name = "Highlight budget",
+    Desc = "The engine renders 255 at a time",
+    Style = "Row",
+    Update = function()
+        local boxes = 0
+        for _, entry in pairs(visuals) do
+            if entry.box then boxes = boxes + 1 end
+        end
+        local tone = highlightCount > HIGHLIGHT_BUDGET * 0.9 and "<Warning>" or "<Muted>"
+        local close = highlightCount > HIGHLIGHT_BUDGET * 0.9 and "</Warning>" or "</Muted>"
+        return string.format("%s%d / %d%s highlights · %d boxes",
+            tone, highlightCount, HIGHLIGHT_BUDGET, close, boxes)
+    end,
 })
 
 styleGroup:CreateButton({
@@ -1712,9 +1870,13 @@ local api = {
 
     unload = function()
         stopAll()
-        for part, entry in pairs(visuals) do
-            if entry.marker then pcall(function() entry.marker:Destroy() end) end
+        for part in pairs(visuals) do
             dropVisual(part)
+        end
+        highlightCount = 0
+        if marksFolder then
+            pcall(function() marksFolder:Destroy() end)
+            marksFolder = nil
         end
         purgeBoostParts(rootPart())
         boost.constraint = nil
@@ -1722,14 +1884,22 @@ local api = {
         boost.current = 0
         pcall(function() Window:Destroy() end)
         if alarmGui then pcall(function() alarmGui:Destroy() end) end
-        if getgenv then getgenv().StillWaterHub = nil end
+        if getgenv then
+            getgenv().Robscript = nil
+            getgenv().StillWaterHub = nil
+        end
     end,
 }
 
-if getgenv then getgenv().StillWaterHub = api end
+-- `Robscript` is the current handle; `StillWaterHub` stays as a legacy alias so
+-- older snippets and notes keep working.
+if getgenv then
+    getgenv().Robscript = api
+    getgenv().StillWaterHub = api
+end
 
 Window:Notify({
-    Title = "Still Water Hub loaded",
+    Title = "Robscript.com loaded",
     Content = "RightControl opens the window. ESP is already on.",
     Type = "Success",
     Duration = 6,
