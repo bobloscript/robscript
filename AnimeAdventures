@@ -1,4 +1,5 @@
 -- RobScript Team - Anime Adventures · Robly Airflow
+-- Task navigation: Home, Farm, Units, Battle, Activity, Settings.
 -- Readable source cached for restarting and continuing after teleports.
 local AIRFLOW_SOURCE = [====[
 -- RobScript Team - Anime Adventures — Robly Airflow
@@ -76,7 +77,7 @@ local CHANGELOG = {
             {
                 "👥",
                 "Best team finder",
-                "Tries your other units against each mode's weak and strong elements and shows the team that does best (Battle tab). It only equips it if you switch that on.",
+                "Tries your other units against each mode's weak and strong elements and shows the team that does best (Battle → Planner). It only equips it if you switch that on.",
                 "NEW"
             },
             {
@@ -88,7 +89,7 @@ local CHANGELOG = {
             {
                 "🧬",
                 "Smart evolve",
-                "Evolves your best copy of a unit once it's ready and gets stronger, but only with items no bigger goal needs and only using up spare copies (never one on your team or with a trait). Every evolve shows in the log and the Spending tab. Switch it off in the Path tab.",
+                "Evolves your best copy of a unit once it's ready and gets stronger, but only with items no bigger goal needs and only using up spare copies (never one on your team or with a trait). Every evolve shows in the log and the Spending tab. Switch it off in the Units → Goals.",
                 "NEW"
             }
         }
@@ -138,7 +139,7 @@ table.insert(CHANGELOG, 1, {
         {
             "📍",
             "The simulator searches for spots",
-            "At the start of a match (your own team, not Infinite or Fool's Hunt) the simulator tries spots on the map for each attacker and uses the layout that gets furthest against tough enemies. Each unit's shortlist counts the road it reaches at full range with the run's bonuses: Iron Sentinel went from reaching 72% of a road to all of it. A spot that lost on a map counts against it next time. Battle tab.",
+            "At the start of a match (your own team, not Infinite or Fool's Hunt) the simulator tries spots on the map for each attacker and uses the layout that gets furthest against tough enemies. Each unit's shortlist counts the road it reaches at full range with the run's bonuses: Iron Sentinel went from reaching 72% of a road to all of it. A spot that lost on a map counts against it next time. Battle → Planner.",
             "NEW"
         },
         {
@@ -150,7 +151,7 @@ table.insert(CHANGELOG, 1, {
         {
             "👥",
             "Team search that counts bosses",
-            "The team planner now also tries your damage-over-time units and every farm, and judges teams near their breaking point, where a difference shows. In a dungeon the simulator now plays each room's last-wave boss with its real HP, and damage over time stays on a lone boss instead of vanishing. With Auto-Equip Best Team on (Battle tab), the better team goes in before a dungeon run's first room and after a lost try.",
+            "The team planner now also tries your damage-over-time units and every farm, and judges teams near their breaking point, where a difference shows. In a dungeon the simulator now plays each room's last-wave boss with its real HP, and damage over time stays on a lone boss instead of vanishing. With Auto-Equip Best Team on (Battle → Planner), the better team goes in before a dungeon run's first room and after a lost try.",
             "NEW"
         },
         {
@@ -169,7 +170,7 @@ table.insert(CHANGELOG, 2, {
         {
             "🏆",
             "Main goal",
-            "Pick a unit to chase (Settings: pull goal, e.g. Chuuni, SS once evolved). The farm plays Fool's Hunt for AprilCoins while the goal needs them, pulls the April banner 10 at a time until it drops, keeps its evolve item's price, buys that item, trains its takedowns and evolves it. Path tab.",
+            "Pick a unit to chase (Settings: pull goal, e.g. Chuuni, SS once evolved). The farm plays Fool's Hunt for AprilCoins while the goal needs them, pulls the April banner 10 at a time until it drops, keeps its evolve item's price, buys that item, trains its takedowns and evolves it. Units → Goals.",
             "NEW"
         },
         {
@@ -193,7 +194,7 @@ table.insert(CHANGELOG, 2, {
         {
             "📖",
             "Learns the mode",
-            "Every Fool's Hunt run records the wave reached, the coins, the dealt units that carried the damage (placed first next time) and the hidden stats of every dealt unit. Path tab.",
+            "Every Fool's Hunt run records the wave reached, the coins, the dealt units that carried the damage (placed first next time) and the hidden stats of every dealt unit. Units → Goals.",
             "NEW"
         }
     }
@@ -206,7 +207,7 @@ table.insert(CHANGELOG, 3, {
         {
             "📚",
             "Community tiers",
-            "A community tier list (Oct 2026) now rates units the game hides: an S or SS evolution counts as joining your team, and the Path tab lists every banner unit and your own units with their ratings.",
+            "A community tier list (Oct 2026) now rates units the game hides: an S or SS evolution counts as joining your team, and the Units → Goals lists every banner unit and your own units with their ratings.",
             "NEW"
         },
         {
@@ -256,7 +257,7 @@ table.insert(CHANGELOG, 5, {
         {
             "🎯",
             "Takedown training",
-            "Some evolutions need the unit's own takedowns (Shinobi (Hood) needs 7,500). The farm puts that unit on your team only for runs the simulator says you still win with 30% tougher enemies, counts its takedowns every match, and puts your team back after each run. Path tab.",
+            "Some evolutions need the unit's own takedowns (Shinobi (Hood) needs 7,500). The farm puts that unit on your team only for runs the simulator says you still win with 30% tougher enemies, counts its takedowns every match, and puts your team back after each run. Units → Goals.",
             "NEW"
         },
         {
@@ -280,20 +281,20 @@ table.insert(CHANGELOG, 1, {
     items = {
         {
             "💪",
-            "Team tab",
+            "Units → Upgrades",
             "The farm now makes your 8 core units stronger with what you already have: XP food from the gold shop (gold kept for you), Stat Cubes to your grade, trait rerolls where a roll beats the trait on average, your unused relics, and a limit break once a unit is at its cap with a Divine Wish and spare units. One action at a time, each judged by how much of the team's damage it adds, with the game's own unit maths. Dry Run is on at first: it only says what it would do.",
             "NEW"
         },
         {
             "🎯",
             "Modes that make the team stronger",
-            "The mode ranker now counts the XP a run gives your units, and values a Divine Wish, Star Remnants and Stat Cubes by what they'd do for your core units. The Daily Challenge is played once a day whatever the Farming tab says, since it pays the wish, remnants and cubes.",
+            "The mode ranker now counts the XP a run gives your units, and values a Divine Wish, Star Remnants and Stat Cubes by what they'd do for your core units. The Daily Challenge is played once a day whatever the Farm → Stages says, since it pays the wish, remnants and cubes.",
             "NEW"
         },
         {
             "📊",
             "Who carries",
-            "Each match records how much of the damage each unit dealt (Iron Sentinel's drones count as its). The Team tab weighs every change by that.",
+            "Each match records how much of the damage each unit dealt (Iron Sentinel's drones count as its). The Units → Upgrades weighs every change by that.",
             "NEW"
         },
         {
@@ -310,14 +311,14 @@ table.insert(CHANGELOG, 1, {
         },
         {
             "⏸️",
-            "The Team tab finishes first",
-            "It can only work in the lobby, and won rooms used to chain straight into the next one, so it hardly ever got a turn. The run now goes through the lobby whenever the Team tab has something to do, and it finishes before the next room. Going through the lobby doesn't cost a choice of room.",
+            "The Units → Upgrades finishes first",
+            "It can only work in the lobby, and won rooms used to chain straight into the next one, so it hardly ever got a turn. The run now goes through the lobby whenever the Units → Upgrades has something to do, and it finishes before the next room. Going through the lobby doesn't cost a choice of room.",
             "NEW"
         },
         {
             "🔮",
             "Smart Relics",
-            "Before a run, your relics move to where they add the most damage on the team that's playing, counting what each copy really rolled: its damage types, the Timepiece's extra hit on slow attackers, crit, flyers. Once a team has them, they only move again for +2% or more. Team tab.",
+            "Before a run, your relics move to where they add the most damage on the team that's playing, counting what each copy really rolled: its damage types, the Timepiece's extra hit on slow attackers, crit, flyers. Once a team has them, they only move again for +2% or more. Units → Upgrades.",
             "NEW"
         },
         {
@@ -329,7 +330,7 @@ table.insert(CHANGELOG, 1, {
         {
             "☀️",
             "Ready for the Summer update",
-            "Update 21 changed how the game checks unlocked levels, which units hit flyers, and where it keeps trait odds and difficulty numbers. The farm reads all of them the new way, so it plays again and the team search and Team tab work.",
+            "Update 21 changed how the game checks unlocked levels, which units hit flyers, and where it keeps trait odds and difficulty numbers. The farm reads all of them the new way, so it plays again and the team search and Units → Upgrades work.",
             "FIX"
         },
         {
@@ -347,7 +348,7 @@ table.insert(CHANGELOG, 1, {
         {
             "🛑",
             "No more rerolls",
-            "The farm no longer rerolls stats or traits, on the Team tab or the Lobby tab. Your Stat Cubes, Star Remnants and tokens stay yours to use by hand.",
+            "The farm no longer rerolls stats or traits, on the Units → Upgrades or the Lobby tab. Your Stat Cubes, Star Remnants and tokens stay yours to use by hand.",
             "IMPROVED"
         },
         {
@@ -377,13 +378,13 @@ table.insert(CHANGELOG, 1, {
         {
             "🎯",
             "Banner Snipe",
-            "Pick any unit a banner can feature. Each lobby visit reads every banner, and while one features your pick it pulls there until the unit drops, or until your gems, pearls or Legacy Gems reach the Keep line you set. Banners turn over every 4 hours: a match can't read them, but the farm knows when they've changed and stops at the lobby after the match to look. It replaces Griffin Watch (a watch that was on carries on for Griffin). Summon tab.",
+            "Pick any unit a banner can feature. Each lobby visit reads every banner, and while one features your pick it pulls there until the unit drops, or until your gems, pearls or Legacy Gems reach the Keep line you set. Banners turn over every 4 hours: a match can't read them, but the farm knows when they've changed and stops at the lobby after the match to look. It replaces Griffin Watch (a watch that was on carries on for Griffin). Units → Summon.",
             "NEW"
         },
         {
             "🌀",
             "Portal To Play",
-            "A new pick on the Play tab. Smart plays a portal you hold when its map drops something your evolutions need, from any of the game's 38 kinds. Pick a kind to play it first whenever you hold one, or switch Portals off to keep them.",
+            "A new pick on the Farm → Stages. Smart plays a portal you hold when its map drops something your evolutions need, from any of the game's 38 kinds. Pick a kind to play it first whenever you hold one, or switch Portals off to keep them.",
             "NEW"
         },
         {
@@ -414,7 +415,7 @@ table.insert(CHANGELOG, 1, {
         {
             "🔥",
             "Limit Break, your way",
-            "On the Fuse tab: pick any unit that can still be limit broken, then tick its fodder in a table that shows each unit's rarity, level, points, evolved, trait, relic, shine and whether a goal needs it. ★ marks the farm's own safe picks, and a card shows level, Divine Wish and fodder points with a progress bar. Nothing ticked: the farm picks by its safe rule as before.",
+            "On the Units → Fusion: pick any unit that can still be limit broken, then tick its fodder in a table that shows each unit's rarity, level, points, evolved, trait, relic, shine and whether a goal needs it. ★ marks the farm's own safe picks, and a card shows level, Divine Wish and fodder points with a progress bar. Nothing ticked: the farm picks by its safe rule as before.",
             "NEW"
         },
 
@@ -457,7 +458,7 @@ table.insert(CHANGELOG, 1, {
         {
             "🌀",
             "Portals: Off, On or Only this",
-            "Portals had a plain switch where every other kind on the Play tab has three choices. Now it has the same three: On plays the portals you hold ahead of other kinds when a goal needs their drops (or your pick whenever you hold one), Only this plays just portals, and Off never opens one.",
+            "Portals had a plain switch where every other kind on the Farm → Stages has three choices. Now it has the same three: On plays the portals you hold ahead of other kinds when a goal needs their drops (or your pick whenever you hold one), Only this plays just portals, and Off never opens one.",
             "IMPROVED"
         },
         {
@@ -580,7 +581,7 @@ table.insert(CHANGELOG, 1, {
         {
             "🎯",
             "Choose what to evolve next",
-            "The Goals tab lists your 10 strongest evolutions, by the guides' rating and then the score at level 100. Pick one to focus on and its items and takedowns come first, or leave it on Smart Play and the farm chooses.",
+            "The Units → Goals lists your 10 strongest evolutions, by the guides' rating and then the score at level 100. Pick one to focus on and its items and takedowns come first, or leave it on Smart Play and the farm chooses.",
             "NEW"
         },
         {
@@ -592,7 +593,7 @@ table.insert(CHANGELOG, 1, {
         {
             "⏭️",
             "Next between story acts",
-            "After a win the farm presses Next instead of going back to the lobby. The team is sorted out at the start of the next match, before the first wave: your training unit stays in if the simulator says the team still wins there, otherwise your own team goes back. It still stops at the lobby when the Team tab has work.",
+            "After a win the farm presses Next instead of going back to the lobby. The team is sorted out at the start of the next match, before the first wave: your training unit stays in if the simulator says the team still wins there, otherwise your own team goes back. It still stops at the lobby when the Units → Upgrades has work.",
             "NEW"
         },
         {
@@ -616,7 +617,7 @@ table.insert(CHANGELOG, 2, {
     items = {
         {
             "🌾",
-            "Farming tab",
+            "Farm → Stages",
             "One switch to play, and five you can use to play only raids, story progress, challenges, April Coins or dungeons. All off: it plays whatever pays best.",
             "NEW"
         },
@@ -702,19 +703,19 @@ table.insert(CHANGELOG, 1, {
         {
             "🏠",
             "Go To Lobby",
-            "Two new buttons on the Settings tab. Go To Lobby leaves the match at once, and the farm starts no other match until you press Start Farming Again. Summons, fuses and stars you switched on keep running in the lobby. A match that was already starting when you pressed it comes straight back.",
+            "Two new buttons on the Settings → General. Go To Lobby leaves the match at once, and the farm starts no other match until you press Start Farming Again. Summons, fuses and stars you switched on keep running in the lobby. A match that was already starting when you pressed it comes straight back.",
             "NEW"
         },
         {
             "🃏",
             "Card Pick for the Summer Hunt",
-            "Choose how the farm takes the Hunt's cards, on the Play tab. Secret Luck (the default) takes the card with the most secret luck, then the most pay. Gems takes the card that pays the most. Easiest Win takes the one that makes your team strongest. Smart weighs pay against strength, as before. Except on Easiest Win, a card that would leave your team too weak to win is never taken.",
+            "Choose how the farm takes the Hunt's cards, on the Farm → Stages. Secret Luck (the default) takes the card with the most secret luck, then the most pay. Gems takes the card that pays the most. Easiest Win takes the one that makes your team strongest. Smart weighs pay against strength, as before. Except on Easiest Win, a card that would leave your team too weak to win is never taken.",
             "NEW"
         },
         {
             "🏺",
             "Artifact Stage",
-            "The Artifact Stage (a new one every 14 days) is played now, alone, ahead of other kinds while your team has a chance there, until its 10 clears are in: 30 gems a clear, and at 3, 5 and 10 clears 15 Limited Star Remnants and 250 gems in all, claimed for you. The simulator reads its enemies 2.1× tougher, as the stage says, until real runs measure them. Losses rest it like any mode. Play tab, under Raids: Off, On or Only this.",
+            "The Artifact Stage (a new one every 14 days) is played now, alone, ahead of other kinds while your team has a chance there, until its 10 clears are in: 30 gems a clear, and at 3, 5 and 10 clears 15 Limited Star Remnants and 250 gems in all, claimed for you. The simulator reads its enemies 2.1× tougher, as the stage says, until real runs measure them. Losses rest it like any mode. Farm → Stages: Off, On or Only this.",
             "NEW"
         },
         {
@@ -740,7 +741,7 @@ table.insert(CHANGELOG, 1, {
         {
             "👥",
             "Auto-Equip Best Team on by default",
-            "The farm now equips the best team it finds before each run, unless you switched Auto-Equip Best Team off yourself (Battle tab). Your own team goes back after.",
+            "The farm now equips the best team it finds before each run, unless you switched Auto-Equip Best Team off yourself (Battle → Planner). Your own team goes back after.",
             "IMPROVED"
         },
         {
@@ -764,7 +765,7 @@ table.insert(CHANGELOG, 1, {
         {
             "📋",
             "Unit pickers always fill in",
-            "If the window opened before the game had loaded your units, the unit pickers on the Fuse and Summon tabs could stay empty, and so could the fodder table. They now fill in as soon as your units are there, in a match too.",
+            "If the window opened before the game had loaded your units, the unit pickers on the Units → Fusion and Units → Summon could stay empty, and so could the fodder table. They now fill in as soon as your units are there, in a match too.",
             "FIX"
         }
     }
@@ -817,13 +818,13 @@ table.insert(CHANGELOG, 1, {
         {
             "💍",
             "Smart Charm Equip",
-            "Summer Charms give bonuses in the Summer Hunt and Sky Portals, one worn at a time. Before either, the farm puts on the one that helps most: more rewards where your team wins with room to spare, more damage where it might lose. Charms only change in the lobby, so a replay goes through it once when a better one is waiting. Play tab, under Summer Hunt.",
+            "Summer Charms give bonuses in the Summer Hunt and Sky Portals, one worn at a time. Before either, the farm puts on the one that helps most: more rewards where your team wins with room to spare, more damage where it might lose. Charms only change in the lobby, so a replay goes through it once when a better one is waiting. Farm → Events.",
             "NEW"
         },
         {
             "🤝",
             "Matchmaking in every mode that has it",
-            "Play tab, Matchmaking: a switch for each mode the game matchmakes. The Daily (on, as before), raids (up to 6 players), Infinite and Legend Stages (up to 4) and the Summer Hunt (up to 6). Other players' units help, and outside the Daily the enemies get tougher with each player. If nobody joins in time, it plays alone.",
+            "Farm → Party: a switch for each mode the game matchmakes. The Daily (on, as before), raids (up to 6 players), Infinite and Legend Stages (up to 4) and the Summer Hunt (up to 6). Other players' units help, and outside the Daily the enemies get tougher with each player. If nobody joins in time, it plays alone.",
             "NEW"
         },
         {
@@ -902,7 +903,7 @@ table.insert(CHANGELOG, 1, {
         {
             "🌀",
             "Play Portals You Can't Beat",
-            "Play tab, under Portals: your portals go first even when the simulator says your team will lose there. Off by default.",
+            "Farm → Stages: your portals go first even when the simulator says your team will lose there. Off by default.",
             "NEW"
         },
         {
@@ -21226,7 +21227,7 @@ function Adventure.goalText()
         local EC = math.max(Config.aprilFloor, BC.haveItem and 0 or BC.itemCost)
         local FC = CC and CC.pity_data and CC.pity_data.April2025
         local GC = FC and tonumber(FC.opens_since_mythic)
-        return DC .. string.format("step 1 of 3: pull %s from the April banner. You have %s AprilCoins: %d ten-pulls above the %s kept for its evolve item. " .. "Each Mythic from this banner is one of 3 limited units (1 in 3 is %s), and one is guaranteed every 200 pulls%s. " .. "The farm plays Fool's Hunt for AprilCoins (worth %.2f gems each to the ranking while this goal needs them)%s.", Units.name(BC.id), Utils.fmt(BC.coins), math.max(0, math.floor((BC.coins - EC) / 1500)), Utils.fmt(EC), Units.name(BC.id), GC and string.format(" (%d pulls since the last Mythic)", GC) or "", math.max(Config.aprilValue, Config.goalCoinValue), Config.summonApril and " and pulls 10 at a time" or "; April pulls are off (Summon tab)")
+        return DC .. string.format("step 1 of 3: pull %s from the April banner. You have %s AprilCoins: %d ten-pulls above the %s kept for its evolve item. " .. "Each Mythic from this banner is one of 3 limited units (1 in 3 is %s), and one is guaranteed every 200 pulls%s. " .. "The farm plays Fool's Hunt for AprilCoins (worth %.2f gems each to the ranking while this goal needs them)%s.", Units.name(BC.id), Utils.fmt(BC.coins), math.max(0, math.floor((BC.coins - EC) / 1500)), Utils.fmt(EC), Units.name(BC.id), GC and string.format(" (%d pulls since the last Mythic)", GC) or "", math.max(Config.aprilValue, Config.goalCoinValue), Config.summonApril and " and pulls 10 at a time" or "; April pulls are off (Units → Summon)")
     elseif BC.step == "item" then
         return DC .. string.format("step 2 of 3: you have %s! Its evolve item costs %s AprilCoins in the event shop; you have %s. The farm buys it when the coins are in.", Units.name(BC.id), Utils.fmt(BC.itemCost), Utils.fmt(BC.coins))
     elseif BC.step == "evolve" then
@@ -22193,7 +22194,7 @@ function Adventure.buyShopGoals()
                     }).name or pI.item, pI.cost, (Core.Items [pI.costItem] or {
                     }).name or pI.costItem, "for " .. Units.name(nI.to))
                     if App.notify then
-                        App.notify("Goals", string.format("Bought %s for %s (Goals tab)", (Core.Items [pI.item] or {
+                        App.notify("Goals", string.format("Bought %s for %s (Units → Goals)", (Core.Items [pI.item] or {
                         }).name or pI.item, Units.name(nI.from)), "success")
                     end
                     return true
@@ -23088,7 +23089,7 @@ function Strategy.run(ZN)
         local qO = _N.collection:get_unit_by_uuid(ZN.uuid) or aO
         local rO = (tonumber(qO.xp) or 0) - lO
         if rO > 0 then
-            Spending.add(string.format("%d XP food on %s", gO, ZN.name), gO, "items", string.format("Team tab: +%s XP, level %d → %d", Utils.fmt(rO), mO, Strategy.level(qO)))
+            Spending.add(string.format("%d XP food on %s", gO, ZN.name), gO, "items", string.format("Units → Upgrades: +%s XP, level %d → %d", Utils.fmt(rO), mO, Strategy.level(qO)))
             Strategy.note(string.format("fed %s %d items: +%s XP, level %d → %d%s", ZN.name, gO, Utils.fmt(rO), mO, Strategy.level(qO), math.abs(rO - fO) > fO * 0.1 and string.format(" (planned %s)", Utils.fmt(fO)) or ""))
         else
             Strategy.note(string.format("the game didn't take the food for %s (%s): trying again in 10 min", ZN.name, tostring(nO and oO or "no answer")))
@@ -23244,7 +23245,7 @@ function Strategy.finishWork()
         if not YO then
             break
         end
-        App.status("Mode", "Team tab first: " .. tostring(YO))
+        App.status("Mode", "Units → Upgrades first: " .. tostring(YO))
         if ZO == "relic" then
             local _O, aP = pcall(Strategy.relicsApply, true)
             if not (_O and aP) then
@@ -23257,7 +23258,7 @@ function Strategy.finishWork()
         task.wait(4)
     end
     if XO > 0 then
-        App.log(1, Strategy.LOG, string.format("Team tab finished for now: %d actions in %ds", XO, math.floor(Utils.now() - WO)))
+        App.log(1, Strategy.LOG, string.format("Units → Upgrades finished for now: %d actions in %ds", XO, math.floor(Utils.now() - WO)))
         Modes._sigAt, Modes.lastScored = nil, nil
         App.saveSoon()
     end
@@ -23536,7 +23537,7 @@ function FarmHub.autoEvolve()
     if (FarmHub.evoBlocked [nQ.uuid] or 0) >= os.time() then
         return
     end
-    local wQ, xQ = FarmHub.evolve(nQ, "your focus (Goals tab)")
+    local wQ, xQ = FarmHub.evolve(nQ, "your focus (Units → Goals)")
     if wQ then
         FarmHub.pickDone("autoEvolve", "Focus", xQ)
     else
@@ -23556,7 +23557,7 @@ function FarmHub.evolveText()
     for zQ, AQ in ipairs(Brain.goals or {
     }) do
         if AQ.pinned and AQ.uuid == Config.evolveUnit then
-            return AQ.text .. ((Modes.onlyOn() and not AQ.ready) and ("\nOnly " .. Modes.onlyText() .. " is on (Play tab), so it can only farm there.") or "") .. yQ
+            return AQ.text .. ((Modes.onlyOn() and not AQ.ready) and ("\nOnly " .. Modes.onlyText() .. " is on (Farm → Stages), so it can only farm there.") or "") .. yQ
         end
     end
     return "Works out what it needs in the lobby…" .. yQ
@@ -24011,7 +24012,7 @@ function FarmHub.autoFuseXp()
             for OT, PT in ipairs(GT) do
                 zT [PT] = true
             end
-            Spending.add(string.format("%d units fused into %s", # GT, tT), # GT, "units", string.format("Fuse For XP: your pick (Fuse tab): +%s XP", Utils.fmt(NT - IT)))
+            Spending.add(string.format("%d units fused into %s", # GT, tT), # GT, "units", string.format("Fuse For XP: your pick (Units → Fusion): +%s XP", Utils.fmt(NT - IT)))
             App.log(1, "LOBBY", string.format("Fuse For XP: %d units into %s, +%s XP, level %d", # GT, tT, Utils.fmt(NT - IT), Strategy.level(rT.collection:get_unit_by_uuid(Config.fuseXpUnit) or sT)))
         elseif # GT > 20 then
             FarmHub.fuseBatch = 20
@@ -24089,7 +24090,7 @@ function FarmHub.fuseInto(RT, TT)
         local kU
         kU, jU = FarmHub.fodderPicked(VT)
         if jU < gU then
-            return ZT(string.format("Waiting: the units you ticked are worth %d of %d points. Tick more on the Fuse tab.", math.floor(jU), math.floor(gU)))
+            return ZT(string.format("Waiting: the units you ticked are worth %d of %d points. Tick more on the Units → Fusion.", math.floor(jU), math.floor(gU)))
         end
         iU, jU = {
         }, 0
@@ -24130,7 +24131,7 @@ function FarmHub.fuseInto(RT, TT)
     end
     Config.fuseArmSig, Config.fuseArmAt = "", 0
     if bU(UT.collection:get_unit_by_uuid(RT) or VT) > sU then
-        Spending.add("limit broke " .. aU, # nU, "units", (TT and ("Auto Limit Break: your pick (Fuse tab)" .. (hU and ", your fodder" or "")) or "Team tab") .. " · used " .. table.concat(oU, ", ") .. " and a Divine Wish")
+        Spending.add("limit broke " .. aU, # nU, "units", (TT and ("Auto Limit Break: your pick (Units → Fusion)" .. (hU and ", your fodder" or "")) or "Units → Upgrades") .. " · used " .. table.concat(oU, ", ") .. " and a Divine Wish")
         if hU then
             local wU = {
             }
@@ -24284,7 +24285,7 @@ end
 
 function FarmHub.smartEvolve()
     if not Config.smartEvolve then
-        return App.status("Evolve", "smart evolve is off (Goals tab)")
+        return App.status("Evolve", "smart evolve is off (Units → Goals)")
     end
     local XU = Core.session()
     if not XU then
@@ -24749,7 +24750,7 @@ function Training.apply(OX)
     local QX = Config.trainTakedowns and Training.target() or nil
     if not QX then
         Training.home()
-        return App.status("Training", Config.trainTakedowns and "no evolution is waiting on takedowns" or "off (Goals tab)")
+        return App.status("Training", Config.trainTakedowns and "no evolution is waiting on takedowns" or "off (Units → Goals)")
     end
     local RX = Units.name(QX.id)
     local SX = string.format("%s %s/%s", QX.what, Utils.fmt(QX.have), Utils.fmt(QX.need))
@@ -25806,7 +25807,7 @@ function FarmHub.summon()
                 end
                 return c3 + 20 > (tonumber(X1.collection.capacity) or math.huge)
             end
-            local e3 = Z1(Config.summonBanner, a3.name, a3.have, Config [a3.floor], a3.cost, "Auto Summon: your pick (Summon tab)", a3.name, b3)
+            local e3 = Z1(Config.summonBanner, a3.name, a3.have, Config [a3.floor], a3.cost, "Auto Summon: your pick (Units → Summon)", a3.name, b3)
             local f3 = FarmHub.BANNER_NAME [Config.summonBanner] or Config.summonBanner
             table.insert(Y1, e3 > 0 and string.format("%s: %d summons", f3, e3) or (b3() and (f3 .. ": your unit storage is full") or (f3 .. ": at your Keep At Least line")))
         end
@@ -37848,7 +37849,7 @@ function Match.finish()
             App.log(1, "ERROR", "team work: " .. tostring(Rec))
         end
         if Pec then
-            Fec, Gec = "lobby", "lobby: the Team tab can " .. tostring(Pec)
+            Fec, Gec = "lobby", "lobby: the Units → Upgrades can " .. tostring(Pec)
         end
     end
     if Match.kind == "dungeon" and Fec ~= "stay" and Bec and Bec.key == "dg" and _cc and # Units.equipped() >= 6 and not Brain.holdLobby and not Brain.buyStorage and not Pec then
@@ -39409,6 +39410,270 @@ function GUI.theme(Airflow)
     end })
 end
 
+-- Navigation describes player tasks. Legacy names below identify saved flags;
+-- changing a page or group label must never change a player's profile keys.
+GUI.NAV_SCHEMA = {
+    { Name = "Home", Icon = "house" },
+    { Name = "Farm", Icon = "gamepad-2", Pages = {
+        { "Stages", "map" }, { "Challenges", "trophy" }, { "Events", "sun" },
+        { "Party", "users" }, { "Rules", "sliders-horizontal" },
+    } },
+    { Name = "Units", Icon = "users", Pages = {
+        { "Goals", "target" }, { "Upgrades", "trending-up" }, { "Summon", "sparkles" },
+        { "Fusion", "flame" }, { "Study", "microscope" },
+    } },
+    { Name = "Battle", Icon = "swords", Pages = {
+        { "Controls", "crosshair" }, { "Planner", "brain" }, { "Economy", "coins" },
+    } },
+    { Name = "Activity", Icon = "scroll-text", Pages = {
+        { "Log", "scroll-text" }, { "Spending", "wallet" },
+        { "History", "history" }, { "Systems", "activity" },
+    } },
+    { Name = "Settings", Icon = "settings", Pages = {
+        { "General", "settings-2" }, { "Profiles", "save" },
+        { "Theme", "palette" }, { "Updates", "newspaper" },
+    } },
+}
+
+-- root, subpage, visible group, column, collapsed
+GUI.LAYOUT = {
+    Home = {
+        Overview = { "Home", "", "Farm control", "Left" },
+        ["Right now"] = { "Home", "", "Current run", "Right" },
+        ["At a glance"] = { "Home", "", "Session", "Right" },
+        ["Every part"] = { "Activity", "Systems", "Automation status", "Right" },
+    },
+    Play = {
+        Overview = { "Farm", "Stages", "Mode selection", "Left" },
+        ["Story and Legend Stages"] = { "Farm", "Stages", "Story & Legend", "Right" },
+        ["Infinite and Portals"] = { "Farm", "Stages", "Infinite & Portals", "Left" },
+        ["Raids and Dungeon"] = { "Farm", "Stages", "Raids & Dungeon", "Right" },
+        Challenges = { "Farm", "Challenges", "Challenge rules", "Left" },
+        Matchmaking = { "Farm", "Party", "Find players", "Left" },
+        ["Summer Skins and Stars"] = { "Farm", "Events", "Skins & stars", "Right" },
+        ["Fool's Hunt"] = { "Farm", "Events", "Event progress", "Right" },
+        ["What it plays next (gems a minute)"] = { "Battle", "Planner", "Mode ranking", "Left" },
+        ["Run records"] = { "Activity", "History", "Completed runs", "Left" },
+        Advanced = { "Farm", "Rules", "Mode priorities", "Left", true },
+    },
+    Goals = {
+        Overview = { "Units", "Goals", "Current goal", "Left" },
+        Focus = { "Units", "Goals", "Current goal", "Left" },
+        ["Ready now"] = { "Units", "Goals", "Ready to evolve", "Right" },
+        ["Evolutions in reach (strongest first)"] = { "Units", "Goals", "Evolution paths", "Right", true },
+        ["Takedown training"] = { "Units", "Goals", "Takedown training", "Left" },
+        ["How it chases goals"] = { "Units", "Goals", "Goal priorities", "Left", true },
+        Notes = { "Units", "Goals", "Recommendations", "Right", true },
+    },
+    Team = {
+        Overview = { "Units", "Upgrades", "Team upgrades", "Left" },
+        Next = { "Units", "Upgrades", "Team upgrades", "Left" },
+        ["Core units"] = { "Units", "Upgrades", "Core units", "Right", true },
+        Levels = { "Units", "Upgrades", "XP food", "Left" },
+        Gear = { "Units", "Upgrades", "Relics & limit breaks", "Right" },
+        Advanced = { "Units", "Upgrades", "Upgrade rules", "Left", true },
+    },
+    Summon = {
+        Overview = { "Units", "Summon", "Banner snipe", "Left" },
+        ["Banner Snipe"] = { "Units", "Summon", "Banner snipe", "Left" },
+        ["Auto Summon"] = { "Units", "Summon", "Repeat summons", "Right" },
+        ["Smart pulls"] = { "Units", "Summon", "Goal summons", "Right", true },
+        Display = { "Units", "Summon", "Animations", "Left", true },
+    },
+    Fuse = {
+        Overview = { "Units", "Fusion", "Limit break", "Left" },
+        ["Limit Break"] = { "Units", "Fusion", "Limit break", "Left" },
+        ["Fuse For XP"] = { "Units", "Fusion", "Fuse for XP", "Right" },
+    },
+    Battle = {
+        Overview = { "Battle", "Controls", "Battle automation", "Left" },
+        ["In a match"] = { "Battle", "Controls", "Battle automation", "Left" },
+        ["Your team at full upgrade"] = { "Battle", "Controls", "Equipped units", "Right" },
+        ["Simulator and teams"] = { "Battle", "Planner", "Team planning", "Right" },
+        ["Advanced: farm or damage"] = { "Battle", "Economy", "Farm income", "Left" },
+    },
+    Activity = {
+        Overview = { "Activity", "Log", "Live log", "Left" },
+        ["What each part is doing"] = { "Activity", "Systems", "Subsystems", "Left" },
+        ["Where your gold, gems and coins went"] = { "Activity", "Spending", "Spending summary", "Left" },
+        Log = { "Activity", "Log", "Live log", "Left" },
+    },
+    Settings = {
+        Overview = { "Settings", "General", "General", "Left" },
+        General = { "Settings", "General", "General", "Left" },
+        ["Gold shop"] = { "Settings", "General", "Gold shop", "Right" },
+        ["Study A Unit"] = { "Units", "Study", "Study a unit", "Left" },
+        Controls = { "Settings", "General", "Script", "Right" },
+    },
+}
+
+GUI.CONTROL_LAYOUT = {
+    ["Keep Playing Daily"] = { "Farm", "Challenges", "Daily challenge", "Right" },
+    ["Daily In A Kill Box"] = { "Farm", "Challenges", "Daily challenge", "Right" },
+    ["Gems To Keep"] = { "Units", "Summon", "Snipe budget", "Left" },
+    ["Pearls To Keep"] = { "Units", "Summon", "Snipe budget", "Left" },
+    ["Legacy Gems To Keep"] = { "Units", "Summon", "Snipe budget", "Left" },
+    ["Safe Road"] = { "Battle", "Economy", "Defense thresholds", "Right", true },
+    ["Safe Kill Time"] = { "Battle", "Economy", "Defense thresholds", "Right", true },
+    ["Danger Road"] = { "Battle", "Economy", "Defense thresholds", "Right", true },
+    ["Save Threshold"] = { "Battle", "Economy", "Defense thresholds", "Right", true },
+    ["Reset Mode Stats"] = { "Activity", "History", "History tools", "Right", true },
+    ["Reset Unit Learning"] = { "Battle", "Planner", "Planner tools", "Right", true },
+    ["Go To Lobby"] = { "Home", "", "Farm control", "Left" },
+    ["Start Farming Again"] = { "Home", "", "Farm control", "Left" },
+    ["Log Level"] = { "Activity", "Log", "Logging", "Right" },
+    ["Print To Console"] = { "Activity", "Log", "Logging", "Right" },
+}
+
+GUI.SHORT_TEXT = {
+    ["Auto Farm"] = { "Auto Farm", "Choose modes, start runs and play automatically." },
+    ["Auto Play"] = { "Chain runs", "Start the next eligible stage after a run." },
+    ["Story Map"] = { "Story map", "Smart clears new acts before replaying stages." },
+    ["Legend Stage"] = { "Legend stage", "Smart picks stages that advance your goals." },
+    ["Infinite Map"] = { "Infinite map", "Smart weighs daily gems and takedowns." },
+    ["End Infinite Early"] = { "Leave after daily gems", "Finish when another mode becomes more rewarding." },
+    ["Play Portals You Can't Beat"] = { "Ignore portal win estimate", "Allow your portals even if the simulator predicts a loss." },
+    ["Start New Dungeon Runs"] = { "Start new dungeon runs", "Begin another dungeon after the current run ends." },
+    ["Only Ones You Can Beat"] = { "Require win estimate", "Skip challenges below the win chance set here." },
+    ["Win Chance Needed"] = { "Minimum win chance", "Required estimate when the win filter is enabled." },
+    ["Skip These Challenges"] = { "Excluded challenges", "Never queue challenges with these modifiers." },
+    ["Keep Playing Daily"] = { "Repeat until daily win", "Prioritize the daily challenge until it is won." },
+    ["Daily In A Kill Box"] = { "Daily kill box", "Cluster units near the exit during repeated daily runs." },
+    ["Matchmake The Daily"] = { "Daily challenge", "Look for players before starting the daily." },
+    ["Matchmake Raids"] = { "Raids", "Find a party for raids." },
+    ["Matchmake Infinite"] = { "Infinite", "Find a party for Infinite." },
+    ["Matchmake Legend Stages"] = { "Legend stages", "Find a party for Legend Stages." },
+    ["Matchmake The Summer Hunt"] = { "Summer Hunt", "Find a party for the current Summer Hunt." },
+    ["Matchmaking Wait"] = { "Party wait", "After this time, start alone if no party joined." },
+    ["Focus On"] = { "Target evolution", "Choose one unit, or let Smart pick your goal." },
+    ["Takedown Training"] = { "Train takedowns", "Bring a trainee when the rest of the team can win." },
+    ["Leave When Trained"] = { "Return when trained", "Leave Infinite once training and nearby daily gems are done." },
+    ["Make My Team Stronger"] = { "Automatic upgrades", "Improve your core units using available resources." },
+    ["Level Up With XP Food"] = { "Feed XP food", "Give food to the core unit that benefits most." },
+    ["Buy XP Food"] = { "Buy XP food", "Buy efficient XP food while preserving your gold floor." },
+    ["Limit Break Core Units"] = { "Auto limit break core", "Use spare units after showing the planned fodder." },
+    ["Dry Run"] = { "Preview upgrades only", "Show the plan without spending resources." },
+    ["Unit To Snipe"] = { "Target unit", "Pull from the banner featuring this unit." },
+    ["Banner Snipe"] = { "Snipe target", "Keep pulling until the target drops or a budget is reached." },
+    ["Gems To Keep"] = { "Gems reserve", "Snipe never spends below this reserve." },
+    ["Pearls To Keep"] = { "Pearls reserve", "Snipe never spends below this reserve." },
+    ["Legacy Gems To Keep"] = { "Legacy gems reserve", "Snipe never spends below this reserve." },
+    ["Keep At Least"] = { "Currency reserve", "Repeat summons keep this amount of the selected currency." },
+    ["Unit To Limit Break"] = { "Target unit", "Choose a unit whose level cap you want to raise." },
+    ["Auto Limit Break"] = { "Enable limit break", "Uses the selected fodder after the preview countdown." },
+    ["Unit To Feed"] = { "Unit to level", "Feed eligible duplicates into this unit for XP." },
+    ["Use Units Up To"] = { "Maximum fodder rarity", "Mythic and Secret units are excluded from XP feeding." },
+    ["Auto Fuse For XP"] = { "Enable XP fusion", "Consume eligible units up to the target's level cap." },
+    ["Auto-Equip Best Team"] = { "Equip planned team", "Use the stronger team before a run, then restore yours." },
+    ["Simulate Now"] = { "Recalculate plan", "Run the simulator and team search in the lobby." },
+    ["Equip Best Team"] = { "Equip planned team", "Equip the best team found in the lobby." },
+    ["Restore My Team"] = { "Restore my team", "Put your original team back in the lobby." },
+    ["Go To Lobby"] = { "Return to lobby", "Leave this run and hold future match starts." },
+    ["Start Farming Again"] = { "Resume after lobby hold", "Clear the lobby hold and allow match starts." },
+    ["Battle AI"] = { "Battle automation", "Control placement and upgrades inside a match." },
+    ["Ability Hold"] = { "Ability hold", "Wait this long for a boss or a crowd." },
+    ["Smart Charm Equip"] = { "Choose charm automatically", "Prefer rewards when strong enough, damage when needed." },
+    ["Smart Skins"] = { "Manage event skins", "Equip useful skins and sell spare ones listed here." },
+    ["Open Sunny Stars"] = { "Open Sunny Stars", "Use pearls above the reserve for the planned target." },
+    ["Study Runs"] = { "Study runs", "Number of real matches to measure the selected unit." },
+}
+
+GUI.PAGE_HELP = {
+    Home = "",
+    Play = "Enabled modes compete by rewards. Only this mode restricts the farm; Disabled skips a mode.",
+    Goals = "Choose an evolution target. Its items and takedowns take priority.",
+    Team = "Upgrade core units. Preview mode shows spending before you enable it.",
+    Summon = "Choose a target or banner, set reserves, then enable summons.",
+    Fuse = "Select a target and review its fodder before enabling fusion. Used units are consumed.",
+    Battle = "Control how the farm fights. Team predictions are under Planner.",
+    Activity = "",
+    Settings = "",
+}
+
+function GUI.prepareNavigation(window)
+    GUI.Nav, GUI.Blocks = {}, {}
+    for _, section in ipairs(GUI.NAV_SCHEMA) do
+        local root = window:CreateTab({ Name = section.Name, Icon = section.Icon })
+        local entry = { Root = root, Pages = {} }
+        GUI.Nav[section.Name] = entry
+        if section.Pages then
+            for _, spec in ipairs(section.Pages) do
+                entry.Pages[spec[1]] = root:CreateSubTab({
+                    Name = spec[1], Icon = spec[2],
+                    EmptyText = section.Name == "Farm" and spec[1] == "Events"
+                        and "No supported event is currently available." or "Waiting for game data.",
+                })
+            end
+        else
+            entry.Pages[""] = root
+        end
+    end
+    GUI.Nav.Settings.Pages.Profiles:CreateConfigManager({ Name = "Saved profiles", Side = "Left" })
+    GUI.Nav.Settings.Pages.Theme:CreateThemeManager({ Name = "Appearance", Side = "Left" })
+end
+
+function GUI.block(rootName, pageName, title, side, collapsed)
+    local id = rootName .. "/" .. pageName .. "/" .. title
+    if GUI.Blocks[id] then return GUI.Blocks[id] end
+    local entry = assert(GUI.Nav[rootName], "Unknown navigation section: " .. rootName)
+    local host = assert(entry.Pages[pageName], "Unknown page: " .. pageName)
+    local group = host:CreateGroupbox({ Name = title, Side = side or "Left", Collapsed = collapsed == true })
+    GUI.Blocks[id] = group
+    return group
+end
+
+function GUI.sectionSpec(page)
+    local route = GUI.LAYOUT[page.Name]
+    local spec = route and route[page.GroupName]
+    if spec then return spec end
+    if page.Name == "Play" then return { "Farm", "Events", page.GroupName, "Left" } end
+    if page.Name == "Updates" then
+        return { "Settings", "Updates", page.GroupName, "Left", page.SectionCount > 1 }
+    end
+    error("Unmapped UI section: " .. page.Name .. "/" .. page.GroupName)
+end
+
+function GUI.controlGroup(page, name)
+    local spec = GUI.CONTROL_LAYOUT[name] or GUI.sectionSpec(page)
+    return GUI.block(table.unpack(spec))
+end
+
+function GUI.controlText(name, description)
+    local entry = GUI.SHORT_TEXT[name]
+    local short = entry and entry[2] or description or ""
+    if #short > 82 then short = "" end
+    return entry and entry[1] or name, short
+end
+
+function GUI.controlDependency(name)
+    if name == "Win Chance Needed" then return function() return Config.chSmart == true end end
+    if name == "Daily In A Kill Box" then return function() return Config.dailyLoop == true end end
+    if name == "Ability Hold" then return function() return Config.actives == true end end
+    if name == "Leave When Trained" then return function() return Config.trainTakedowns == true end end
+end
+
+function GUI.go(rootName, pageName)
+    local entry = assert(GUI.Nav[rootName], "Unknown navigation target")
+    GUI.NativeWindow:SelectTab(entry.Root)
+    if pageName and pageName ~= "" then entry.Root:SelectSubTab(entry.Pages[pageName]) end
+end
+
+function GUI.shortcuts()
+    local box = GUI.block("Home", "", "Go to", "Left")
+    local links = {
+        { "Modes", "Farm", "Stages" }, { "Goals", "Units", "Goals" }, { "Summon", "Units", "Summon" },
+        { "Fusion", "Units", "Fusion" }, { "Planner", "Battle", "Planner" }, { "Logs", "Activity", "Log" },
+    }
+    for first = 1, #links, 3 do
+        local row = {}
+        for index = first, math.min(first + 2, #links) do
+            local target = links[index]
+            table.insert(row, { Name = target[1], Callback = function() GUI.go(target[2], target[3]) end })
+        end
+        box:CreateButtonRow(row)
+    end
+end
+
 function GUI.flag(page, name)
     local base = "AA/" .. page.Name .. "/" .. page.GroupName .. "/" .. name
     GUI.flagCounts = GUI.flagCounts or {}
@@ -39435,29 +39700,55 @@ function GUI.valueHandle(native, scale)
 end
 
 function GUI.paragraph(group, text, title)
-    local native = group:CreateParagraph({ Title = GUI.escape(title or ""), Content = GUI.escape(text) })
+    local native
+    if title and title ~= "" then
+        native = group:CreateParagraph({ Title = GUI.escape(title), Content = GUI.escape(text) })
+    else
+        native = group:CreateLabel({ Text = GUI.escape(text), Visible = text ~= nil and text ~= "" })
+    end
     local handle = { Native = native }
     function handle.Set(a, b)
-        native:Set(GUI.escape(a == handle and b or a))
+        local value = a == handle and b or a
+        native:Set(GUI.escape(value))
+        native:SetVisible(value ~= nil and value ~= "")
     end
     return handle
 end
 
-function GUI.statusCard(group, options)
-    local status = group:CreateStatus({ Name = GUI.escape(options.title or "Status"), Value = "", Style = "Plain" })
+function GUI.shortLine(value, limit)
+    local line = tostring(value or ""):match("[^\n]+") or ""
+    local at = utf8.offset(line, (limit or 155) + 1)
+    if at then line = line:sub(1, at - 1):gsub("%s+%S*$", "") .. "…" end
+    return line
+end
+
+function GUI.statusCard(group, options, compact)
+    local heading = group:CreateLabel({ Text = "" })
+    local status = group:CreateStatus({ Name = "State", Value = "", Style = "Badge", Visible = false })
     local body = GUI.paragraph(group, "")
-    local progress = group:CreateProgress({ Name = "Progress", CurrentValue = 0, Visible = false })
+    local progress = group:CreateProgress({ Name = "Wave progress", CurrentValue = 0, Visible = false })
     local handle = {}
     function handle.Set(a, b)
         local data = a == handle and b or a
         data = data or {}
-        status:SetName(GUI.escape((data.icon and (data.icon .. " ") or "") .. tostring(data.title or "Status")))
+        local title = tostring(data.title or "Status"):gsub("^Up next: ", "")
+        heading:Set("<b>" .. GUI.escape((data.icon and (data.icon .. " ") or "") .. title) .. "</b>")
+        status:SetVisible(data.tag ~= nil and data.tag ~= "")
         status:Set(GUI.escape(data.tag or ""))
-        status:SetColor(data.tagColor or data.color)
+        status:SetTone(data.tagColor or data.color or "Accent")
+        local full = table.concat({ tostring(data.text or ""), tostring(data.sub or "") }, "\n")
+        heading:SetTooltip(GUI.escape(full))
         local lines = {}
-        if data.text and data.text ~= "" then table.insert(lines, tostring(data.text)) end
-        if data.sub and data.sub ~= "" then table.insert(lines, tostring(data.sub)) end
+        if data.text and data.text ~= "" then
+            local value = compact and GUI.shortLine(data.text) or data.text
+            table.insert(lines, tostring(value))
+        end
+        if data.sub and data.sub ~= "" then
+            local value = compact and GUI.shortLine(tostring(data.sub):gsub(" · front at.*$", ""), 110) or data.sub
+            table.insert(lines, tostring(value))
+        end
         body.Set(table.concat(lines, "\n"))
+        body.Native:SetTooltip(GUI.escape(full))
         progress:SetVisible(type(data.progress) == "number")
         if type(data.progress) == "number" then
             progress:Set(math.clamp(data.progress, 0, 1), true)
@@ -39468,11 +39759,19 @@ function GUI.statusCard(group, options)
     return handle
 end
 
+function GUI.modeSummary(nextMode, skipped)
+    if GUI.skipInfo then GUI.skipInfo.Set(#skipped > 0 and table.concat(skipped, "\n") or "Every enabled mode is available.") end
+    local selection = Modes.onlyOn() and ("Only " .. Modes.onlyText()) or "Smart · enabled modes"
+    return "Selection: " .. selection .. "\nNext: " .. (nextMode and nextMode.label or "waiting for an eligible stage")
+        .. (#skipped > 0 and ("\n" .. #skipped .. " unavailable · details in Farm → Rules") or "")
+end
+
 -- String-only Airflow dropdowns are backed by a hidden native Input flag.
 -- Profiles save raw UUIDs/map IDs, rather than labels containing changing levels.
 -- This uses only documented Input/Dropdown APIs, including silent SetOptions.
 function GUI.dropdown(page, name, desc, options, initial, callback, multiple)
-    local group = page:Group()
+    local group = GUI.controlGroup(page, name)
+    local visibleName, shortDesc = GUI.controlText(name, desc)
     local rows, labels, byLabel, byValue = {}, {}, {}, {}
     local rawValue, native, storage
     local ready = false
@@ -39481,16 +39780,20 @@ function GUI.dropdown(page, name, desc, options, initial, callback, multiple)
         rows, labels, byLabel, byValue = {}, {}, {}, {}
         for index, option in ipairs(newOptions or {}) do
             local row = type(option) == "table" and option or { text = tostring(option), value = option }
-            local label = tostring(row.text or row.value or "")
+            local originalText = tostring(row.text or row.value or "")
+            local label = originalText
+            local modeNames = { On = "Enabled", Off = "Disabled", ["Only this"] = "Only this mode" }
+            if modeNames[label] then label = modeNames[label] end
+            if label:find("Smart:", 1, true) then label = "Smart" end
             if byLabel[label] then label = label .. " [" .. index .. "]" end
             while byLabel[label] do label = label .. "·" end
-            rows[index] = { text = label, value = row.value, index = index }
+            rows[index] = { text = label, originalText = originalText, value = row.value, index = index }
             labels[index], byLabel[label], byValue[row.value] = label, rows[index], label
         end
     end
     local function pending(value)
         if value ~= nil and byValue[value] == nil then
-            local label = "Saved pick · " .. tostring(value)
+            local label = "Saved selection · loading"
             while byLabel[label] do label = label .. "·" end
             local row = { text = label, value = value, index = #rows + 1 }
             table.insert(rows, row)
@@ -39524,7 +39827,7 @@ function GUI.dropdown(page, name, desc, options, initial, callback, multiple)
             callback(indexes)
         else
             local row = byLabel[byValue[rawValue]]
-            if row then callback(row.text, row.value, row.index) end
+            if row then callback(row.originalText or row.text, row.value, row.index) end
         end
     end
     rebuild(options)
@@ -39538,7 +39841,7 @@ function GUI.dropdown(page, name, desc, options, initial, callback, multiple)
     end
     local selected = selection(rawValue)
     native = group:CreateDropdown({
-        Name = name, Desc = desc, Tooltip = desc, Options = labels,
+        Name = visibleName, Desc = shortDesc, Tooltip = desc, Options = labels,
         CurrentOption = selected, MultipleOptions = multiple == true,
         AllowNone = multiple == true, Searchable = true, MaxRows = 8,
         Callback = function(picked)
@@ -39599,27 +39902,21 @@ function GUI.dropdown(page, name, desc, options, initial, callback, multiple)
 end
 
 function GUI.page(window, name, icon)
-    local tab = window:CreateTab({ Name = name, Icon = icon })
-    local page = { Name = name, Tab = tab, GroupName = "Overview", SectionCount = 0 }
+    local page = { Name = name, GroupName = "Overview", SectionCount = 0 }
     function page:Group()
-        if not self.Current then
-            self.Current = tab:CreateGroupbox({ Name = self.GroupName, Side = "Left" })
-        end
-        return self.Current
+        return GUI.block(table.unpack(GUI.sectionSpec(self)))
     end
     function page:Section(title)
         self.SectionCount = self.SectionCount + 1
         self.GroupName = title ~= "" and title or "Details"
-        self.Current = tab:CreateGroupbox({
-            Name = self.GroupName,
-            Side = self.SectionCount % 2 == 1 and "Right" or "Left",
-        })
-        return self.Current
+        return self:Group()
     end
     function page:Toggle(title, desc, value, callback)
         local ready = false
-        local native = self:Group():CreateToggle({
-            Name = title, Desc = desc, Tooltip = desc, CurrentValue = value == true,
+        local displayName, shortDesc = GUI.controlText(title, desc)
+        local native = GUI.controlGroup(self, title):CreateToggle({
+            Name = displayName, Desc = shortDesc, Tooltip = desc, CurrentValue = value == true,
+            DependsOn = GUI.controlDependency(title), DependsMode = "Disable",
             Flag = GUI.flag(self, title),
             Callback = function(on) if ready and callback then callback(on) end end,
         })
@@ -39639,8 +39936,10 @@ function GUI.page(window, name, icon)
                 elseif example:match("^[%d.%-]+ gems$") then suffix = " gems" end
             end
         end
-        local native = self:Group():CreateSlider({
-            Name = title, Desc = desc, Tooltip = desc,
+        local displayName, shortDesc = GUI.controlText(title, desc)
+        local native = GUI.controlGroup(self, title):CreateSlider({
+            Name = displayName, Desc = shortDesc, Tooltip = desc,
+            DependsOn = GUI.controlDependency(title), DependsMode = "Disable",
             Range = { (options.min or 0) / scale, (options.max or 100) / scale },
             Increment = (options.step or 1) / scale, CurrentValue = (options.default or options.min or 0) / scale, Suffix = suffix,
             Flag = GUI.flag(self, title),
@@ -39657,8 +39956,9 @@ function GUI.page(window, name, icon)
     end
     function page:Input(title, desc, placeholder, value, callback)
         local ready = false
-        local native = self:Group():CreateInput({
-            Name = title, Desc = desc, Tooltip = desc, PlaceholderText = placeholder,
+        local displayName, shortDesc = GUI.controlText(title, desc)
+        local native = GUI.controlGroup(self, title):CreateInput({
+            Name = displayName, Desc = shortDesc, Tooltip = desc, PlaceholderText = placeholder,
             CurrentValue = value, Flag = GUI.flag(self, title),
             Callback = function(text) if ready and callback then callback(text) end end,
         })
@@ -39676,8 +39976,9 @@ function GUI.page(window, name, icon)
             ["Go To Lobby"] = "house", ["Start Farming Again"] = "play",
             ["Save Settings"] = "save", ["Unload"] = "power",
         }
-        return self:Group():CreateButton({
-            Name = title, Desc = desc, Tooltip = desc, Icon = icons[title] or "chevron-right",
+        local displayName, shortDesc = GUI.controlText(title, desc)
+        return GUI.controlGroup(self, title):CreateButton({
+            Name = displayName, Desc = shortDesc, Tooltip = desc, Icon = icons[title] or "chevron-right",
             Callback = function()
                 task.spawn(function()
                     if not App.alive then return end
@@ -39697,42 +39998,64 @@ function GUI.page(window, name, icon)
         function handle.Set(a, b) native:Set(GUI.escape(a == handle and b or a)) end
         return handle
     end
-    function page:StatusCard(options) return GUI.statusCard(self:Group(), options) end
+    function page:StatusCard(options)
+        local group, compact = self:Group(), self.Name == "Home"
+        if self.Name == "Home" and options.title == "Simulator" then
+            group, compact = GUI.block("Battle", "Planner", "Prediction", "Left"), false
+        elseif self.Name == "Home" and options.title == "Up next" then
+            group = GUI.block("Home", "", "Next run", "Right")
+        elseif self.Name == "Fuse" then
+            group = GUI.block("Units", "Fusion", "Requirements", "Right")
+        end
+        return GUI.statusCard(group, options, compact)
+    end
     function page:KeyValue(keys)
-        local handles = {}
+        local group, cells, values = self:Group(), {}, {}
+        local empty = group:CreateLabel({ Text = self.GroupName == "Run records" and "No completed runs yet." or "Waiting for game data." })
         for _, key in ipairs(keys) do
-            handles[key] = self:Group():CreateStatus({ Name = GUI.escape(key), Value = "…", Style = "Plain" })
+            cells[key] = group:CreateStatus({ Name = GUI.escape(key), Value = "", Style = "Plain", Wrap = true, Visible = false })
         end
         local handle = {}
         function handle.Set(a, b, c, d, e)
             local key, value, color, title = a, b, c, d
             if a == handle then key, value, color, title = b, c, d, e end
-            local native = handles[key]
+            local native = cells[key]
             if not native then return end
-            if title ~= nil then native:SetName(GUI.escape(title)) end
-            native:Set(GUI.escape(value))
-            native:SetColor(color)
+            local text = tostring(value or "")
+            local visible = text ~= "" and text ~= "—" and text ~= "…"
+            values[key] = visible
+            native:SetVisible(visible)
+            if visible then
+                native:SetName(GUI.escape(title ~= nil and title ~= "" and title or key))
+                native:Set(GUI.escape(text))
+                native:SetColor(color)
+            elseif title and title ~= "" and not tonumber(title) then
+                empty:Set(GUI.escape(title))
+            end
+            local any = false
+            for _, on in pairs(values) do if on then any = true; break end end
+            empty:SetVisible(not any)
         end
         return handle
     end
     function page:StatGrid(keys)
-        local cells = {}
+        local group, cells = self:Group(), {}
+        local names = { ["First Clears Left"] = "New clears", ["Summer Pearls"] = "Pearls", Record = "Wins / losses" }
+        local gold = group:CreateStatus({ Name = "Gold", Value = "…", Style = "Row" })
         for _, key in ipairs(keys) do
-            cells[key] = self:Group():CreateStatus({ Name = key, Value = "…", Style = "Plain" })
+            cells[key] = group:CreateStatus({ Name = names[key] or key, Value = "…", Style = "Row" })
         end
         local handle = {}
         function handle.Set(key, value, sub, color)
             local native = cells[key]
             if native then
-                native:Set(GUI.escape(tostring(value or "") .. (sub and sub ~= "" and ("\n" .. sub) or "")))
-                native:SetColor(color)
+                native:Set(GUI.escape(value))
+                native:SetColor(key == "First Clears Left" and "Text" or color)
+                native:SetTooltip(GUI.escape(sub or ""))
+                if key == "Gems" and sub then gold:Set(GUI.escape(tostring(sub):gsub("^gold ", ""))) end
             end
         end
         return handle
-    end
-    if name == "Settings" then
-        tab:CreateConfigManager({ Name = "Profiles", Side = "Left" })
-        tab:CreateThemeManager({ Name = "Appearance", Side = "Right" })
     end
     return page
 end
@@ -39740,24 +40063,22 @@ end
 function GUI.window(Airflow)
     local window = Airflow:CreateWindow({
         Name = GUI.TITLE, LoadingSubtitle = GUI.TITLE .. " · v" .. VERSION,
-        ToggleUIKeybind = "RightControl", Size = UDim2.fromOffset(780, 540),
+        ToggleUIKeybind = "RightControl", Size = UDim2.fromOffset(900, 620), AdaptiveSize = true, Density = "Default",
         Backdrop = { Weather = "Fireflies", Tint = 0.35 }, Theme = GUI.THEME,
         ConfigurationSaving = { Enabled = true, FolderName = Core.FOLDER .. "/Airflow" },
         Home = false,
     })
     GUI.NativeWindow = window
-    local icons = {
-        Home = "house", Play = "gamepad-2", Goals = "target", Team = "users",
-        Summon = "sparkles", Fuse = "flame", Battle = "swords", Activity = "scroll-text",
-        Settings = "settings", Updates = "newspaper",
-    }
+    GUI.prepareNavigation(window)
+    GUI.skipInfo = GUI.paragraph(GUI.block("Farm", "Rules", "Unavailable modes", "Right"), "Waiting for the first plan.")
     local controller = { Native = window }
     function controller:Tab(_, name)
-        local page = GUI.page(window, name, icons[name] or "layout-grid")
+        local page = GUI.page(window, name)
         if name == "Home" then
             self.State = page:Group():CreateStatus({
                 Name = "Farm", Value = "Starting…", Style = "Dot", Pin = true, Tone = "Accent",
             })
+            GUI.shortcuts()
         end
         return page
     end
@@ -39781,7 +40102,11 @@ function GUI.window(Airflow)
 end
 
 function GUI.banner(page, text)
-    return GUI.paragraph(page:Group(), text, "About this page")
+    local brief = GUI.PAGE_HELP[page.Name] or ""
+    if brief == "" then return end
+    local handle = GUI.paragraph(page:Group(), brief)
+    handle.Native:SetTooltip(GUI.escape(text))
+    return handle
 end
 
 function GUI.activity(page)
@@ -40314,7 +40639,7 @@ function GUI.lbTargetOptions()
 end
 
 function GUI.fodderTable(page)
-    local group = page:Group()
+    local group = GUI.block("Units", "Fusion", "Fodder units", "Left")
     local handle = { data = {} }
     local board, selectionFlag
     local summary = group:CreateStatus({ Name = "Fodder", Value = "Farm picks", Style = "Plain" })
@@ -40359,7 +40684,7 @@ function GUI.fodderTable(page)
         render()
     end
     board = group:CreateTable({
-        Name = "Limit break fodder", MaxRows = 8, Search = true,
+        Name = "Available fodder", MaxRows = 6, Search = true,
         Columns = {
             { Name = "Pick", Width = 40 }, { Name = "Unit", Width = 0.32 },
             { Name = "Details" }, { Name = "Points", Width = 55, Align = "Right" },
@@ -40517,7 +40842,7 @@ function GUI.lbStatusNow()
         _qc,
         hrc(drc >= _qc),
         Zqc and "" or " (requirement checked in the lobby)"),
-        sub = FarmHub.pickNote.autoFuse or (Config.autoFuse and "Auto Limit Break is on: it fuses once everything is ✓, after showing what it uses for 30 s." or "Auto Limit Break is off. Switch it on below when you're happy with the fodder."),
+        sub = FarmHub.pickNote.autoFuse or (Config.autoFuse and "Auto Limit Break is on: it fuses once everything is ✓, after showing what it uses for 30 s." or "Limit break is off. Review the fodder, then enable it in the target panel."),
         tag = frc and "READY" or "WAITING",
         tagColor = frc and Uqc.green or Uqc.orange,
         progress = math.min(1,
@@ -40541,7 +40866,7 @@ function GUI.homeRows()
     end
     local prc = {
     }
-    prc.Playing = Modes.onlyOn() and ("Only " .. Modes.onlyText()) or "Smart: whatever pays best (Play tab)"
+    prc.Playing = Modes.onlyOn() and ("Only " .. Modes.onlyText()) or "Smart: whatever pays best (Farm → Stages)"
     prc.Focus = lrc(FarmHub.focusText)
     prc.Training = Config.trainTakedowns and lrc(Training.text) or "off"
     prc.Snipe = Config.snipeOn and Config.snipeUnit ~= "" and lrc(FarmHub.snipeText) or "off"
@@ -40549,10 +40874,9 @@ function GUI.homeRows()
         local qrc, rrc = pcall(GUI.lbStatus)
         prc ["Limit Break"] = qrc and irc(rrc.title .. " · " .. tostring(rrc.tag):lower() .. " · " .. (tostring(rrc.text):gsub("%s+·%s+", " · "))) or "…"
     else
-        prc ["Limit Break"] = "no unit picked (Fuse tab)"
+        prc ["Limit Break"] = "Choose a target in Units → Fusion"
     end
     prc.Team = Config.team and lrc(Strategy.text) or "off"
-    prc.Hive = lrc(Reports.hiveText)
     return prc
 end
 GUI.HOME_KEYS = {
@@ -40561,8 +40885,7 @@ GUI.HOME_KEYS = {
     "Training",
     "Snipe",
     "Limit Break",
-    "Team",
-    "Hive"
+    "Team"
 }
 
 function GUI.build()
@@ -40987,7 +41310,7 @@ function GUI.build()
         xrc("teamRelics", atc)
         FarmHub.last.teamPlan = nil
     end)
-    vrc.teamFuse = bsc:Toggle("Limit Break Core Units", "Once a core unit is capped and you hold a Divine Wish, by the farm's safe fodder rule. Lists the units it uses for 30 s first. To choose yourself, use the Fuse tab", Config.teamFuse, function(btc)
+    vrc.teamFuse = bsc:Toggle("Limit Break Core Units", "Once a core unit is capped and you hold a Divine Wish, by the farm's safe fodder rule. Lists the units it uses for 30 s first. To choose yourself, use the Units → Fusion", Config.teamFuse, function(btc)
         xrc("teamFuse", btc)
         xrc("fuseArmSig", "")
         FarmHub.last.teamPlan = nil
@@ -41887,7 +42210,7 @@ function GUI.update()
             table.insert(Uwc, "Skipped: " .. Wwc)
         end
         table.sort(Uwc)
-        pcall(Swc.only.Set, (not Modes.onlyOn() and "Nothing is on Only this, so it plays whatever pays best among the kinds that are On." or string.format("Only %s: %s", Modes.onlyText(), Twc and ("next is " .. Twc.label) or ((Config.onlyDungeons and (Modes.rec("dg").restUntil or 0) > os.time()) and ("the dungeon is on hold until " .. os.date("%H:%M", Modes.rec("dg").restUntil)) or "none can be played right now, so it waits (no raid tries left, no new challenge yet, no keys, no portal a goal needs...)"))) .. (# Uwc > 0 and ("\n" .. table.concat(Uwc, "\n")) or ""))
+        pcall(Swc.only.Set, GUI.modeSummary(Twc, Uwc))
     end
     if Swc.summonPick and FarmHub.every("summonText", 3) then
         pcall(function()
