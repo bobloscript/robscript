@@ -1,0 +1,1585 @@
+--!nonstrict
+--[[
+    Robscript Team - Survive Your Ideas
+    ------------------------------------------------------------------
+    Client companion for "Survive Your Ideas" (universe 10769671316).
+    UI: Robly Airflow (https://github.com/bobloscript/Robly_Airflow)
+
+    Everything here is client-side information and local visuals:
+    round state, the word being typed, hazard telegraphs, safe towers,
+    item library, world settings. No server state is modified.
+
+    Container: executor / client script.
+]]
+
+----- Guard: single instance -----
+if getgenv then
+    local previous = getgenv().SYI_HUB
+    if previous and previous.Cleanup then
+        pcall(previous.Cleanup)
+    end
+end
+
+----- Services -----
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
+local VirtualUser = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+local Workspace = workspace
+
+local LocalPlayer = Players.LocalPlayer
+
+----- Constants -----
+local HUB_NAME = "Robscript Team - Survive Your Ideas"
+local HUB_VERSION = "1.1"
+local CONFIG_FOLDER = "RobscriptSYI"
+local MAX_WORD_ROWS = 120
+
+local THEME = {
+    Background = Color3.fromHex("#0A0A0C"),
+    Surface = Color3.fromHex("#141418"),
+    Surface2 = Color3.fromHex("#1A1A20"),
+    Surface3 = Color3.fromHex("#2A2A33"),
+    Stroke = Color3.fromHex("#26262E"),
+    StrokeHover = Color3.fromHex("#3C3C49"),
+    Accent = Color3.fromHex("#FF3B7F"),
+    AccentDark = Color3.fromHex("#1A0710"),
+    Text = Color3.fromHex("#F5F5F7"),
+    Muted = Color3.fromHex("#8D8D99"),
+}
+
+----- Forward declarations (captured as upvalues by earlier closures) -----
+local Window = nil
+local WordTable = nil
+local WordLog = nil
+local DeathLog = nil
+local HazardLog = nil
+local PlayerTable = nil
+local HudRoot = nil
+local AntiAfkConnection = nil
+local ZoomBackup = nil
+local refreshMarkers = nil
+local Cleanup = nil
+
+----- Game modules (read-only) -----
+local WriterRemotes = ReplicatedStorage:FindFirstChild("WriterRemotes")
+local Items = ReplicatedStorage:FindFirstChild("Items")
+local MetaWords = ReplicatedStorage:FindFirstChild("MetaWords")
+local EconomyRemotes = ReplicatedStorage:FindFirstChild("EconomyRemotes")
+local NukeRemotes = ReplicatedStorage:FindFirstChild("NukeRemotes")
+local IslandRemotes = ReplicatedStorage:FindFirstChild("IslandRemotes")
+
+local Supported = WriterRemotes ~= nil
+
+local ItemLibrary = nil
+if Items then
+    local module = Items:FindFirstChild("ItemLibrary")
+    if module then
+        local ok, result = pcall(require, module)
+        ItemLibrary = ok and result or nil
+    end
+end
+
+local MetaWordsConfig = nil
+if MetaWords then
+    local module = MetaWords:FindFirstChild("MetaWordsConfig")
+    if module then
+        local ok, result = pcall(require, module)
+        MetaWordsConfig = ok and result or nil
+    end
+end
+
+----- Runtime state -----
+local State = {
+    liveWord = "",
+    liveWriter = "",
+    lastWord = "",
+    lastWriter = "",
+    words = {},
+    water = 0,
+    seaLevel = 0,
+}
+
+local Connections = {}
+local ActiveMarkers = {}
+
+local Flags = {
+    HudEnabled = true,
+    TurnAlert = true,
+    WordAlert = false,
+    HazardAlert = true,
+    WaterMargin = 6,
+    TowerMarkers = true,
+    MarkerDistance = 400,
+}
+
+local function track(connection)
+    table.insert(Connections, connection)
+    return connection
+end
+
+local function disconnectAll()
+    for _, connection in ipairs(Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    Connections = {}
+end
+
+----- Small helpers -----
+local function stamp()
+    return os.date("%H:%M:%S")
+end
+
+local function getCharacter()
+    local character = LocalPlayer.Character
+    if character and character.Parent then
+        return character
+    end
+    return nil
+end
+
+local function getRoot()
+    local character = getCharacter()
+    if not character then
+        return nil
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function readNumber(value, fallback)
+    if type(value) == "number" then
+        return value
+    end
+    return fallback or 0
+end
+
+local function fmtSeconds(total)
+    total = math.max(0, math.floor(total))
+    return string.format("%02d:%02d", math.floor(total / 60), total % 60)
+end
+
+local function playPing(pitch)
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if gui then
+        for _, descendant in ipairs(gui:GetDescendants()) do
+            if descendant:IsA("Sound") and descendant.SoundId ~= "" then
+                local clone = descendant:Clone()
+                clone.Name = "SYI_Ping"
+                clone.PlaybackSpeed = pitch or 1
+                clone.Parent = SoundService
+                clone:Play()
+                task.delay(3, function()
+                    if clone then
+                        pcall(function()
+                            clone:Destroy()
+                        end)
+                    end
+                end)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function flashHud()
+    if not HudRoot then
+        return
+    end
+    local card = HudRoot:FindFirstChild("Card")
+    if not card then
+        return
+    end
+    local original = card.BackgroundColor3
+    card.BackgroundColor3 = THEME.Accent
+    TweenService:Create(card, TweenInfo.new(0.45), { BackgroundColor3 = original }):Play()
+end
+
+local function safeNotify(options)
+    if not Window then
+        return
+    end
+    pcall(function()
+        Window:Notify(options)
+    end)
+end
+
+----- Reading the in-game interface -----
+local function gameGui(name)
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then
+        return nil
+    end
+    return playerGui:FindFirstChild(name)
+end
+
+local function readInterfaceText(name)
+    local gui = gameGui("SYI_Interface")
+    if not gui then
+        return nil
+    end
+    local label = gui:FindFirstChild(name, true)
+    if label and (label:IsA("TextLabel") or label:IsA("TextButton") or label:IsA("TextBox")) then
+        return label.Text
+    end
+    return nil
+end
+
+local function readAliveCount()
+    return tonumber(readInterfaceText("Alive")) or 0
+end
+
+local function readTimeLeft()
+    local text = readInterfaceText("Time")
+    if not text then
+        return 0
+    end
+    local minutes, seconds = string.match(text, "(%d+):(%d+)")
+    if minutes then
+        return tonumber(minutes) * 60 + tonumber(seconds)
+    end
+    return tonumber(text) or 0
+end
+
+local function readMessage()
+    return readInterfaceText("Message") or ""
+end
+
+local function myWriterChance()
+    return readNumber(LocalPlayer:GetAttribute("WriterChance"), 0)
+end
+
+----- Word parsing -----
+local function parseAnnouncement(rich)
+    if type(rich) ~= "string" then
+        return "?", "?"
+    end
+    local word = string.match(rich, "<i>(.-)</i>")
+    local writer = string.match(rich, "^(.-)%s+said")
+    if not word then
+        word = string.gsub(rich, "<.->", "")
+    end
+    return writer or "?", word
+end
+
+local function pushWord(writer, word)
+    State.lastWord = word
+    State.lastWriter = writer
+    table.insert(State.words, 1, {
+        Word = word,
+        Writer = writer,
+        Time = stamp(),
+    })
+    while #State.words > MAX_WORD_ROWS do
+        table.remove(State.words)
+    end
+    if WordTable then
+        pcall(function()
+            WordTable:SetRows(State.words)
+        end)
+    end
+end
+
+----- Safe tower markers -----
+local function clearMarkers()
+    for _, marker in ipairs(ActiveMarkers) do
+        pcall(function()
+            marker:Destroy()
+        end)
+    end
+    ActiveMarkers = {}
+end
+
+refreshMarkers = function()
+    clearMarkers()
+    if not Flags.TowerMarkers then
+        return
+    end
+    local distance = Flags.MarkerDistance
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("Model") and (object.Name == "EscapeTower" or object.Name == "NukeBunker") then
+            local ok, pivot = pcall(function()
+                return object:GetPivot().Position
+            end)
+            if ok and pivot then
+                local highlight = Instance.new("Highlight")
+                highlight.Name = "SYI_Marker"
+                highlight.Adornee = object
+                highlight.FillColor = object.Name == "NukeBunker" and Color3.fromRGB(90, 180, 255)
+                    or Color3.fromRGB(255, 59, 127)
+                highlight.FillTransparency = 0.72
+                highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+                highlight.OutlineTransparency = 0.25
+                highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                highlight.Parent = object
+                table.insert(ActiveMarkers, highlight)
+
+                local billboard = Instance.new("BillboardGui")
+                billboard.Name = "SYI_MarkerLabel"
+                billboard.Adornee = object
+                billboard.Size = UDim2.fromOffset(110, 26)
+                billboard.StudsOffsetWorldSpace = Vector3.new(0, 6, 0)
+                billboard.AlwaysOnTop = true
+                billboard.MaxDistance = distance
+                billboard.LightInfluence = 0
+                billboard.Parent = object
+
+                local label = Instance.new("TextLabel")
+                label.BackgroundTransparency = 1
+                label.Size = UDim2.fromScale(1, 1)
+                label.Font = Enum.Font.GothamBold
+                label.TextSize = 14
+                label.TextColor3 = Color3.fromRGB(255, 255, 255)
+                label.TextStrokeTransparency = 0.4
+                label.Text = object.Name == "NukeBunker" and "BUNKER" or "SAFE"
+                label.Parent = billboard
+
+                table.insert(ActiveMarkers, billboard)
+            end
+        end
+    end
+end
+
+local function nearestTower()
+    local root = getRoot()
+    if not root then
+        return nil, 0
+    end
+    local bestName, bestDistance = nil, math.huge
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("Model") and (object.Name == "EscapeTower" or object.Name == "NukeBunker") then
+            local ok, pivot = pcall(function()
+                return object:GetPivot().Position
+            end)
+            if ok and pivot then
+                local distance = (pivot - root.Position).Magnitude
+                if distance < bestDistance then
+                    bestDistance = distance
+                    bestName = object.Name
+                end
+            end
+        end
+    end
+    return bestName, bestDistance
+end
+
+----- Hazard watching -----
+local HazardNames = {
+    Preset_tsunami = "Tsunami",
+    Preset_meteor = "Meteor shower",
+    Preset_nuke = "Nuke",
+    Preset_volcano = "Volcano",
+    Preset_ice = "Freeze",
+    Preset_zombie = "Zombies",
+    Preset_pig = "Pigs",
+    Preset_delete = "Erase",
+    EscapeTower = "Safe tower",
+    NukeBunker = "Nuke bunker",
+}
+
+local function watchMatchContent()
+    local matchContent = Workspace:FindFirstChild("MatchContent")
+    if not matchContent then
+        return
+    end
+    track(matchContent.ChildAdded:Connect(function(child)
+        local label = HazardNames[child.Name]
+        if not label then
+            return
+        end
+        if HazardLog then
+            HazardLog:Push("<Accent>" .. label .. "</Accent> appeared", "Warning")
+        end
+        if Flags.HazardAlert then
+            playPing(1.15)
+            safeNotify({
+                Title = "Hazard incoming",
+                Content = label,
+                Icon = "triangle-alert",
+                Type = "Warning",
+                Duration = 3,
+            })
+        end
+        if (child.Name == "EscapeTower" or child.Name == "NukeBunker") and refreshMarkers then
+            refreshMarkers()
+        end
+    end))
+end
+
+local function watchWater()
+    local function refresh()
+        State.water = readNumber(Workspace:GetAttribute("SeaTop"), 0)
+        State.seaLevel = readNumber(Workspace:GetAttribute("SeaLevel"), 0)
+    end
+    refresh()
+    track(Workspace:GetAttributeChangedSignal("SeaTop"):Connect(refresh))
+    track(Workspace:GetAttributeChangedSignal("SeaLevel"):Connect(refresh))
+end
+
+----- Remote hooks -----
+local function hookRemotes()
+    if not Supported then
+        return
+    end
+
+    local writerChosen = WriterRemotes:FindFirstChild("WriterChosen")
+    local writerLive = WriterRemotes:FindFirstChild("WriterLive")
+    local wordAnnounced = WriterRemotes:FindFirstChild("WordAnnounced")
+
+    if writerChosen and writerChosen:IsA("RemoteEvent") then
+        track(writerChosen.OnClientEvent:Connect(function(name)
+            State.liveWriter = tostring(name or "")
+            if State.liveWriter == LocalPlayer.Name and Flags.TurnAlert then
+                playPing(1.35)
+                flashHud()
+                safeNotify({
+                    Title = "Your turn to write",
+                    Content = "Whatever you type becomes real",
+                    Icon = "pencil-line",
+                    Type = "Success",
+                    Duration = 4,
+                })
+            end
+        end))
+    end
+
+    if writerLive and writerLive:IsA("RemoteEvent") then
+        track(writerLive.OnClientEvent:Connect(function(tag, a, b)
+            -- "begin" carries the writer character and the writer name,
+            -- the typed text arrives as "text", the locked word as "stamp".
+            if tag == "begin" then
+                State.liveWord = ""
+                if type(b) == "string" and b ~= "" then
+                    State.liveWriter = b
+                end
+            elseif tag == "text" then
+                State.liveWord = tostring(a or "")
+            elseif tag == "stamp" then
+                State.liveWord = tostring(a or "")
+            end
+        end))
+    end
+
+    if wordAnnounced and wordAnnounced:IsA("RemoteEvent") then
+        track(wordAnnounced.OnClientEvent:Connect(function(rich)
+            local writer, word = parseAnnouncement(rich)
+            pushWord(writer, word)
+            if WordLog then
+                WordLog:Push("<b>" .. writer .. "</b> wrote <Accent>" .. word .. "</Accent>")
+            end
+            if Flags.WordAlert then
+                playPing(1)
+                safeNotify({
+                    Title = word,
+                    Content = "written by " .. writer,
+                    Icon = "scroll-text",
+                    Type = "Info",
+                    Duration = 3,
+                })
+            end
+            task.delay(4, function()
+                if State.liveWord == word then
+                    State.liveWord = ""
+                end
+            end)
+        end))
+    end
+
+    if EconomyRemotes then
+        local deathFeed = EconomyRemotes:FindFirstChild("DeathFeed")
+        if deathFeed and deathFeed:IsA("RemoteEvent") then
+            track(deathFeed.OnClientEvent:Connect(function(a, b)
+                local text = type(a) == "string" and a or tostring(b or "")
+                if DeathLog and text ~= "" then
+                    DeathLog:Push("<Muted>" .. text .. "</Muted>")
+                end
+            end))
+        end
+    end
+
+    if NukeRemotes then
+        local nuke = NukeRemotes:FindFirstChild("Nuke")
+        if nuke and nuke:IsA("RemoteEvent") then
+            track(nuke.OnClientEvent:Connect(function()
+                if HazardLog then
+                    HazardLog:Push("<Error>Nuke launched</Error>", "Error")
+                end
+                if Flags.HazardAlert then
+                    playPing(0.75)
+                end
+            end))
+        end
+    end
+
+    if IslandRemotes then
+        local zoneDoomed = IslandRemotes:FindFirstChild("ZoneDoomed")
+        if zoneDoomed and zoneDoomed:IsA("RemoteEvent") then
+            track(zoneDoomed.OnClientEvent:Connect(function()
+                if HazardLog then
+                    HazardLog:Push("<Warning>Your zone is sinking</Warning>", "Warning")
+                end
+                if Flags.HazardAlert then
+                    playPing(0.9)
+                end
+            end))
+        end
+    end
+end
+
+----- Floating HUD -----
+local function resolveGuiParent()
+    local ok, hidden = pcall(function()
+        return gethui and gethui() or nil
+    end)
+    if ok and hidden then
+        return hidden
+    end
+    return LocalPlayer:FindFirstChild("PlayerGui")
+end
+
+local function buildHud()
+    local parent = resolveGuiParent()
+    if not parent then
+        return
+    end
+
+    local old = parent:FindFirstChild("SYI_HubHud")
+    if old then
+        old:Destroy()
+    end
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "SYI_HubHud"
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = true
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screen.DisplayOrder = 90
+    screen.Parent = parent
+
+    local card = Instance.new("Frame")
+    card.Name = "Card"
+    card.AnchorPoint = Vector2.new(0.5, 0)
+    card.Position = UDim2.new(0.5, 0, 0, 8)
+    card.Size = UDim2.fromOffset(340, 96)
+    card.BackgroundColor3 = THEME.Background
+    card.BackgroundTransparency = 0.15
+    card.BorderSizePixel = 0
+    card.Parent = screen
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = card
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = THEME.Accent
+    stroke.Thickness = 1
+    stroke.Transparency = 0.35
+    stroke.Parent = card
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(12, 6)
+    title.Size = UDim2.new(1, -24, 0, 16)
+    title.Font = Enum.Font.GothamMedium
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = THEME.Muted
+    title.Text = "SURVIVE YOUR IDEAS"
+    title.Parent = card
+
+    local wordLabel = Instance.new("TextLabel")
+    wordLabel.Name = "Word"
+    wordLabel.BackgroundTransparency = 1
+    wordLabel.Position = UDim2.fromOffset(12, 24)
+    wordLabel.Size = UDim2.new(1, -24, 0, 32)
+    wordLabel.Font = Enum.Font.GothamBold
+    wordLabel.TextSize = 24
+    wordLabel.TextXAlignment = Enum.TextXAlignment.Left
+    wordLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    wordLabel.TextColor3 = THEME.Text
+    wordLabel.Text = "-"
+    wordLabel.Parent = card
+
+    local line = Instance.new("TextLabel")
+    line.Name = "Line"
+    line.BackgroundTransparency = 1
+    line.Position = UDim2.fromOffset(12, 58)
+    line.Size = UDim2.new(1, -24, 0, 16)
+    line.Font = Enum.Font.Gotham
+    line.TextSize = 12
+    line.TextXAlignment = Enum.TextXAlignment.Left
+    line.TextColor3 = THEME.Muted
+    line.Text = ""
+    line.Parent = card
+
+    local water = Instance.new("TextLabel")
+    water.Name = "Water"
+    water.BackgroundTransparency = 1
+    water.Position = UDim2.fromOffset(12, 74)
+    water.Size = UDim2.new(1, -24, 0, 16)
+    water.Font = Enum.Font.Gotham
+    water.TextSize = 12
+    water.TextXAlignment = Enum.TextXAlignment.Left
+    water.TextColor3 = THEME.Muted
+    water.Text = ""
+    water.Parent = card
+
+    HudRoot = screen
+    screen.Enabled = Flags.HudEnabled
+end
+
+local function updateHud()
+    if not HudRoot then
+        return
+    end
+    local card = HudRoot:FindFirstChild("Card")
+    if not card then
+        return
+    end
+    local wordLabel = card:FindFirstChild("Word")
+    local lineLabel = card:FindFirstChild("Line")
+    local waterLabel = card:FindFirstChild("Water")
+
+    local word = State.liveWord ~= "" and State.liveWord or State.lastWord
+    if wordLabel then
+        wordLabel.Text = (word ~= "" and word) or "-"
+        wordLabel.TextColor3 = State.liveWord ~= "" and THEME.Accent or THEME.Text
+    end
+
+    if lineLabel then
+        if State.liveWord ~= "" then
+            lineLabel.Text = State.liveWriter ~= "" and (State.liveWriter .. " is typing") or "typing"
+        elseif State.lastWord ~= "" then
+            lineLabel.Text = (State.lastWriter ~= "" and State.lastWriter or "someone") .. " wrote it"
+        else
+            lineLabel.Text = "waiting for the first word"
+        end
+    end
+
+    if waterLabel then
+        local root = getRoot()
+        if root then
+            local margin = root.Position.Y - State.water
+            if margin < Flags.WaterMargin then
+                waterLabel.Text = string.format("water %.1f studs above your feet - GET HIGHER", math.abs(margin))
+                waterLabel.TextColor3 = Color3.fromRGB(255, 96, 96)
+            else
+                waterLabel.Text = string.format("water %.1f  |  you have %.1f studs of room", State.water, margin)
+                waterLabel.TextColor3 = THEME.Muted
+            end
+        else
+            waterLabel.Text = ""
+        end
+    end
+end
+
+----- UI -----
+local Airflow = nil
+do
+    local sources = {
+        "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+        "https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+    }
+    for _, url in ipairs(sources) do
+        local ok, library = pcall(function()
+            return loadstring(game:HttpGet(url))()
+        end)
+        if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+            Airflow = library
+            break
+        end
+    end
+    if not Airflow then
+        error("[" .. HUB_NAME .. "] Airflow UI could not be loaded")
+    end
+end
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+    Airflow:SetDefaultTheme(THEME)
+end)
+
+Window = Airflow:CreateWindow({
+    Name = HUB_NAME,
+    LoadingSubtitle = "round info, word feed, safety",
+    ToggleUIKeybind = "RightControl",
+    Size = UDim2.fromOffset(780, 540),
+    Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+    Theme = THEME,
+    ConfigurationSaving = { Enabled = true, FolderName = CONFIG_FOLDER },
+    Home = {
+        Title = HUB_NAME,
+        Welcome = "Welcome back,",
+        Tier = "v" .. HUB_VERSION,
+        Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+    },
+})
+
+----- Tab: Round -----
+local RoundTab = Window:CreateTab({ Name = "Round", Icon = "timer" })
+local LiveBox = RoundTab:CreateGroupbox({ Name = "Right now", Side = "Left" })
+local AlertBox = RoundTab:CreateGroupbox({ Name = "Alerts", Side = "Right" })
+
+LiveBox:CreateStatus({
+    Name = "Phase",
+    Style = "Row",
+    Pin = true,
+    UpdateRate = 0.5,
+    Update = function()
+        if not Supported then
+            return "<Error>Unsupported place</Error>"
+        end
+        if State.liveWriter == LocalPlayer.Name then
+            return "<Accent>Your turn</Accent>"
+        end
+        if State.liveWord ~= "" then
+            return "Typing"
+        end
+        local message = readMessage()
+        if message ~= "" then
+            return message
+        end
+        return "Idle"
+    end,
+})
+
+LiveBox:CreateStatus({
+    Name = "Alive",
+    Style = "Row",
+    Pin = true,
+    UpdateRate = 0.5,
+    Update = function()
+        return tostring(readAliveCount())
+    end,
+})
+
+LiveBox:CreateStatus({
+    Name = "Time",
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        return fmtSeconds(readTimeLeft())
+    end,
+})
+
+LiveBox:CreateStatus({
+    Name = "Your writer chance",
+    Style = "Row",
+    UpdateRate = 1,
+    Update = function()
+        return string.format("%.1f%%", myWriterChance())
+    end,
+})
+
+LiveBox:CreateLabel({
+    Text = "No word yet",
+    UpdateRate = 0.3,
+    Update = function()
+        if State.liveWord ~= "" then
+            return "Now typing: <Accent>" .. State.liveWord .. "</Accent>"
+        end
+        if State.lastWord ~= "" then
+            return "Last word: <b>" .. State.lastWord .. "</b> (" .. State.lastWriter .. ")"
+        end
+        return "No word yet"
+    end,
+})
+
+LiveBox:CreateParagraph({
+    Title = "Live word preview",
+    Content = "The word shows up here while the writer types it, before the round announces it.",
+})
+
+AlertBox:CreateSection("Alerts")
+AlertBox:CreateToggle({
+    Name = "Your turn",
+    Desc = "Sound and toast when the game picks you to write",
+    Flag = "SYI_TurnAlert",
+    CurrentValue = true,
+    Callback = function(value)
+        Flags.TurnAlert = value
+    end,
+})
+AlertBox:CreateToggle({
+    Name = "Announce every word",
+    Desc = "Toast for each announced word",
+    Flag = "SYI_WordAlert",
+    CurrentValue = false,
+    Callback = function(value)
+        Flags.WordAlert = value
+    end,
+})
+AlertBox:CreateToggle({
+    Name = "Hazard warnings",
+    Desc = "Sound when a new hazard object appears",
+    Flag = "SYI_HazardAlert",
+    CurrentValue = true,
+    Callback = function(value)
+        Flags.HazardAlert = value
+    end,
+})
+AlertBox:CreateSlider({
+    Name = "Water warning margin",
+    Desc = "Warn when the sea is this close to you",
+    Range = { 0, 40 },
+    Increment = 1,
+    Suffix = " studs",
+    CurrentValue = 6,
+    Flag = "SYI_WaterMargin",
+    Callback = function(value)
+        Flags.WaterMargin = value
+    end,
+})
+
+----- Tab: Words -----
+local WordsTab = Window:CreateTab({ Name = "Words", Icon = "scroll-text" })
+local FeedBox = WordsTab:CreateGroupbox({ Name = "This session", Side = "Left" })
+local RawBox = WordsTab:CreateGroupbox({ Name = "Raw feed", Side = "Right" })
+
+WordTable = FeedBox:CreateTable({
+    Name = "Words written",
+    Rank = true,
+    Columns = {
+        { Name = "Word", Width = 0.46 },
+        { Name = "Writer", Width = 0.32 },
+        { Name = "Time", Align = "Right", Width = 0.22 },
+    },
+    Rows = {},
+    MaxRows = 9,
+    EmptyText = "No words yet",
+    SearchPlaceholder = "Find a word",
+})
+
+FeedBox:CreateButtonRow({
+    { Name = "Copy list", Callback = function()
+        local lines = {}
+        for _, row in ipairs(State.words) do
+            table.insert(lines, row.Word .. " - " .. row.Writer .. " - " .. row.Time)
+        end
+        local ok = pcall(function()
+            if setclipboard then
+                setclipboard(table.concat(lines, "\n"))
+            elseif toclipboard then
+                toclipboard(table.concat(lines, "\n"))
+            end
+        end)
+        safeNotify({
+            Title = ok and "Copied" or "Clipboard is closed",
+            Content = ok and (#State.words .. " words") or "Your executor has no clipboard",
+            Icon = "clipboard",
+            Type = ok and "Success" or "Warning",
+        })
+    end },
+    { Name = "Clear", Style = "Secondary", Callback = function()
+        State.words = {}
+        pcall(function()
+            WordTable:SetRows({})
+        end)
+        if WordLog then
+            WordLog:Clear()
+        end
+    end },
+})
+
+WordLog = RawBox:CreateLog({
+    Name = "Announcements",
+    MaxEntries = 200,
+    MaxRows = 5,
+    Timestamps = true,
+    EmptyText = "Nothing announced yet",
+})
+
+DeathLog = RawBox:CreateLog({
+    Name = "Deaths",
+    MaxEntries = 80,
+    MaxRows = 5,
+    Timestamps = true,
+    EmptyText = "Nobody died yet",
+})
+
+----- Tab: Players -----
+local PlayersTab = Window:CreateTab({ Name = "Players", Icon = "users" })
+local RankBox = PlayersTab:CreateGroupbox({ Name = "Writer chance", Side = "Left" })
+local InfoBox = PlayersTab:CreateGroupbox({ Name = "How it works", Side = "Right" })
+
+PlayerTable = RankBox:CreateTable({
+    Name = "Likely to write next",
+    Rank = true,
+    Columns = {
+        { Name = "Player", Width = 0.5 },
+        { Name = "Chance", Align = "Right", Width = 0.25 },
+        { Name = "State", Align = "Right", Width = 0.25 },
+    },
+    Rows = {},
+    MaxRows = 10,
+    EmptyText = "No players",
+    Search = false,
+    Highlight = function(row)
+        return row[1] == LocalPlayer.Name
+    end,
+})
+
+InfoBox:CreateParagraph({
+    Title = "Why the chance matters",
+    Content = "The game stores a writer chance on every player, and the higher it is, the more often that player is picked to write. This board sorts the server by that number.",
+})
+
+InfoBox:CreateSection("Hazards")
+HazardLog = InfoBox:CreateLog({
+    Name = "Hazard feed",
+    MaxEntries = 60,
+    MaxRows = 7,
+    Timestamps = true,
+    EmptyText = "Calm so far",
+})
+
+----- Tab: Safe -----
+local SafeTab = Window:CreateTab({ Name = "Safe", Icon = "shield" })
+local TowerBox = SafeTab:CreateGroupbox({ Name = "Towers", Side = "Left" })
+local WaterBox = SafeTab:CreateGroupbox({ Name = "Water", Side = "Right" })
+
+TowerBox:CreateToggle({
+    Name = "Mark safe towers",
+    Desc = "Highlight every escape tower and nuke bunker",
+    Flag = "SYI_TowerMarkers",
+    CurrentValue = true,
+    Callback = function(value)
+        Flags.TowerMarkers = value
+        if refreshMarkers then
+            refreshMarkers()
+        end
+    end,
+})
+TowerBox:CreateSlider({
+    Name = "Marker distance",
+    Range = { 50, 2000 },
+    Increment = 50,
+    Suffix = " studs",
+    CurrentValue = 400,
+    Flag = "SYI_MarkerDistance",
+    Callback = function(value)
+        Flags.MarkerDistance = value
+        if refreshMarkers then
+            refreshMarkers()
+        end
+    end,
+})
+TowerBox:CreateButton({
+    Name = "Scan again",
+    Icon = "refresh-cw",
+    Callback = function()
+        if refreshMarkers then
+            refreshMarkers()
+        end
+        safeNotify({ Title = "Markers refreshed", Icon = "refresh-cw", Type = "Info" })
+    end,
+})
+TowerBox:CreateStatus({
+    Name = "Nearest",
+    Style = "Row",
+    UpdateRate = 0.75,
+    Update = function()
+        local name, distance = nearestTower()
+        if not name then
+            return "<Muted>none found</Muted>"
+        end
+        local label = name == "NukeBunker" and "Bunker" or "Tower"
+        return string.format("%s - %.0f studs", label, distance)
+    end,
+})
+
+WaterBox:CreateStatus({
+    Name = "Sea level",
+    Style = "Row",
+    Pin = true,
+    UpdateRate = 0.5,
+    Update = function()
+        return string.format("%.1f", State.water)
+    end,
+})
+WaterBox:CreateStatus({
+    Name = "Your height",
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        local root = getRoot()
+        return root and string.format("%.1f", root.Position.Y) or "-"
+    end,
+})
+WaterBox:CreateStatus({
+    Name = "Room left",
+    Style = "Row",
+    UpdateRate = 0.5,
+    Update = function()
+        local root = getRoot()
+        if not root then
+            return "-"
+        end
+        return string.format("%.1f studs", math.max(0, root.Position.Y - State.water))
+    end,
+})
+WaterBox:CreateParagraph({
+    Title = "Getting higher",
+    Content = "The sea level is a live world value, so this meter moves the moment the water starts to rise. Escape towers and bunkers are the intended way up.",
+})
+
+----- Tab: Items -----
+local ItemsTab = Window:CreateTab({ Name = "Items", Icon = "backpack" })
+local ItemListBox = ItemsTab:CreateGroupbox({ Name = "Library", Side = "Left" })
+local ItemInfoBox = ItemsTab:CreateGroupbox({ Name = "Details", Side = "Right" })
+
+local ItemRows = {}
+if ItemLibrary and type(ItemLibrary.Items) == "table" then
+    for _, item in ipairs(ItemLibrary.Items) do
+        local cooldown = "-"
+        if type(item.use) == "table" and item.use.seconds then
+            cooldown = tostring(item.use.seconds) .. "s"
+        end
+        table.insert(ItemRows, { item.name or item.id, item.tier or "?", cooldown })
+    end
+end
+
+local ItemParagraph = ItemInfoBox:CreateParagraph({
+    Title = "Pick an item",
+    Content = "Click any row to read what it does.",
+})
+
+ItemListBox:CreateTable({
+    Name = "All items",
+    Columns = {
+        { Name = "Item", Width = 0.55 },
+        { Name = "Tier", Width = 0.27 },
+        { Name = "Cooldown", Align = "Right", Width = 0.18 },
+    },
+    Rows = ItemRows,
+    MaxRows = 9,
+    EmptyText = "Item library is not readable here",
+    SearchPlaceholder = "Search items",
+    Callback = function(row)
+        local clicked = row and row[1] or ""
+        if not ItemLibrary or type(ItemLibrary.Items) ~= "table" then
+            return
+        end
+        for _, item in ipairs(ItemLibrary.Items) do
+            if (item.name or item.id) == clicked then
+                ItemParagraph:Set("<b>" .. (item.name or item.id) .. "</b> - " .. (item.tier or "?")
+                    .. "\n" .. (item.description or ""))
+                return
+            end
+        end
+    end,
+})
+
+local MetaRows = {}
+if MetaWordsConfig and type(MetaWordsConfig.WORDS) == "table" then
+    for _, entry in ipairs(MetaWordsConfig.WORDS) do
+        local price = "-"
+        if entry.robux then
+            price = tostring(entry.robux) .. " R$"
+        elseif entry.price then
+            price = tostring(entry.price)
+        end
+        table.insert(MetaRows, { entry.word, price, entry.description or "" })
+    end
+end
+
+ItemInfoBox:CreateTable({
+    Name = "Meta words",
+    Columns = {
+        { Name = "Word", Width = 0.3 },
+        { Name = "Price", Align = "Right", Width = 0.24 },
+        { Name = "What it does", Width = 0.46 },
+    },
+    Rows = MetaRows,
+    MaxRows = 6,
+    Search = false,
+    EmptyText = "No meta words readable",
+})
+
+----- Tab: Catalog -----
+local CatalogTab = Window:CreateTab({ Name = "Catalog", Icon = "book-open" })
+local AllWordsBox = CatalogTab:CreateGroupbox({ Name = "All words", Side = "Left" })
+local TypingBox = CatalogTab:CreateGroupbox({ Name = "While typing", Side = "Right" })
+
+local CatalogRows = {}
+local CatalogTotal = 0
+local CatalogLoaded = false
+
+local DiaryFolder = ReplicatedStorage:FindFirstChild("Diary")
+local CatalogModule = DiaryFolder and DiaryFolder:FindFirstChild("DiaryCatalog")
+if CatalogModule then
+    local okRequire, catalog = pcall(require, CatalogModule)
+    if okRequire and type(catalog) == "table" and type(catalog.all) == "function" then
+        local okAll, entries = pcall(catalog.all)
+        if okAll and type(entries) == "table" then
+            local seen = {}
+            for id, entry in pairs(entries) do
+                local word = tostring(entry.key or id)
+                if not seen[word] then
+                    seen[word] = true
+                    table.insert(CatalogRows, {
+                        word,
+                        tostring(entry.cat or "?"),
+                        tostring(entry.line or ""),
+                    })
+                end
+            end
+            table.sort(CatalogRows, function(a, b)
+                return a[1] < b[1]
+            end)
+            CatalogTotal = #CatalogRows
+            CatalogLoaded = true
+        end
+    end
+end
+
+local categoryNames = { "All" }
+do
+    local seen = {}
+    for _, row in ipairs(CatalogRows) do
+        if not seen[row[2]] then
+            seen[row[2]] = true
+            table.insert(categoryNames, row[2])
+        end
+    end
+    table.sort(categoryNames, function(a, b)
+        if a == "All" then
+            return true
+        end
+        if b == "All" then
+            return false
+        end
+        return a < b
+    end)
+end
+
+local currentCategory = "All"
+local showInternal = false
+local catalogTable = nil
+
+local function isInternalWord(word)
+    return string.find(word, ":", 1, true) ~= nil
+end
+
+local function collectCatalogRows()
+    local rows = {}
+    for _, row in ipairs(CatalogRows) do
+        local categoryMatches = currentCategory == "All" or row[2] == currentCategory
+        local visibilityMatches = showInternal or not isInternalWord(row[1])
+        if categoryMatches and visibilityMatches then
+            table.insert(rows, row)
+        end
+    end
+    return rows
+end
+
+local function applyCatalogFilter()
+    local rows = collectCatalogRows()
+    if catalogTable then
+        pcall(function()
+            catalogTable:SetRows(rows)
+        end)
+    end
+    return #rows
+end
+
+local initialRows = collectCatalogRows()
+
+local CatalogCount = AllWordsBox:CreateStatus({
+    Name = "Words",
+    Style = "Row",
+    Pin = true,
+    Value = CatalogLoaded and (tostring(#initialRows) .. " / " .. tostring(CatalogTotal)) or "not readable",
+})
+
+AllWordsBox:CreateDropdown({
+    Name = "Category",
+    Options = categoryNames,
+    CurrentOption = "All",
+    Flag = "SYI_Category",
+    Callback = function(value)
+        currentCategory = value or "All"
+        local shown = applyCatalogFilter()
+        CatalogCount:Set(shown .. " / " .. tostring(CatalogTotal))
+    end,
+})
+
+AllWordsBox:CreateToggle({
+    Name = "Show internal variants",
+    Desc = "Ids the game spawns itself, like food:Apple",
+    Flag = "SYI_Internal",
+    CurrentValue = false,
+    Callback = function(value)
+        showInternal = value
+        local shown = applyCatalogFilter()
+        CatalogCount:Set(shown .. " / " .. tostring(CatalogTotal))
+    end,
+})
+
+local CatalogParagraph = TypingBox:CreateParagraph({
+    Title = "Pick a word",
+    Content = CatalogLoaded
+        and "Click any row to read what the word does."
+        or "The word registry is not readable from this place.",
+})
+
+catalogTable = AllWordsBox:CreateTable({
+    Name = "Every word in the game",
+    Columns = {
+        { Name = "Word", Width = 0.26 },
+        { Name = "Category", Width = 0.22 },
+        { Name = "What happens", Width = 0.52 },
+    },
+    Rows = initialRows,
+    MaxRows = 12,
+    EmptyText = "The word registry is not readable here",
+    SearchPlaceholder = "Search all words",
+    Callback = function(row)
+        if not row then
+            return
+        end
+        CatalogParagraph:Set("<b>" .. tostring(row[1]) .. "</b> - " .. tostring(row[2])
+            .. "\n" .. tostring(row[3]))
+    end,
+})
+
+TypingBox:CreateSection("Live match")
+TypingBox:CreateStatusList({
+    Name = "Matching what is typed",
+    MaxRows = 6,
+    EmptyText = "nobody is typing",
+    UpdateRate = 0.4,
+    Update = function()
+        if not CatalogLoaded then
+            return nil
+        end
+        local prefix = State.liveWord
+        if prefix == "" then
+            return nil
+        end
+        local needle = string.lower(prefix)
+        local matches = {}
+        for _, row in ipairs(CatalogRows) do
+            if string.sub(string.lower(row[1]), 1, #needle) == needle then
+                table.insert(matches, { Text = row[1], Value = row[3], Tone = "Accent" })
+            end
+        end
+        if #matches == 0 then
+            return { { Text = "<Muted>" .. prefix .. "</Muted>", Value = "no match" } }
+        end
+        table.sort(matches, function(a, b)
+            if #a.Text == #b.Text then
+                return a.Text < b.Text
+            end
+            return #a.Text < #b.Text
+        end)
+        while #matches > 6 do
+            table.remove(matches)
+        end
+        return matches
+    end,
+})
+
+TypingBox:CreateParagraph({
+    Title = "Why this matters",
+    Content = "The word is sent to the client letter by letter while the writer types. Here the letters are matched against the registry, so the coming hazard is known before it is announced.",
+})
+
+----- Tab: World -----
+local WorldTab = Window:CreateTab({ Name = "World", Icon = "globe" })
+local VisualBox = WorldTab:CreateGroupbox({ Name = "Visuals", Side = "Left" })
+local MiscBox = WorldTab:CreateGroupbox({ Name = "Convenience", Side = "Right" })
+
+local LightingBackup = nil
+local ParticleBackup = nil
+
+local function setFullbright(on)
+    if on then
+        if not LightingBackup then
+            LightingBackup = {
+                Ambient = Lighting.Ambient,
+                OutdoorAmbient = Lighting.OutdoorAmbient,
+                Brightness = Lighting.Brightness,
+                ClockTime = Lighting.ClockTime,
+                GlobalShadows = Lighting.GlobalShadows,
+                FogEnd = Lighting.FogEnd,
+                ExposureCompensation = Lighting.ExposureCompensation,
+            }
+        end
+        Lighting.Ambient = Color3.fromRGB(178, 178, 178)
+        Lighting.OutdoorAmbient = Color3.fromRGB(178, 178, 178)
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 12
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 1000000
+        Lighting.ExposureCompensation = 0.4
+    elseif LightingBackup then
+        Lighting.Ambient = LightingBackup.Ambient
+        Lighting.OutdoorAmbient = LightingBackup.OutdoorAmbient
+        Lighting.Brightness = LightingBackup.Brightness
+        Lighting.ClockTime = LightingBackup.ClockTime
+        Lighting.GlobalShadows = LightingBackup.GlobalShadows
+        Lighting.FogEnd = LightingBackup.FogEnd
+        Lighting.ExposureCompensation = LightingBackup.ExposureCompensation
+        LightingBackup = nil
+    end
+end
+
+local function setParticles(on)
+    if on then
+        if ParticleBackup then
+            for _, emitter in ipairs(ParticleBackup) do
+                pcall(function()
+                    emitter.Enabled = true
+                end)
+            end
+            ParticleBackup = nil
+        end
+        return
+    end
+    if ParticleBackup then
+        return
+    end
+    ParticleBackup = {}
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("ParticleEmitter") or object:IsA("Fire") or object:IsA("Smoke") or object:IsA("Sparkles") then
+            if object.Enabled then
+                object.Enabled = false
+                table.insert(ParticleBackup, object)
+            end
+        end
+    end
+end
+
+VisualBox:CreateToggle({
+    Name = "Fullbright",
+    Desc = "Bright noon light and no fog",
+    Flag = "SYI_Fullbright",
+    CurrentValue = false,
+    Callback = function(value)
+        setFullbright(value)
+    end,
+})
+VisualBox:CreateToggle({
+    Name = "Max zoom",
+    Desc = "Pull the camera far back to watch hazards",
+    Flag = "SYI_MaxZoom",
+    CurrentValue = false,
+    Callback = function(value)
+        if value then
+            ZoomBackup = LocalPlayer.CameraMaxZoomDistance
+            LocalPlayer.CameraMaxZoomDistance = 1000
+        else
+            LocalPlayer.CameraMaxZoomDistance = ZoomBackup or 128
+            ZoomBackup = nil
+        end
+    end,
+})
+VisualBox:CreateSlider({
+    Name = "Field of view",
+    Range = { 50, 120 },
+    Increment = 1,
+    CurrentValue = 70,
+    Flag = "SYI_Fov",
+    Callback = function(value)
+        local camera = Workspace.CurrentCamera
+        if camera then
+            camera.FieldOfView = value
+        end
+    end,
+})
+VisualBox:CreateToggle({
+    Name = "Lighter effects",
+    Desc = "Turn off particles and fire for more FPS",
+    Flag = "SYI_LowFx",
+    CurrentValue = false,
+    Callback = function(value)
+        setParticles(not value)
+    end,
+})
+
+MiscBox:CreateToggle({
+    Name = "Compact HUD",
+    Desc = "Small card with the live word and the water level",
+    Flag = "SYI_Hud",
+    CurrentValue = true,
+    Callback = function(value)
+        Flags.HudEnabled = value
+        if HudRoot then
+            HudRoot.Enabled = value
+        end
+    end,
+})
+MiscBox:CreateKeybind({
+    Name = "Toggle HUD key",
+    CurrentKeybind = "F2",
+    Flag = "SYI_HudKey",
+    Callback = function()
+        Flags.HudEnabled = not Flags.HudEnabled
+        if HudRoot then
+            HudRoot.Enabled = Flags.HudEnabled
+        end
+    end,
+})
+MiscBox:CreateToggle({
+    Name = "Anti AFK",
+    Desc = "Keeps you in the server while you wait",
+    Flag = "SYI_AntiAfk",
+    CurrentValue = false,
+    Callback = function(value)
+        if value then
+            if not AntiAfkConnection then
+                AntiAfkConnection = LocalPlayer.Idled:Connect(function()
+                    pcall(function()
+                        VirtualUser:CaptureController()
+                        VirtualUser:ClickButton2(Vector2.new())
+                    end)
+                end)
+            end
+        elseif AntiAfkConnection then
+            AntiAfkConnection:Disconnect()
+            AntiAfkConnection = nil
+        end
+    end,
+})
+
+----- Tab: Settings -----
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
+AboutBox:CreateParagraph({
+    Title = HUB_NAME,
+    Content = "v" .. HUB_VERSION
+        .. " - round info, live word preview, the full word registry, hazard and water warnings, safe tower markers, item library.",
+})
+AboutBox:CreateButton({
+    Name = "Unload",
+    Icon = "power",
+    Style = "Secondary",
+    Confirm = true,
+    Callback = function()
+        if Cleanup then
+            Cleanup()
+        end
+    end,
+})
+
+----- Cleanup -----
+function Cleanup()
+    pcall(disconnectAll)
+    pcall(clearMarkers)
+    pcall(function()
+        setFullbright(false)
+    end)
+    pcall(function()
+        setParticles(true)
+    end)
+    pcall(function()
+        if ZoomBackup then
+            LocalPlayer.CameraMaxZoomDistance = ZoomBackup
+        end
+    end)
+    pcall(function()
+        if AntiAfkConnection then
+            AntiAfkConnection:Disconnect()
+        end
+    end)
+    pcall(function()
+        if HudRoot then
+            HudRoot:Destroy()
+        end
+    end)
+    pcall(function()
+        Window:Destroy()
+    end)
+    if getgenv then
+        getgenv().SYI_HUB = nil
+    end
+end
+
+if getgenv then
+    getgenv().SYI_HUB = { Cleanup = Cleanup }
+end
+
+----- Boot -----
+buildHud()
+
+if Supported then
+    watchWater()
+    watchMatchContent()
+    hookRemotes()
+    refreshMarkers()
+else
+    safeNotify({
+        Title = "Wrong game",
+        Content = "This script is for Survive Your Ideas only",
+        Icon = "triangle-alert",
+        Type = "Error",
+        Duration = 6,
+    })
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        local ok, err = pcall(updateHud)
+        if not ok then
+            warn("[SYI] hud update failed: " .. tostring(err))
+            break
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if not PlayerTable then
+            break
+        end
+        local entries = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            table.insert(entries, {
+                Name = player.Name,
+                Chance = readNumber(player:GetAttribute("WriterChance"), 0),
+                Player = player,
+            })
+        end
+        table.sort(entries, function(a, b)
+            return a.Chance > b.Chance
+        end)
+        local rows = {}
+        for _, entry in ipairs(entries) do
+            local state = "alive"
+            local character = entry.Player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 then
+                state = "out"
+            end
+            table.insert(rows, { entry.Name, string.format("%.1f%%", entry.Chance), state })
+        end
+        pcall(function()
+            PlayerTable:SetRows(rows)
+        end)
+    end
+end)
+
+local autoloadOk, autoloadErr = pcall(function()
+    Window:LoadAutoload()
+end)
+if not autoloadOk then
+    warn("[SYI] autoload failed: " .. tostring(autoloadErr))
+end
+
+safeNotify({
+    Title = "Loaded",
+    Content = HUB_NAME .. " v" .. HUB_VERSION,
+    Icon = "check",
+    Type = "Success",
+})
