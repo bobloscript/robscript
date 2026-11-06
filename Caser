@@ -1,4 +1,5 @@
 --[[
+pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
 =====================================================================
   CASER - Case Farm Hub (Potassium / Robly Airflow UI)
   v1.0 - auto case opening with rotation, inventory selling by filters
@@ -150,6 +151,32 @@ end
 
 ----- Formatting helpers -----
 
+-- The game prints money as credits / 100 ("1 805.07" for 180507 credits, see Economy.money),
+-- with a space every three digits and no ".00" tail. Every number the user sees in this hub
+-- goes through the same two functions, so the hub and the game never disagree.
+local MONEY_UNIT = 100
+
+local function gameMoney(value)
+	value = tonumber(value) or 0
+	local formatted = string.format("%.2f", math.abs(value) / MONEY_UNIT)
+	local whole, cents = string.match(formatted, "^(%d+)%.(%d+)$")
+	if not whole then
+		return formatted
+	end
+	whole = string.reverse(string.reverse(whole):gsub("(%d%d%d)", "%1 ")):gsub("^%s", "")
+	local negative = value < 0 and (whole ~= "0" or cents ~= "00")
+	return (negative and "-" or "") .. whole .. (cents == "00" and "" or "." .. cents)
+end
+
+local function money(value)
+	return gameMoney(value) .. " ◈"
+end
+
+-- Sliders are shown in the same units the game uses (credits / 100), the API stays in credits.
+local function unitsToCredits(units)
+	return (tonumber(units) or 0) * MONEY_UNIT
+end
+
 local function formatNumber(value)
 	value = tonumber(value) or 0
 	local sign = value < 0 and "-" or ""
@@ -162,10 +189,6 @@ local function formatNumber(value)
 		return string.format("%s%.1fk", sign, value / 1e3)
 	end
 	return sign .. tostring(math.floor(value))
-end
-
-local function money(value)
-	return formatNumber(value) .. " ◈"
 end
 
 local function shortTime(seconds)
@@ -253,11 +276,16 @@ local function toggleOf(element)
 	return valueOf(element, false) == true
 end
 
+-- Declared here because saveSaved below needs them; filled in by buildCaseList.
+local CaseList = {}
+local CaseByLabel = {}
+local LabelById = {}
+
 ----- Saved settings -----
 
 -- The Airflow window flags survive only while the script runs, and the rotation queue is not
 -- a flag at all, so the queue and the filters are kept in a small JSON file next to the script.
-local CONFIG_FILE = "CaserHub.json"
+local CONFIG_FILE = "RobscriptTeamCaser.json"
 local HttpService = game:GetService("HttpService")
 local Saved = {}
 
@@ -295,7 +323,13 @@ local function saveSaved()
 		if ok and type(current) == "table" then
 			for _, row in ipairs(current) do
 				if type(row) == "table" then
-					table.insert(rows, { Case = row.Case or row[1], Opens = row.Opens or row[2] })
+					local label = row.Case or row[1]
+					local entry = CaseByLabel[label]
+					table.insert(rows, {
+						Case = label,
+						Id = entry and entry.id or row.Id or nil,
+						Opens = row.Opens or row[2],
+					})
 				end
 			end
 		end
@@ -308,20 +342,28 @@ local function saveSaved()
 		sellEvery = valueOf(ui.sellEvery, nil),
 		autoSell = ui.autoSell and toggleOf(ui.autoSell) or nil,
 		forceSellAt = valueOf(ui.forceSellAt, nil),
-		minValue = valueOf(ui.minValue, nil),
-		maxValue = valueOf(ui.maxValue, nil),
+		minValueU = valueOf(ui.minValue, nil),
+		maxValueU = valueOf(ui.maxValue, nil),
 		rarities = valueOf(ui.rarityDropdown, nil),
 		kinds = valueOf(ui.kindDropdown, nil),
 		keywords = valueOf(ui.keywordInput, nil),
-		reserve = valueOf(ui.reserve, nil),
+		reserveU = valueOf(ui.reserve, nil),
 	}
 	local ok, encoded = pcall(function()
 		return HttpService:JSONEncode(data)
 	end)
-	if ok then
-		pcall(function()
-			writefile(CONFIG_FILE, encoded)
-		end)
+	if not ok then
+		State.lastSaveError = tostring(encoded)
+		return
+	end
+	local wrote, writeError = pcall(function()
+		writefile(CONFIG_FILE, encoded)
+	end)
+	if wrote then
+		State.lastSaveError = nil
+		State.lastSavedAt = os.clock()
+	else
+		State.lastSaveError = tostring(writeError)
 	end
 end
 
@@ -398,8 +440,6 @@ end
 
 ----- Case catalog view -----
 
-local CaseList = {}
-local CaseByLabel = {}
 
 local function casePriceText(case)
 	if case.vip then
@@ -415,6 +455,7 @@ end
 local function buildCaseList()
 	CaseList = {}
 	CaseByLabel = {}
+	LabelById = {}
 
 	local now = State.serverTime
 	local paid, special = {}, {}
@@ -429,6 +470,7 @@ local function buildCaseList()
 			end
 			local entry = { label = label, case = case, id = case.id, price = tonumber(case.price) or 0 }
 			CaseByLabel[label] = entry
+			LabelById[entry.id] = label
 			table.insert(CaseList, entry)
 			if case.free or case.vip then
 				table.insert(special, entry)
@@ -600,8 +642,8 @@ local function currentFilters()
 		rarities = selectedRarities(),
 		kinds = selectedKinds(),
 		keywords = keywordList(),
-		minValue = tonumber(valueOf(ui.minValue, 0)) or 0,
-		maxValue = tonumber(valueOf(ui.maxValue, 1e12)) or 1e12,
+		minValue = unitsToCredits(valueOf(ui.minValue, 0)),
+		maxValue = unitsToCredits(valueOf(ui.maxValue, 1e10)),
 		keepLocked = toggleOf(ui.keepLocked),
 	}
 end
@@ -959,7 +1001,7 @@ local function openAttempt()
 
 	local count = currentAmount()
 	local cost = entry.price * count
-	local reserve = tonumber(valueOf(ui.reserve, 0)) or 0
+	local reserve = unitsToCredits(valueOf(ui.reserve, 0))
 
 	if cost > 0 and credits() - cost < reserve then
 		State.skipReason = "not enough credits for " .. tostring(entry.case.name)
@@ -1230,7 +1272,7 @@ Airflow:SetDefaultTheme(THEME)
 ----- Window -----
 
 Window = Airflow:CreateWindow({
-	Name = "Caser Hub",
+	Name = "Robscript Team - Caser",
 	LoadingSubtitle = "auto cases, rotation, selling",
 	ToggleUIKeybind = "RightControl",
 	Size = UDim2.fromOffset(820, 580),
@@ -1238,7 +1280,7 @@ Window = Airflow:CreateWindow({
 	Theme = THEME,
 	ConfigurationSaving = { Enabled = true, FolderName = "CaserHub" },
 	Home = {
-		Title = "Caser Hub",
+		Title = "Robscript Team - Caser",
 		Welcome = "Welcome back,",
 		Tier = "v1.0",
 		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
@@ -1288,10 +1330,10 @@ ui.fastMode = OpenBox:CreateToggle({
 
 ui.reserve = OpenBox:CreateSlider({
 	Name = "Keep credits",
-	Desc = "Never spend below this balance",
-	Range = { 0, 20000000 },
-	Increment = 10000,
-	CurrentValue = tonumber(Saved.reserve) or 0,
+	Desc = "Never spend below this balance (same units as the game)",
+	Range = { 0, 200000 },
+	Increment = 100,
+	CurrentValue = tonumber(Saved.reserveU) or 0,
 	Suffix = " ◈",
 	Flag = "Reserve",
 })
@@ -1371,6 +1413,11 @@ do
 		for _, row in ipairs(Saved.rows) do
 			if type(row) == "table" then
 				local label = row.Case or row[1]
+				-- Labels carry the price, so they change when the formatting changes. Prefer
+				-- the stable case id and only then the old label.
+				if not CaseByLabel[label] and row.Id and LabelById[row.Id] then
+					label = LabelById[row.Id]
+				end
 				local opens = tonumber(row.Opens or row[2]) or 5
 				if CaseByLabel[label] then
 					table.insert(queueDefaults, { Case = label, Opens = math.max(1, math.floor(opens)) })
@@ -1495,7 +1542,7 @@ QueueBox:CreateButtonRow({
 			Callback = function()
 				local ok, result = pcall(loopStep)
 				if not ok then
-					notify("Caser Hub", tostring(result), "Error")
+					notify("Robscript Team - Caser", tostring(result), "Error")
 				end
 			end,
 		},
@@ -1561,9 +1608,9 @@ ui.keywordInput = FilterBox:CreateInput({
 ui.minValue = FilterBox:CreateSlider({
 	Name = "Sell items worth at least",
 	Desc = "0 = no lower limit",
-	Range = { 0, 5000000 },
-	Increment = 500,
-	CurrentValue = tonumber(Saved.minValue) or 0,
+	Range = { 0, 50000 },
+	Increment = 5,
+	CurrentValue = tonumber(Saved.minValueU) or 0,
 	Suffix = " ◈",
 	Flag = "SellMinValue",
 })
@@ -1571,9 +1618,9 @@ ui.minValue = FilterBox:CreateSlider({
 ui.maxValue = FilterBox:CreateSlider({
 	Name = "Keep items worth at least",
 	Desc = "Anything above this price is never sold",
-	Range = { 0, 30000000 },
-	Increment = 5000,
-	CurrentValue = tonumber(Saved.maxValue) or 250000,
+	Range = { 0, 300000 },
+	Increment = 50,
+	CurrentValue = tonumber(Saved.maxValueU) or 2500,
 	Suffix = " ◈",
 	Flag = "SellMaxValue",
 })
@@ -1612,9 +1659,9 @@ ActionBox:CreateButtonRow({
 				State.selling = false
 				local sold, gained = sellNow("manual")
 				if sold == 0 then
-					notify("Caser Hub", "Nothing matches the filters", "Warning")
+					notify("Robscript Team - Caser", "Nothing matches the filters", "Warning")
 				elseif sold then
-					notify("Caser Hub", string.format("Sold %d items for %s", sold, money(gained)), "Success")
+					notify("Robscript Team - Caser", string.format("Sold %d items for %s", sold, money(gained)), "Success")
 				end
 			end,
 		},
@@ -1624,7 +1671,7 @@ ActionBox:CreateButtonRow({
 				if refreshState() then
 					pushLog("<Muted>profile refreshed</Muted>")
 				else
-					notify("Caser Hub", "State request failed", "Error")
+					notify("Robscript Team - Caser", "State request failed", "Error")
 				end
 			end,
 		},
@@ -1799,15 +1846,7 @@ task.spawn(function()
 	if State.vip or presetUnlocked() then
 		pushLog("<Success>VIP/preset detected</Success> - up to 10 cases per call")
 	end
-	pushLog("<Muted>Caser Hub ready</Muted> - " .. tostring(#CaseList) .. " cases in the list")
-end)
-
--- Keep the queue and the filters on disk, so a reload does not lose the setup.
-task.spawn(function()
-	while true do
-		task.wait(10)
-		pcall(saveSaved)
-	end
+	pushLog("<Muted>Robscript Team - Caser ready</Muted> - " .. tostring(#CaseList) .. " cases in the list")
 end)
 
 ----- Public API -----
@@ -1816,6 +1855,7 @@ local api = {}
 
 local function destroy()
 	State.running = false
+	State.destroyed = true
 	State.token = State.token + 1
 	pcall(saveSaved)
 	pcall(function()
@@ -1852,16 +1892,33 @@ api = {
 	refresh = refreshState,
 	credits = credits,
 	inventory = inventory,
+	money = money,
+	gameMoney = gameMoney,
+	unitsToCredits = unitsToCredits,
 	filterPreview = function()
 		local ids, worth = collectSellable(currentFilters())
 		return { count = #ids, value = worth }
 	end,
 	skip = State.skipped,
 	destroy = destroy,
+	saveConfig = saveSaved,
+	configFile = CONFIG_FILE,
 	window = Window,
 	ui = ui,
 }
 
 getgenv().CaserHub = api
 
-pushLog("<Success>Caser Hub loaded</Success> - RightControl toggles the window")
+pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
+
+-- Registered last on purpose: the loop compares itself with getgenv().CaserHub, so it has to
+-- run after the hub published itself there.
+task.spawn(function()
+	local owner = api
+	while owner ~= nil and getgenv().CaserHub == owner and not State.destroyed do
+		task.wait(10)
+		if getgenv().CaserHub == owner and not State.destroyed then
+			pcall(saveSaved)
+		end
+	end
+end)
