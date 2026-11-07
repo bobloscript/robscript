@@ -1,0 +1,1565 @@
+--!strict
+--[[
+	RobScript.com - Lift A Planet
+
+	A client-side automation hub for "[WORLD 2] Lift A Planet"
+	(PlaceId 93580582370636, by CoreForge Interactive).
+
+	Features:
+	  - Auto Train     keeps the Train tool equipped so the server keeps ticking strength
+	  - Auto Farm      teleports to a stage, starts the lift, clicks the bar and finishes it
+	  - Smart Farm     buys every booster of a stage, trains until the next stage is liftable,
+	                   then farms that stage, and repeats the cycle automatically
+	  - Auto Cash Out  user defined multiplier target with a panic bank fallback
+	  - Auto Buy       buys Speed / Push Up Time boosters from the station pads
+
+	Verified against the live game:
+	  Training        Humanoid:EquipTool(Backpack.Train) sets LocalPlayer.Training = true
+	  Lift start      fireproximityprompt(Workspace.Stages.Stage_N.Planet.LiftPrompt)
+	  Lift clicks     ReplicatedStorage.Remotes.LiftClick:FireServer()  (no arguments)
+	  Cash out        ReplicatedStorage.Remotes.LiftBank:FireServer()   (no arguments)
+	  Multiplier      LiftUI.OverloadLabel.Text  ->  "x4.6"
+	  Upgrades        fireproximityprompt(<pad>.BuyPrompt), price in <pad>.Label.StateLabel.Text
+
+	UI: Robly Airflow (https://github.com/bobloscript/Robly_Airflow) with the
+	Robscript theme from the "Robly Airflow" reference note.
+
+	Usage: loadstring(game:HttpGet("<raw url>"))()
+]]
+
+----- Services -----
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+----- Executor environment -----
+local Environment: any = (typeof(getgenv) == "function" and getgenv()) or _G
+local FirePrompt: any = (typeof(fireproximityprompt) == "function" and fireproximityprompt) or nil
+local IdentifyExecutor: any = (typeof(identifyexecutor) == "function" and identifyexecutor) or function()
+	return "Unknown"
+end
+
+-- Shut down a previous build of this hub before creating a new one.
+if typeof(Environment.LiftAPlanetStop) == "function" then
+	pcall(Environment.LiftAPlanetStop)
+	Environment.LiftAPlanetStop = nil
+end
+
+----- Constants -----
+local HUB_NAME = "RobScript.com - Lift A Planet"
+local HUB_VERSION = "1.0.0"
+
+-- Config.Lift.ClickRateLimit is 0.08 s, Config.Lift.MaxDistance is 30 studs,
+-- Config.Lift.ResultHoldTime is 1.4 s and Config.Overload.MaxTime is 6 s.
+local CLICK_INTERVAL = 0.09
+local LIFT_RANGE = 24
+local PAD_RANGE = 5.5
+local RESULT_HOLD = 1.6
+local OVERLOAD_TIMEOUT = 6
+local PANIC_MULTIPLIER = 9
+local BAR_FILLED = 0.985
+local STAGE_PATTERN = "^Stage_(%d+)$"
+
+local PAD_KINDS = {
+	Speed = "SpeedBoosterPad",
+	Train = "TrainBoosterPad",
+}
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+----- State -----
+local ui: any = {}
+local state: any = {
+	running = true,
+	phase = "idle",
+	lastResult = "",
+	lifts = 0,
+	earned = 0,
+	spent = 0,
+	purchases = 0,
+	loggedTraining = false,
+	smartStage = nil,
+	smartMode = "idle",
+}
+
+----- Generic helpers -----
+local function attributeNumber(name: string, default: number): number
+	local value = LocalPlayer:GetAttribute(name)
+	if typeof(value) == "number" then
+		return value
+	end
+	return default
+end
+
+local function attributeFlag(name: string): boolean
+	return LocalPlayer:GetAttribute(name) == true
+end
+
+local function isOn(handle: any): boolean
+	return handle ~= nil and handle.Value == true
+end
+
+local function numberOf(handle: any, default: number): number
+	local value = handle and handle.Value
+	if typeof(value) == "number" then
+		return value
+	end
+	return default
+end
+
+-- Dropdown flags expose the selected option through :Get(), toggles through .Value.
+local function flagText(handle: any, default: string): string
+	if not handle then
+		return default
+	end
+	local ok, value = pcall(function()
+		return handle:Get()
+	end)
+	if ok and typeof(value) == "string" then
+		return value
+	end
+	return default
+end
+
+-- SpeedBoostersOwned / TrainBoostersOwned are comma separated strings ("1,2").
+local function ownedCount(attributeName: string): number
+	local value = LocalPlayer:GetAttribute(attributeName)
+	if typeof(value) == "number" then
+		return value
+	end
+	if typeof(value) == "string" then
+		local count = 0
+		for _ in string.gmatch(value, "[^,]+") do
+			count += 1
+		end
+		return count
+	end
+	return 0
+end
+
+local function formatMoney(value: number): string
+	if value >= 1e9 then
+		return string.format("$%.2fB", value / 1e9)
+	elseif value >= 1e6 then
+		return string.format("$%.2fM", value / 1e6)
+	elseif value >= 1e4 then
+		return string.format("$%.1fK", value / 1e3)
+	end
+	return string.format("$%d", math.floor(value))
+end
+
+-- Pad prices arrive as "$540", "$1.4K", "$10.0K", "$2.3M" or "EQUIPPED".
+local function parseMoney(text: any): number?
+	if typeof(text) ~= "string" then
+		return nil
+	end
+	local cleaned = string.upper(string.gsub(text, "[%$%s,]", ""))
+	if cleaned == "" or string.find(cleaned, "EQUIPPED", 1, true) then
+		return nil
+	end
+	local digits, suffix = string.match(cleaned, "^([%d%.]+)([KMB]?)$")
+	if not digits then
+		return nil
+	end
+	local amount = tonumber(digits)
+	if not amount then
+		return nil
+	end
+	if suffix == "K" then
+		return amount * 1e3
+	elseif suffix == "M" then
+		return amount * 1e6
+	elseif suffix == "B" then
+		return amount * 1e9
+	end
+	return amount
+end
+
+----- Game helpers -----
+local characterCache: Model? = nil
+local humanoidCache: Humanoid? = nil
+local rootCache: BasePart? = nil
+
+local function getCharacterParts(): (Model?, Humanoid?, BasePart?)
+	local character = LocalPlayer.Character
+	if not character or not character.Parent then
+		return nil, nil, nil
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		return nil, nil, nil
+	end
+	characterCache, humanoidCache, rootCache = character, humanoid, root
+	return character, humanoid, root
+end
+
+local function teleportTo(position: Vector3): boolean
+	local _, _, root = getCharacterParts()
+	if not root then
+		return false
+	end
+	root.CFrame = CFrame.new(position)
+	root.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
+local remotesCache: Folder? = nil
+local function getRemotes(): Folder?
+	if remotesCache and remotesCache.Parent then
+		return remotesCache
+	end
+	local folder = ReplicatedStorage:FindFirstChild("Remotes")
+	if not folder then
+		local ok, waited = pcall(function()
+			return ReplicatedStorage:WaitForChild("Remotes", 10)
+		end)
+		folder = ok and waited or nil
+	end
+	if folder and folder:IsA("Folder") then
+		remotesCache = folder
+		return folder
+	end
+	return nil
+end
+
+local function fireRemote(remoteName: string, ...: any): boolean
+	local remotes = getRemotes()
+	local remote = remotes and remotes:FindFirstChild(remoteName)
+	if not remote or not remote:IsA("RemoteEvent") then
+		return false
+	end
+	local args = table.pack(...)
+	local ok = pcall(function()
+		remote:FireServer(table.unpack(args, 1, args.n))
+	end)
+	return ok
+end
+
+local function findPrompt(instance: Instance): ProximityPrompt?
+	local direct = instance:FindFirstChildOfClass("ProximityPrompt")
+	if direct then
+		return direct
+	end
+	for _, descendant in ipairs(instance:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function firePrompt(prompt: ProximityPrompt?): boolean
+	if not prompt or not FirePrompt then
+		return false
+	end
+	return (pcall(FirePrompt, prompt))
+end
+
+local configCache: any = nil
+local function getConfig(): any
+	if configCache then
+		return configCache
+	end
+	local module = ReplicatedStorage:FindFirstChild("Config")
+	if not module then
+		local ok, waited = pcall(function()
+			return ReplicatedStorage:WaitForChild("Config", 10)
+		end)
+		module = ok and waited or nil
+	end
+	if not module then
+		return nil
+	end
+	local ok, result = pcall(require, module)
+	if ok and typeof(result) == "table" then
+		configCache = result
+		return result
+	end
+	return nil
+end
+
+local function getStageFolders(): { [number]: Instance }
+	local stagesFolder = workspace:FindFirstChild("Stages")
+	local result: { [number]: Instance } = {}
+	if not stagesFolder then
+		return result
+	end
+	for _, child in ipairs(stagesFolder:GetChildren()) do
+		local index = tonumber(string.match(child.Name, STAGE_PATTERN))
+		if index then
+			result[index] = child
+		end
+	end
+	return result
+end
+
+local function getStageIndexes(): { number }
+	local indexes = {}
+	for index in pairs(getStageFolders()) do
+		table.insert(indexes, index)
+	end
+	table.sort(indexes)
+	return indexes
+end
+
+local function stageLabel(index: number): string
+	local config = getConfig()
+	local stage = config and config.Stages and config.Stages[index]
+	if stage then
+		return string.format("%d - %s (%d)", index, stage.Name, stage.RecommendedStrength)
+	end
+	return string.format("%d", index)
+end
+
+local function resolveStageIndex(): number
+	if isOn(ui.smartFarm) and state.smartStage then
+		return state.smartStage
+	end
+	local manual = flagText(ui.stage, "Auto")
+	if manual ~= "Auto" then
+		local index = tonumber(string.match(manual, "^(%d+)"))
+		if index then
+			return index
+		end
+	end
+	local config = getConfig()
+	local strength = attributeNumber("Strength", 0)
+	local best = 1
+	for _, index in ipairs(getStageIndexes()) do
+		local stage = config and config.Stages and config.Stages[index]
+		if stage and strength >= stage.RecommendedStrength then
+			best = index
+		end
+	end
+	return best
+end
+
+local function getPlanet(stageIndex: number): BasePart?
+	local folder = getStageFolders()[stageIndex]
+	local planet = folder and folder:FindFirstChild("Planet")
+	if planet and planet:IsA("BasePart") then
+		return planet
+	end
+	return nil
+end
+
+local function getLiftUI(): Instance?
+	return PlayerGui:FindFirstChild("LiftUI")
+end
+
+local function getLiftPanel(): Instance?
+	local gui = getLiftUI()
+	return gui and gui:FindFirstChild("Panel")
+end
+
+local function getMultiplier(): number
+	local gui = getLiftUI()
+	local label = gui and gui:FindFirstChild("OverloadLabel")
+	if not label or not label:IsA("TextLabel") or not label.Visible then
+		return 0
+	end
+	local matched = string.match(label.Text, "x([%d%.]+)")
+	return tonumber(matched) or 0
+end
+
+local function getLiftFill(): number
+	local panel = getLiftPanel()
+	local bar = panel and panel:FindFirstChild("BarBack")
+	local fill = bar and bar:FindFirstChild("Fill")
+	if fill and fill:IsA("GuiObject") then
+		return fill.Size.X.Scale
+	end
+	return 0
+end
+
+local function getHint(): string
+	local panel = getLiftPanel()
+	local hint = panel and panel:FindFirstChild("HintLabel")
+	if hint and hint:IsA("TextLabel") then
+		return hint.Text
+	end
+	return ""
+end
+
+local function classifyResult(hint: string): string
+	if string.find(hint, "BOOM", 1, true) then
+		return "exploded"
+	elseif string.find(hint, "DROPPED", 1, true) then
+		return "dropped"
+	elseif string.find(hint, "NICE", 1, true) or string.find(hint, "SAFE", 1, true) or string.find(hint, "AMAZING", 1, true) then
+		return "banked"
+	end
+	return "unknown"
+end
+
+----- Training -----
+local function getTrainTool(): Tool?
+	local character, _, _ = getCharacterParts()
+	local equipped = character and character:FindFirstChild("Train")
+	if equipped and equipped:IsA("Tool") then
+		return equipped
+	end
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	local stored = backpack and backpack:FindFirstChild("Train")
+	if stored and stored:IsA("Tool") then
+		return stored
+	end
+	return nil
+end
+
+local function equipTrainTool(): boolean
+	local character, humanoid, _ = getCharacterParts()
+	local tool = getTrainTool()
+	if not character or not humanoid or not tool then
+		return false
+	end
+	if tool.Parent == character then
+		return true
+	end
+	local ok = pcall(function()
+		humanoid:EquipTool(tool)
+	end)
+	return ok
+end
+
+local function unequipTools(): boolean
+	local _, humanoid, _ = getCharacterParts()
+	if not humanoid then
+		return false
+	end
+	local ok = pcall(function()
+		humanoid:UnequipTools()
+	end)
+	return ok
+end
+
+----- Upgrades -----
+type UpgradeEntry = {
+	index: number,
+	kind: string,
+	pad: Instance,
+	prompt: ProximityPrompt?,
+	price: number?,
+	priceText: string,
+	effect: string,
+	owned: boolean,
+}
+
+local upgradeCache: { at: number, entries: { any }? } = { at = 0, entries = nil }
+
+local function collectUpgrades(): { UpgradeEntry }
+	local cached = upgradeCache.entries
+	if cached and (os.clock() - upgradeCache.at) < 2 then
+		return cached
+	end
+	local entries: { UpgradeEntry } = {}
+	for _, index in ipairs(getStageIndexes()) do
+		local folder = getStageFolders()[index]
+		for kind, padName in pairs(PAD_KINDS) do
+			local pad = folder:FindFirstChild(padName)
+			if pad then
+				local prompt = findPrompt(pad)
+				local label = pad:FindFirstChild("Label")
+				local priceLabel = label and label:FindFirstChild("StateLabel")
+				local effectLabel = label and label:FindFirstChild("ValueLabel")
+				local priceText = ""
+				if priceLabel and priceLabel:IsA("TextLabel") then
+					priceText = priceLabel.Text
+				end
+				local effect = ""
+				if effectLabel and effectLabel:IsA("TextLabel") then
+					effect = effectLabel.Text
+				end
+				-- Pad label states: "$210" = for sale, "OWNED" = bought, "EQUIPPED" = active.
+				local upperText = string.upper(priceText)
+				local owned = string.find(upperText, "EQUIPPED", 1, true) ~= nil
+					or string.find(upperText, "OWNED", 1, true) ~= nil
+					or (prompt ~= nil and (prompt.ActionText == "Equipped" or string.find(prompt.ActionText, "Equip ", 1, true) ~= nil))
+				table.insert(entries, {
+					index = index,
+					kind = kind,
+					pad = pad,
+					prompt = prompt,
+					price = owned and nil or parseMoney(priceText),
+					priceText = priceText,
+					effect = effect,
+					owned = owned,
+				})
+			end
+		end
+	end
+	table.sort(entries, function(left, right)
+		if left.index == right.index then
+			return left.kind < right.kind
+		end
+		return left.index < right.index
+	end)
+	upgradeCache.at = os.clock()
+	upgradeCache.entries = entries
+	return entries
+end
+
+local function recommendedStrength(index: number): number
+	local config = getConfig()
+	local stage = config and config.Stages and config.Stages[index]
+	return stage and stage.RecommendedStrength or 0
+end
+
+local function stageName(index: number): string
+	local config = getConfig()
+	local stage = config and config.Stages and config.Stages[index]
+	return stage and stage.Name or tostring(index)
+end
+
+local function stagesWithPlanet(): { number }
+	local list = {}
+	for _, index in ipairs(getStageIndexes()) do
+		if getPlanet(index) then
+			table.insert(list, index)
+		end
+	end
+	return list
+end
+
+local function nextStageAfter(index: number): number?
+	for _, candidate in ipairs(stagesWithPlanet()) do
+		if candidate > index then
+			return candidate
+		end
+	end
+	return nil
+end
+
+-- Both booster pads of a stage are bought: Speed and Push Up Time.
+local function stageOwnedAll(index: number): boolean
+	local speed, train = false, false
+	for _, entry in ipairs(collectUpgrades()) do
+		if entry.index == index then
+			if entry.kind == "Speed" then
+				speed = entry.owned
+			elseif entry.kind == "Train" then
+				train = entry.owned
+			end
+		end
+	end
+	return speed and train
+end
+
+local function stageOwnedCount(index: number): (number, number)
+	local owned, total = 0, 0
+	for _, entry in ipairs(collectUpgrades()) do
+		if entry.index == index then
+			total += 1
+			if entry.owned then
+				owned += 1
+			end
+		end
+	end
+	return owned, total
+end
+
+-- Smart farm starts on the first stage that still has an unbought booster.
+local function initialSmartStage(): number
+	local stages = stagesWithPlanet()
+	for _, index in ipairs(stages) do
+		if not stageOwnedAll(index) then
+			return index
+		end
+	end
+	return stages[#stages] or 1
+end
+
+----- Boosters: buy vs equip -----
+-- A bought booster is not active until it is equipped, and equipping a lower stage
+-- downgrades the stat, so the highest owned stage always gets equipped.
+local KIND_ATTRIBUTE = {
+	Speed = "EquippedSpeedBooster",
+	Train = "EquippedTrainBooster",
+}
+
+local function equipBooster(entry: UpgradeEntry): boolean
+	if not entry or not entry.prompt then
+		return false
+	end
+	teleportTo(entry.pad:GetPivot().Position + Vector3.new(0, 4, PAD_RANGE))
+	task.wait(0.3)
+	local fired = firePrompt(entry.prompt)
+	task.wait(0.45)
+	upgradeCache.at = 0
+	upgradeCache.entries = nil
+	return fired
+end
+
+local function bestOwnedUpgrade(kind: string): UpgradeEntry?
+	local best: UpgradeEntry? = nil
+	for _, entry in ipairs(collectUpgrades()) do
+		if entry.kind == kind and entry.owned then
+			if not best or entry.index > best.index then
+				best = entry
+			end
+		end
+	end
+	return best
+end
+
+local function ensureBestEquipped(): boolean
+	local changed = false
+	for kind, attribute in pairs(KIND_ATTRIBUTE) do
+		local best = bestOwnedUpgrade(kind)
+		if best then
+			local action = best.prompt and best.prompt.ActionText or ""
+			local equipped = attributeNumber(attribute, 0)
+			if action ~= "Equipped" and best.index > equipped then
+				if equipBooster(best) then
+					changed = true
+					if ui.log then
+						ui.log:Push(string.format(
+							"<Muted>Equipped</Muted> <Accent>%s</Accent> booster from stage %d",
+							kind,
+							best.index
+						))
+					end
+				end
+			end
+		end
+	end
+	return changed
+end
+
+local function pickUpgrade(): UpgradeEntry?
+	local money = attributeNumber("Money", 0)
+	local smart = isOn(ui.smartFarm)
+
+	local allowSpeed: boolean
+	local allowTrain: boolean
+	local budget: number
+	local strategy: string
+	local onlyIndex: number? = nil
+
+	if smart then
+		-- Smart farm buys both boosters of the stage it is currently working on.
+		allowSpeed, allowTrain = true, true
+		budget = money
+		strategy = "Cheapest"
+		onlyIndex = state.smartStage
+	else
+		allowSpeed, allowTrain = isOn(ui.buySpeed), isOn(ui.buyTrain)
+		budget = money * (numberOf(ui.spendLimit, 100) / 100)
+		strategy = flagText(ui.buyStrategy, "Cheapest")
+	end
+
+	if not (allowSpeed or allowTrain) then
+		return nil
+	end
+	if smart and not onlyIndex then
+		return nil
+	end
+
+	local currentStage = onlyIndex or resolveStageIndex()
+	local candidates: { UpgradeEntry } = {}
+
+	for _, entry in ipairs(collectUpgrades()) do
+		local allowed = (entry.kind == "Speed" and allowSpeed)
+			or (entry.kind == "Train" and allowTrain)
+		local inScope = (onlyIndex == nil) or (entry.index == onlyIndex)
+		if allowed and inScope and not entry.owned and entry.price and entry.price <= budget then
+			if strategy ~= "Current stage only" or entry.index == currentStage then
+				table.insert(candidates, entry)
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		return nil
+	end
+	if strategy == "Best affordable" then
+		table.sort(candidates, function(left, right)
+			if left.index == right.index then
+				return (left.price or 0) < (right.price or 0)
+			end
+			return left.index > right.index
+		end)
+	else
+		table.sort(candidates, function(left, right)
+			return (left.price or math.huge) < (right.price or math.huge)
+		end)
+	end
+	return candidates[1]
+end
+
+local function purchaseUpgrade(entry: UpgradeEntry): boolean
+	if not entry or not entry.prompt then
+		return false
+	end
+	local padPosition = entry.pad:GetPivot().Position
+	local standPosition = padPosition + Vector3.new(0, 4, PAD_RANGE)
+	teleportTo(standPosition)
+	task.wait(0.3)
+	local fired = firePrompt(entry.prompt)
+	task.wait(0.55)
+	upgradeCache.at = 0
+	upgradeCache.entries = nil
+	if fired then
+		state.purchases += 1
+		state.spent += entry.price or 0
+		if ui.log then
+			ui.log:Push(string.format(
+				"<Success>Bought</Success> <Accent>%s</Accent> booster on stage %d for %s",
+				entry.kind,
+				entry.index,
+				entry.priceText
+			))
+		end
+		task.wait(0.25)
+		ensureBestEquipped()
+	end
+	return fired
+end
+
+----- Lift cycle -----
+local function waitForFlag(flagName: string, expected: boolean, timeout: number): boolean
+	local deadline = os.clock() + timeout
+	while os.clock() < deadline do
+		if attributeFlag(flagName) == expected then
+			return true
+		end
+		task.wait(0.05)
+	end
+	return false
+end
+
+local function clickUntilOverload(): boolean
+	local deadline = os.clock() + 12
+	while os.clock() < deadline do
+		if not attributeFlag("Lifting") then
+			return false
+		end
+		-- The bar tops out around 90-97 %, while the overload multiplier shows up
+		-- exactly when the server marks the lift as filled. That is the real gate.
+		if getMultiplier() > 0 then
+			return true
+		end
+		if getLiftFill() >= BAR_FILLED then
+			return true
+		end
+		fireRemote("LiftClick")
+		task.wait(CLICK_INTERVAL)
+	end
+	return getMultiplier() > 0
+end
+
+local function bankNow(): boolean
+	return fireRemote("LiftBank")
+end
+
+local function finishLift(target: number, autoCashOut: boolean): string
+	local started = os.clock()
+	local banked = false
+
+	while attributeFlag("Lifting") and (os.clock() - started) < OVERLOAD_TIMEOUT do
+		local multiplier = getMultiplier()
+		if autoCashOut and multiplier >= target then
+			bankNow()
+			banked = true
+			break
+		end
+		if multiplier >= PANIC_MULTIPLIER and not banked then
+			bankNow()
+			banked = true
+			break
+		end
+		task.wait(0.05)
+	end
+
+	if attributeFlag("Lifting") then
+		bankNow()
+	end
+
+	waitForFlag("Lifting", false, 3)
+	task.wait(0.25)
+	local hint = getHint()
+	local outcome = classifyResult(hint)
+	state.lastResult = hint
+	if not banked and outcome == "banked" then
+		banked = true
+	end
+	return outcome
+end
+
+local function farmCycle(forcedStage: number?): string
+	local _, _, root = getCharacterParts()
+	if not root then
+		return "no_character"
+	end
+
+	local stageIndex = forcedStage or resolveStageIndex()
+	local planet = getPlanet(stageIndex)
+	if not planet then
+		return "no_planet"
+	end
+
+	local prompt = findPrompt(planet)
+	if not prompt then
+		return "no_prompt"
+	end
+	-- The game disables the prompt while a lift is running and during the result hold.
+	local promptDeadline = os.clock() + 4
+	while not prompt.Enabled and os.clock() < promptDeadline do
+		state.phase = "waiting for prompt"
+		task.wait(0.15)
+	end
+	if not prompt.Enabled then
+		state.phase = "planet locked"
+		return "locked"
+	end
+
+	unequipTools()
+	local radius = math.max(planet.Size.X, planet.Size.Z) * 0.5
+	local offset = math.min(radius + 8, LIFT_RANGE - 4)
+	teleportTo(planet.Position + Vector3.new(0, 3, offset))
+	task.wait(0.35)
+
+	if not firePrompt(prompt) then
+		return "prompt_failed"
+	end
+	if not waitForFlag("Lifting", true, 2.5) then
+		return "lift_not_started"
+	end
+
+	state.phase = "clicking"
+	local moneyBefore = attributeNumber("Money", 0)
+	local ready = clickUntilOverload()
+
+	state.phase = "overload"
+	local target = numberOf(ui.cashOut, 2)
+	local autoCashOut = ready and isOn(ui.autoCashOut) or false
+	local outcome = finishLift(target, autoCashOut)
+
+	local moneyAfter = attributeNumber("Money", 0)
+	local delta = moneyAfter - moneyBefore
+	if delta > 0 then
+		state.earned += delta
+	end
+	state.lifts += 1
+	state.phase = "idle"
+
+	local config = getConfig()
+	local stageName = config and config.Stages and config.Stages[stageIndex] and config.Stages[stageIndex].Name or tostring(stageIndex)
+	if ui.log then
+		local tone = outcome == "exploded" and "Warning" or (outcome == "dropped" and "Error" or "Success")
+		ui.log:Push(string.format(
+			"<%s>%s</%s> %s · %s · %s",
+			tone,
+			string.upper(outcome),
+			tone,
+			stageName,
+			delta >= 0 and ("+" .. formatMoney(delta)) or formatMoney(delta),
+			getHint()
+		))
+	end
+	task.wait(RESULT_HOLD)
+	return outcome
+end
+
+----- Main loop -----
+local function shouldTrain(): boolean
+	if not isOn(ui.autoTrain) then
+		return false
+	end
+	local target = numberOf(ui.trainTarget, 0)
+	if target > 0 then
+		return attributeNumber("Strength", 0) < target
+	end
+	return not isOn(ui.autoFarm)
+end
+
+local function trainStep()
+	local strength = attributeNumber("Strength", 0)
+	local target = numberOf(ui.trainTarget, 0)
+	if ui.trainTargetStatus and target > 0 then
+		ui.trainTargetStatus:Set(string.format("%d / %d", math.floor(strength), math.floor(target)))
+	end
+	if attributeFlag("Training") then
+		return
+	end
+	if equipTrainTool() then
+		state.phase = "training"
+		if ui.log and not state.loggedTraining then
+			state.loggedTraining = true
+			ui.log:Push("<Muted>Training tool equipped</Muted>")
+		end
+	end
+end
+
+-- Smart farm: farm a stage until both of its boosters are bought, then train until
+-- the next stage becomes liftable, then move on and repeat.
+local function smartTick()
+	local stages = stagesWithPlanet()
+	if #stages == 0 then
+		state.phase = "no stages"
+		task.wait(0.5)
+		return
+	end
+
+	local stage = state.smartStage
+	if not stage or not table.find(stages, stage) then
+		stage = initialSmartStage()
+		state.smartStage = stage
+		state.smartMode = "start"
+		if ui.log then
+			ui.log:Push(string.format(
+				"<Accent>Smart farm</Accent> starts on stage %d - %s",
+				stage,
+				stageName(stage)
+			))
+		end
+	end
+
+	local strength = attributeNumber("Strength", 0)
+	local ownedAll = stageOwnedAll(stage)
+	-- A fully upgraded stage is skipped: the goal becomes the next stage.
+	local following = ownedAll and nextStageAfter(stage) or nil
+	local goalStage = following or stage
+	local goalStrength = recommendedStrength(goalStage)
+
+	-- 1) Train until the planet we are aiming at becomes liftable.
+	if strength < goalStrength then
+		state.smartMode = "training"
+		state.phase = string.format(
+			"training for %d (%d/%d)",
+			goalStage,
+			math.floor(strength),
+			math.floor(goalStrength)
+		)
+		trainStep()
+		task.wait(0.4)
+		return
+	end
+
+	-- 2) Strong enough for the next stage: move on to it.
+	if following then
+		state.smartStage = following
+		state.smartMode = "advance"
+		state.phase = string.format("advanced to %d", following)
+		if ui.log then
+			ui.log:Push(string.format(
+				"<Success>Smart farm advanced</Success> %d - %s -> %d - %s",
+				stage,
+				stageName(stage),
+				following,
+				stageName(following)
+			))
+		end
+		return
+	end
+
+	-- 3) Farm the current stage until both of its boosters are bought.
+	state.smartMode = "farming"
+	if attributeFlag("Training") then
+		unequipTools()
+		task.wait(0.2)
+	end
+	-- A freshly bought booster is only "OWNED", it has to be equipped to give the stat.
+	ensureBestEquipped()
+	local ok, err = pcall(farmCycle, stage)
+	if not ok then
+		state.phase = "error"
+		if ui.log then
+			ui.log:Push("<Error>smart farm error</Error> " .. tostring(err))
+		end
+		task.wait(1)
+	end
+end
+
+local function step()
+	if LocalPlayer:GetAttribute("DataLoaded") ~= true then
+		state.phase = "loading"
+		task.wait(0.5)
+		return
+	end
+	if attributeFlag("InBattle") then
+		state.phase = "battle"
+		task.wait(0.5)
+		return
+	end
+
+	if attributeFlag("Lifting") then
+		state.phase = "finishing lift"
+		finishLift(numberOf(ui.cashOut, 2), isOn(ui.autoCashOut))
+		return
+	end
+
+	-- Upgrades run between lifts, so farming never starves them and a lift is never interrupted.
+	if isOn(ui.smartFarm) or isOn(ui.buySpeed) or isOn(ui.buyTrain) then
+		local entry = pickUpgrade()
+		if entry then
+			state.phase = "buying"
+			purchaseUpgrade(entry)
+			state.phase = "idle"
+			return
+		end
+	end
+
+	if isOn(ui.smartFarm) then
+		smartTick()
+		return
+	end
+
+	if shouldTrain() then
+		trainStep()
+		state.loggedTraining = false
+		task.wait(0.4)
+		return
+	end
+
+	if isOn(ui.autoFarm) then
+		if attributeFlag("Training") then
+			unequipTools()
+		end
+		local ok, err = pcall(farmCycle)
+		if not ok then
+			state.phase = "error"
+			if ui.log then
+				ui.log:Push("<Error>farm error</Error> " .. tostring(err))
+			end
+			task.wait(1)
+		end
+		return
+	end
+
+	if attributeFlag("Training") then
+		unequipTools()
+		state.loggedTraining = false
+	end
+	state.phase = "idle"
+	task.wait(0.35)
+end
+
+local function startLoop()
+	task.spawn(function()
+		while state.running do
+			local ok, err = pcall(step)
+			if not ok then
+				if ui.log then
+					ui.log:Push("<Error>loop error</Error> " .. tostring(err))
+				end
+				task.wait(1)
+			end
+			task.wait(0.05)
+		end
+	end)
+end
+
+----- UI -----
+local AirflowSources = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow: any = nil
+for _, url in ipairs(AirflowSources) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and typeof(library) == "table" and typeof(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[" .. HUB_NAME .. "] could not load the Airflow UI library")
+end
+
+pcall(function()
+	Airflow:LoadFont({ Name = "ValleySans" })
+end)
+pcall(function()
+	Airflow:PreloadIcons()
+end)
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+local Window = Airflow:CreateWindow({
+	Name = HUB_NAME,
+	LoadingSubtitle = "train, farm, upgrades",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptLiftAPlanet" },
+	Home = {
+		Title = HUB_NAME,
+		Welcome = "Welcome back,",
+		Tier = "v" .. HUB_VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+Environment.LiftAPlanetWindow = Window
+Environment.LiftAPlanetStop = function()
+	state.running = false
+	pcall(function()
+		unequipTools()
+	end)
+	pcall(function()
+		Window:Destroy()
+	end)
+end
+
+--- Farm tab
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "orbit" })
+local PlanetBox = FarmTab:CreateGroupbox({ Name = "Planet", Side = "Left" })
+local LiftBox = FarmTab:CreateGroupbox({ Name = "Lift", Side = "Left" })
+local StatsBox = FarmTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+local LogBox = FarmTab:CreateGroupbox({ Name = "Activity", Side = "Right" })
+
+ui.log = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 250,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+PlanetBox:CreateParagraph({
+	Title = "Smart farm cycle",
+	Content = "Stage boosters bought -> train until the next stage is liftable -> farm the next "
+		.. "stage until its boosters are bought -> repeat. Buying and equipping run automatically "
+		.. "for the active stage only, so the balance is never spent ahead of the plan.",
+})
+
+ui.smartFarm = PlanetBox:CreateToggle({
+	Name = "Smart farm",
+	Desc = "Buys both boosters of a stage, trains until the next stage is liftable, then farms it",
+	Flag = "LiftSmartFarm",
+	CurrentValue = false,
+	Callback = function(on)
+		if on then
+			state.smartStage = initialSmartStage()
+			state.smartMode = "start"
+			ui.log:Push(string.format(
+				"<Success>Smart farm enabled</Success> starting on stage %d - %s",
+				state.smartStage,
+				stageName(state.smartStage)
+			))
+		else
+			state.smartMode = "idle"
+			state.phase = "idle"
+			ui.log:Push("<Muted>Smart farm disabled</Muted>")
+		end
+	end,
+})
+
+ui.autoFarm = PlanetBox:CreateToggle({
+	Name = "Auto farm planet",
+	Desc = "Teleports, lifts and finishes the planet automatically",
+	Flag = "LiftAutoFarm",
+	CurrentValue = false,
+	Callback = function(on)
+		state.phase = on and "starting" or "idle"
+		ui.log:Push(on and "<Success>Auto farm enabled</Success>" or "<Muted>Auto farm disabled</Muted>")
+	end,
+})
+
+local stageOptions = { "Auto" }
+for _, index in ipairs(getStageIndexes()) do
+	table.insert(stageOptions, stageLabel(index))
+end
+
+ui.stage = PlanetBox:CreateDropdown({
+	Name = "Stage",
+	Desc = "Auto picks the heaviest planet your strength allows",
+	Options = stageOptions,
+	CurrentOption = "Auto",
+	Flag = "LiftStage",
+})
+
+PlanetBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local index = resolveStageIndex()
+		return string.format("<Accent>%s</Accent>", stageLabel(index))
+	end,
+})
+
+PlanetBox:CreateStatus({
+	Name = "Smart stage",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if not isOn(ui.smartFarm) then
+			return "<Muted>off</Muted>"
+		end
+		local stage = state.smartStage or initialSmartStage()
+		local owned, total = stageOwnedCount(stage)
+		return string.format(
+			"<Accent>%d - %s</Accent> <Muted>%d/%d · %s</Muted>",
+			stage,
+			stageName(stage),
+			owned,
+			total,
+			tostring(state.smartMode)
+		)
+	end,
+})
+
+LiftBox:CreateDivider({ Text = "multiplier" })
+
+ui.autoCashOut = LiftBox:CreateToggle({
+	Name = "Auto cash out",
+	Desc = "Banks the multiplier as soon as the target is reached",
+	Flag = "LiftAutoCashOut",
+	CurrentValue = true,
+	Callback = function(on)
+		ui.log:Push(on and "<Success>Auto cash out enabled</Success>" or "<Warning>Auto cash out disabled - the planet may explode</Warning>")
+	end,
+})
+
+ui.cashOut = LiftBox:CreateSlider({
+	Name = "Cash out at",
+	Desc = "Multiplier target",
+	Range = { 1, 10 },
+	Increment = 0.1,
+	Suffix = "x",
+	CurrentValue = 2,
+	Flag = "LiftCashOut",
+})
+
+LiftBox:CreateParagraph({
+	Title = "How the lift works",
+	Content = "The bar needs about 18 steady clicks. Once it is full the multiplier starts growing "
+		.. "and the planet can explode at any moment above roughly 6 seconds. 2x-4x is the safe zone.",
+})
+
+StatsBox:CreateStatus({
+	Name = "Multiplier",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.2,
+	Update = function()
+		local multiplier = getMultiplier()
+		local fill = getLiftFill()
+		if multiplier > 0 then
+			return string.format("<Accent>x%.1f</Accent> <Muted>bar %.0f%%</Muted>", multiplier, fill * 100)
+		end
+		return string.format("<Muted>idle</Muted> <Muted>bar %.0f%%</Muted>", fill * 100)
+	end,
+})
+
+StatsBox:CreateStatus({
+	Name = "Phase",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.4,
+	Update = function()
+		return string.format("<Text>%s</Text>", tostring(state.phase))
+	end,
+})
+
+StatsBox:CreateStatus({
+	Name = "Earned",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Success>%s</Success> <Muted>in %d lifts</Muted>", formatMoney(state.earned), state.lifts)
+	end,
+})
+
+StatsBox:CreateStatus({
+	Name = "Spent",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Warning>%s</Warning> <Muted>%d upgrades</Muted>", formatMoney(state.spent), state.purchases)
+	end,
+})
+
+StatsBox:CreateStatus({
+	Name = "Balance",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%s</Success>", formatMoney(attributeNumber("Money", 0)))
+	end,
+})
+
+--- Train tab
+local TrainTab = Window:CreateTab({ Name = "Train", Icon = "dumbbell" })
+local TrainBox = TrainTab:CreateGroupbox({ Name = "Training", Side = "Left" })
+local TrainInfoBox = TrainTab:CreateGroupbox({ Name = "Strength", Side = "Right" })
+
+ui.autoTrain = TrainBox:CreateToggle({
+	Name = "Auto train",
+	Desc = "Keeps the Train tool equipped so the server keeps adding strength",
+	Flag = "LiftAutoTrain",
+	CurrentValue = false,
+	Callback = function(on)
+		if not on then
+			pcall(unequipTools)
+		end
+		ui.log:Push(on and "<Success>Auto train enabled</Success>" or "<Muted>Auto train disabled</Muted>")
+	end,
+})
+
+ui.trainTarget = TrainBox:CreateSlider({
+	Name = "Strength target",
+	Desc = "0 trains whenever auto farm is off, otherwise trains until the target",
+	Range = { 0, 20000 },
+	Increment = 100,
+	CurrentValue = 0,
+	Flag = "LiftTrainTarget",
+})
+
+TrainBox:CreateButton({
+	Name = "Equip Train tool",
+	Desc = "Equip once without the automation loop",
+	Icon = "dumbbell",
+	Callback = function()
+		if equipTrainTool() then
+			ui.log:Push("<Success>Train tool equipped</Success>")
+		else
+			ui.log:Push("<Error>Train tool not found</Error>")
+		end
+	end,
+})
+
+TrainInfoBox:CreateStatus({
+	Name = "Strength",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.4,
+	Update = function()
+		return string.format("<Strength>%d</Strength>", attributeNumber("Strength", 0))
+	end,
+})
+
+ui.trainTargetStatus = TrainInfoBox:CreateStatus({
+	Name = "Progress",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Muted>%s</Muted>", tostring(state.phase))
+	end,
+})
+
+TrainInfoBox:CreateStatus({
+	Name = "Per tick",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format(
+			"<Text>+%d</Text> <Muted>every %.2fs</Muted>",
+			attributeNumber("PerTick", 0),
+			attributeNumber("Cooldown", 0)
+		)
+	end,
+})
+
+TrainInfoBox:CreateStatus({
+	Name = "Training",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if attributeFlag("Training") then
+			return "<Success>active</Success>"
+		end
+		return "<Muted>idle</Muted>"
+	end,
+})
+
+--- Upgrades tab
+local UpgradesTab = Window:CreateTab({ Name = "Upgrades", Icon = "circle-arrow-up" })
+local BuyBox = UpgradesTab:CreateGroupbox({ Name = "Boosters", Side = "Left" })
+local OwnedBox = UpgradesTab:CreateGroupbox({ Name = "Owned", Side = "Right" })
+
+ui.buySpeed = BuyBox:CreateToggle({
+	Name = "Auto buy Speed",
+	Desc = "Speed boosters: +2 walk speed per stage",
+	Flag = "LiftBuySpeed",
+	CurrentValue = false,
+})
+
+ui.buyTrain = BuyBox:CreateToggle({
+	Name = "Auto buy Push Up Time",
+	Desc = "Train boosters: -0.1 s per push up, the floor is around 0.2 s",
+	Flag = "LiftBuyTrain",
+	CurrentValue = false,
+})
+
+ui.buyStrategy = BuyBox:CreateDropdown({
+	Name = "Strategy",
+	Options = { "Cheapest", "Best affordable", "Current stage only" },
+	CurrentOption = "Cheapest",
+	Flag = "LiftBuyStrategy",
+})
+
+ui.spendLimit = BuyBox:CreateSlider({
+	Name = "Spend limit",
+	Desc = "Share of the current balance that auto buy may use",
+	Range = { 10, 100 },
+	Increment = 5,
+	Suffix = "%",
+	CurrentValue = 60,
+	Flag = "LiftSpendLimit",
+})
+
+BuyBox:CreateButton({
+	Name = "Equip best boosters",
+	Desc = "Equips the highest owned Speed and Push Up Time booster",
+	Icon = "shirt",
+	Callback = function()
+		if ensureBestEquipped() then
+			ui.log:Push("<Success>Best boosters equipped</Success>")
+		else
+			ui.log:Push("<Muted>Nothing to equip</Muted>")
+		end
+	end,
+})
+
+BuyBox:CreateButton({
+	Name = "Buy best upgrade now",
+	Desc = "One manual purchase using the rules above",
+	Icon = "shopping-cart",
+	Callback = function()
+		local entry = pickUpgrade()
+		if not entry then
+			ui.log:Push("<Warning>No affordable upgrade</Warning>")
+			return
+		end
+		purchaseUpgrade(entry)
+	end,
+})
+
+OwnedBox:CreateStatus({
+	Name = "Speed boosters",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Accent>%d</Accent>", ownedCount("SpeedBoostersOwned"))
+	end,
+})
+
+OwnedBox:CreateStatus({
+	Name = "Train boosters",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Accent>%d</Accent>", ownedCount("TrainBoostersOwned"))
+	end,
+})
+
+OwnedBox:CreateStatus({
+	Name = "Walk speed",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Text>%d</Text>", attributeNumber("WalkSpeed", 0))
+	end,
+})
+
+OwnedBox:CreateStatus({
+	Name = "Push up time",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Text>%.2fs</Text>", attributeNumber("Cooldown", 0))
+	end,
+})
+
+OwnedBox:CreateStatus({
+	Name = "Next affordable",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local entry = pickUpgrade()
+		if not entry then
+			return "<Muted>--</Muted>"
+		end
+		return string.format("<Success>%s</Success> %s <Muted>%s</Muted>", entry.kind, entry.priceText, entry.effect)
+	end,
+})
+
+--- Settings tab
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Left" })
+local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
+
+AboutBox:CreateParagraph({
+	Title = "Runtime",
+	Content = string.format("%s v%s · executor: %s", HUB_NAME, HUB_VERSION, tostring(IdentifyExecutor())),
+})
+
+AboutBox:CreateButton({
+	Name = "Clear log",
+	Icon = "trash-2",
+	Callback = function()
+		ui.log:Clear()
+	end,
+})
+
+AboutBox:CreateButton({
+	Name = "Stop hub",
+	Desc = "Unloads the UI and stops every loop",
+	Icon = "power",
+	Style = "Danger",
+	Confirm = true,
+	Callback = function()
+		if typeof(Environment.LiftAPlanetStop) == "function" then
+			Environment.LiftAPlanetStop()
+		end
+	end,
+})
+
+Environment.LiftAPlanet = {
+	Window = Window,
+	Flags = Airflow.Flags,
+	State = state,
+	UI = ui,
+	Version = HUB_VERSION,
+	Debug = {
+		initialSmartStage = initialSmartStage,
+		stageOwnedAll = stageOwnedAll,
+		stageOwnedCount = stageOwnedCount,
+		stagesWithPlanet = stagesWithPlanet,
+		pickUpgrade = pickUpgrade,
+		collectUpgrades = collectUpgrades,
+	},
+	BuyNow = function()
+		local entry = pickUpgrade()
+		if entry then
+			return purchaseUpgrade(entry)
+		end
+		return false
+	end,
+}
+
+Window:LoadAutoload()
+startLoop()
+
+Window:Notify({
+	Title = "Loaded",
+	Content = "Lift A Planet hub is ready",
+	Type = "Success",
+})
+
+if ui.log then
+	ui.log:Push("<Muted>Hub ready ·</Muted> <Accent>" .. HUB_VERSION .. "</Accent>")
+end
