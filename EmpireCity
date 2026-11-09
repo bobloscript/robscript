@@ -1,0 +1,2058 @@
+-- Robscript Team - Empire City
+-- placeId 96518900573630 / gameId 10764511993
+-- Window: RightControl, API: getgenv().RobScriptEmpire
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+-- Unload a previous copy so its loops and connections die first.
+do
+	local existing = getgenv().RobScriptEmpire
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript Empire] Airflow UI could not be loaded")
+end
+
+----- Constants -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+local themeApplied = pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+if not themeApplied then
+	pcall(function()
+		Airflow:SetDefaultTheme(THEME)
+	end)
+end
+
+local TEAM_COLORS = {
+	Citizen = Color3.fromHex("#7BE38B"),
+	Police = Color3.fromHex("#5AA9FF"),
+	Hacker = Color3.fromHex("#B07BFF"),
+	Logistics = Color3.fromHex("#FFD166"),
+	Dealership = Color3.fromHex("#57C78A"),
+	Thief = Color3.fromHex("#FF9F45"),
+}
+
+local UPDATE_RATE = 0.2
+
+local Services = {
+	ReplicatedStorage = ReplicatedStorage,
+	RunService = RunService,
+	UserInputService = UserInputService,
+	Lighting = Lighting,
+}
+
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local GunRuntime = ReplicatedStorage:FindFirstChild("GunSystem2Runtime")
+
+----- State -----
+
+local State = {
+	Aimbot = false,
+	AimPart = "Head",
+	Fov = 220,
+	Smoothness = 8,
+	VisibleOnly = true,
+	IgnoreTeammates = false,
+	TargetNpcs = false,
+	DrawFov = false,
+	SilentAim = false,
+
+	Triggerbot = false,
+	TriggerDelay = 0.08,
+	AutoShoot = false,
+	FireRate = 0.14,
+	AutoReload = true,
+
+	PlayerEsp = false,
+	NpcEsp = false,
+	VehicleEsp = false,
+	LootEsp = false,
+	Tracers = false,
+	Names = true,
+	Health = true,
+	Distance = true,
+	Chams = true,
+
+	Fullbright = false,
+	FpsBoost = false,
+	NoBlur = true,
+
+	FarmRadius = 120,
+	AutoRobbery = false,
+	AutoJewelry = false,
+	AutoPrompt = false,
+	AutoDaily = false,
+
+	PanicKey = "End",
+}
+
+local Session = {
+	startedAt = os.clock(),
+	shots = 0,
+	cashStart = 0,
+	wantedPeak = 0,
+	log = {},
+	connections = {},
+	renderSteps = {},
+	esp = {},
+	tracers = {},
+	lastFire = 0,
+	lastReload = 0,
+	fullbrightBackup = nil,
+	fpsBackup = {},
+	blurBackup = {},
+	manualShots = 0,
+}
+
+local function track(connection)
+	table.insert(Session.connections, connection)
+	return connection
+end
+
+local function addLog(log, message, tone)
+	if log then
+		log:Push(message, tone)
+	end
+end
+
+----- Helpers -----
+
+local function getCharacter()
+	local character = LocalPlayer.Character
+	if character and character.Parent then
+		return character
+	end
+	return nil
+end
+
+local function getHumanoid()
+	local character = getCharacter()
+	return character and character:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function getRoot()
+	local character = getCharacter()
+	return character and character:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function getTool()
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+	local tool = character:FindFirstChildOfClass("Tool")
+	if tool and tool.Name ~= "Glass Breaker" then
+		return tool
+	end
+	return tool
+end
+
+local function getGunRemote()
+	local tool = getTool()
+	if not tool then
+		return nil
+	end
+	local localScript = tool:FindFirstChild("GunScript_Local")
+	return localScript and localScript:FindFirstChild("ToolRemoteEvent") or nil
+end
+
+local function getGuiLayer()
+	local ok, layer = pcall(function()
+		return gethui and gethui() or nil
+	end)
+	if ok and layer then
+		return layer
+	end
+	return LocalPlayer:FindFirstChild("PlayerGui")
+end
+
+local function createFolder(name)
+	local parent = getGuiLayer()
+	local folder = parent and parent:FindFirstChild(name)
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = name
+		folder.Parent = parent
+	end
+	return folder
+end
+
+local function safeGetConnections(signal)
+	if type(getconnections) ~= "function" then
+		return nil
+	end
+	local ok, list = pcall(getconnections, signal)
+	if ok and type(list) == "table" then
+		return list
+	end
+	return nil
+end
+
+local function invokeConnections(signal)
+	local list = safeGetConnections(signal)
+	if not list then
+		return 0
+	end
+	local called = 0
+	for _, connection in ipairs(list) do
+		if type(connection.Function) == "function" then
+			local ok = pcall(connection.Function)
+			if ok then
+				called += 1
+			end
+		end
+	end
+	return called
+end
+
+local function getMouse()
+	local ok, mouse = pcall(function()
+		return LocalPlayer:GetMouse()
+	end)
+	if ok then
+		return mouse
+	end
+	return nil
+end
+
+local function playerAlive(player)
+	local character = player.Character
+	if not character then
+		return false
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+	return character:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+local function isNpcModel(model)
+	if not model or not model:IsA("Model") then
+		return false
+	end
+	if Players:GetPlayerFromCharacter(model) then
+		return false
+	end
+	if model.Name == "EmpireWeaponViewmodel" then
+		return false
+	end
+	return model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local function distanceTo(position)
+	local root = getRoot()
+	if not root then
+		return math.huge
+	end
+	return (root.Position - position).Magnitude
+end
+
+local function worldToScreen(position)
+	local point, onScreen = Camera:WorldToViewportPoint(position)
+	return Vector2.new(point.X, point.Y), onScreen and point.Z > 0, point.Z
+end
+
+local function hasLineOfSight(fromPosition, toPosition, ignored)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local filter = {}
+	for _, instance in ipairs(ignored or {}) do
+		if instance then
+			table.insert(filter, instance)
+		end
+	end
+	params.FilterDescendantsInstances = filter
+
+	local delta = toPosition - fromPosition
+	local length = delta.Magnitude
+	if length < 0.1 then
+		return true
+	end
+	-- stop just short of the point so the target's own part is not the first hit
+	local direction = delta.Unit * math.max(length - 0.35, 0.05)
+	local result = workspace:Raycast(fromPosition, direction, params)
+	return result == nil
+end
+
+local function clamp(value, minValue, maxValue)
+	return math.clamp(value, minValue, maxValue)
+end
+
+----- Weapon control -----
+
+local function getAmmo()
+	local tool = getTool()
+	if not tool then
+		return 0
+	end
+	return tonumber(tool:GetAttribute("Ammo")) or 0
+end
+
+-- The client keeps its own magazine counter in GunGUI; it is the only reliable
+-- "can I shoot right now" source, the tool attribute lags behind a reload.
+local function getLocalMag()
+	local gui = LocalPlayer:FindFirstChild("PlayerGui")
+	local gunGui = gui and gui:FindFirstChild("GunGUI")
+	local frame = gunGui and gunGui:FindFirstChild("Frame")
+	local mag = frame and frame:FindFirstChild("Mag")
+	local current = mag and mag:FindFirstChild("Current")
+	if not current then
+		return nil
+	end
+	return tonumber(current.Text)
+end
+
+local function reloadWeapon()
+	local now = os.clock()
+	if now - Session.lastReload < 1 then
+		return false
+	end
+	Session.lastReload = now
+
+	local gui = LocalPlayer:FindFirstChild("PlayerGui")
+	local gunGui = gui and gui:FindFirstChild("GunGUI")
+	local buttons = gunGui and gunGui:FindFirstChild("MobileButtons")
+	local reloadButton = buttons and buttons:FindFirstChild("ReloadButton")
+	if reloadButton then
+		local called = invokeConnections(reloadButton.Activated)
+		if called > 0 then
+			return true
+		end
+	end
+
+	local tool = getTool()
+	local remote = getGunRemote()
+	if tool and remote then
+		pcall(function()
+			remote:FireServer("Reload")
+		end)
+		return true
+	end
+	return false
+end
+
+local function fireOnce()
+	local now = os.clock()
+	if now - Session.lastFire < State.FireRate then
+		return false
+	end
+	Session.lastFire = now
+
+	local mouse = getMouse()
+	local fired = false
+	if mouse then
+		local down = safeGetConnections(mouse.Button1Down)
+		if down then
+			for _, connection in ipairs(down) do
+				if type(connection.Function) == "function" then
+					local ok = pcall(connection.Function)
+					if ok then
+						fired = true
+					end
+				end
+			end
+			local up = safeGetConnections(mouse.Button1Up)
+			if up then
+				for _, connection in ipairs(up) do
+					pcall(connection.Function)
+				end
+			end
+		end
+	end
+
+	if not fired then
+		local remote = getGunRemote()
+		if remote then
+			pcall(function()
+				remote:FireServer("EjectShell")
+				remote:FireServer("Fire")
+			end)
+			fired = true
+		end
+	end
+
+	if fired then
+		Session.lastFireAttempt = now
+	end
+	return fired
+end
+
+----- World scan (cached once a second, keeps the frame loops cheap) -----
+
+local function scanWorld()
+	local npcs, prompts, loot = {}, {}, {}
+
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if descendant:IsA("Humanoid") then
+			local model = descendant.Parent
+			if descendant.Health > 0 and model and isNpcModel(model) then
+				local npcRoot = model:FindFirstChild("HumanoidRootPart")
+				if npcRoot then
+					table.insert(npcs, {
+						model = model,
+						humanoid = descendant,
+						root = npcRoot,
+						head = model:FindFirstChild("Head"),
+					})
+				end
+			end
+		elseif descendant:IsA("ProximityPrompt") then
+			local instance = descendant.Parent
+			local position
+			if instance then
+				if instance:IsA("BasePart") then
+					position = instance.Position
+				elseif instance:IsA("Model") then
+					local primary = instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart", true)
+					position = primary and primary.Position
+				end
+			end
+			if position then
+				table.insert(prompts, {
+					prompt = descendant,
+					position = position,
+					text = ((descendant.ActionText or "") .. " " .. (descendant.ObjectText or "")):lower(),
+				})
+			end
+		elseif descendant:IsA("BasePart") then
+			local value = descendant:GetAttribute("LootValue")
+			if value then
+				table.insert(loot, { part = descendant, value = value })
+			end
+		end
+	end
+
+	Session.npcCache = npcs
+	Session.promptCache = prompts
+	Session.lootCache = loot
+end
+
+----- Target selection -----
+
+local AIM_PARTS = { "Head", "UpperTorso", "HumanoidRootPart" }
+
+local function aimPointFor(character, partName)
+	local part = character:FindFirstChild(partName)
+	if not part then
+		part = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+	end
+	if not part then
+		return nil
+	end
+	return part.Position
+end
+
+local function isValidTarget(character)
+	if not character then
+		return false
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+	if character == getCharacter() then
+		return false
+	end
+	return true
+end
+
+local function collectCandidates()
+	local candidates = {}
+	local ignored = { getCharacter() }
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and playerAlive(player) then
+			local character = player.Character
+			if not (State.IgnoreTeammates and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team) then
+				local point = aimPointFor(character, State.AimPart)
+				if point then
+					table.insert(candidates, {
+						character = character,
+						point = point,
+						player = player,
+						npc = false,
+						label = player.Name,
+					})
+				end
+			end
+		end
+	end
+
+	if State.TargetNpcs then
+		for _, npc in ipairs(Session.npcCache or {}) do
+			local model = npc.model
+			if model.Parent then
+				local point = aimPointFor(model, State.AimPart)
+				if point then
+					table.insert(candidates, {
+						character = model,
+						point = point,
+						player = nil,
+						npc = true,
+						label = model.Name,
+					})
+				end
+			end
+		end
+	end
+
+	return candidates, ignored
+end
+
+local function resolveTarget()
+	local candidates = collectCandidates()
+	local best, bestScore
+	for _, candidate in ipairs(candidates) do
+		local screenPoint, onScreen, depth = worldToScreen(candidate.point)
+		if depth > 0 then
+			local center = Camera.ViewportSize * 0.5
+			local radius = (screenPoint - center).Magnitude
+			local distance = distanceTo(candidate.point)
+			if radius <= State.Fov and distance <= 800 then
+				local visible = true
+				if State.VisibleOnly then
+					visible = hasLineOfSight(Camera.CFrame.Position, candidate.point, { getCharacter(), candidate.character })
+				end
+				if visible or not State.VisibleOnly then
+					local score = radius + distance * 0.05
+					if not bestScore or score < bestScore then
+						best = candidate
+						bestScore = score
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+----- ESP -----
+
+local EspFolder = createFolder("RobScriptEmpireEsp")
+
+local function newHighlight(adornee, color, filled)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "RSEmpireHighlight"
+	highlight.Adornee = adornee
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillColor = color
+	highlight.FillTransparency = filled and 0.35 or 0.75
+	highlight.OutlineColor = color
+	highlight.OutlineTransparency = 0.15
+	highlight.Parent = EspFolder
+	return highlight
+end
+
+local function newBillboard(adornee, height)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "RSEmpireLabel"
+	billboard.Adornee = adornee
+	billboard.Size = UDim2.fromOffset(220, 44)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, height, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = 2500
+	billboard.LightInfluence = 0
+	billboard.ResetOnSpawn = false
+	billboard.Parent = EspFolder
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Text"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 14
+	label.TextColor3 = THEME.Text
+	label.TextStrokeTransparency = 0.4
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.TextWrapped = true
+	label.RichText = true
+	label.Text = ""
+	label.Parent = billboard
+
+	return billboard, label
+end
+
+local function ensureEsp(id, adornee, height, color)
+	local entry = Session.esp[id]
+	if entry and entry.adornee == adornee then
+		return entry
+	end
+	if entry then
+		if entry.highlight then
+			entry.highlight:Destroy()
+		end
+		if entry.billboard then
+			entry.billboard:Destroy()
+		end
+	end
+
+	entry = {
+		adornee = adornee,
+		highlight = newHighlight(adornee, color, true),
+		billboard = nil,
+		label = nil,
+	}
+	entry.billboard, entry.label = newBillboard(adornee, height or 2.6)
+	Session.esp[id] = entry
+	return entry
+end
+
+local function dropEsp(id)
+	local entry = Session.esp[id]
+	if not entry then
+		return
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	if entry.billboard then
+		entry.billboard:Destroy()
+	end
+	Session.esp[id] = nil
+end
+
+local function clearEsp()
+	for id in pairs(Session.esp) do
+		dropEsp(id)
+	end
+	for _, line in pairs(Session.tracers) do
+		pcall(function()
+			line:Remove()
+		end)
+	end
+	Session.tracers = {}
+end
+
+local function tracerFor(id)
+	if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+		return nil
+	end
+	local line = Session.tracers[id]
+	if line then
+		return line
+	end
+	local ok, created = pcall(function()
+		local newLine = Drawing.new("Line")
+		newLine.Thickness = 1.5
+		newLine.Transparency = 0.65
+		return newLine
+	end)
+	if ok and created then
+		Session.tracers[id] = created
+		return created
+	end
+	return nil
+end
+
+local function updateTracer(id, position, color, enabled)
+	local line = tracerFor(id)
+	if not line then
+		return
+	end
+	if not enabled then
+		line.Visible = false
+		return
+	end
+	local screenPoint, onScreen = worldToScreen(position)
+	if not onScreen then
+		line.Visible = false
+		return
+	end
+	local origin = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y)
+	line.From = origin
+	line.To = screenPoint
+	line.Color = color
+	line.Visible = true
+end
+
+local function formatDistance(distance)
+	if distance >= 1000 then
+		return string.format("%.1fk", distance / 1000)
+	end
+	return string.format("%dm", math.floor(distance))
+end
+
+local function updateEsp()
+	if not (State.PlayerEsp or State.NpcEsp or State.VehicleEsp or State.LootEsp) then
+		if Session.espActive then
+			clearEsp()
+			Session.espActive = false
+		end
+		return
+	end
+	Session.espActive = true
+
+	local seen = {}
+
+	if State.PlayerEsp then
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer and playerAlive(player) then
+				local character = player.Character
+				local root = character:FindFirstChild("HumanoidRootPart")
+				local humanoid = character:FindFirstChildOfClass("Humanoid")
+				local head = character:FindFirstChild("Head") or root
+				if root and humanoid and head then
+					local id = "player_" .. player.UserId
+					seen[id] = true
+					local teamName = player.Team and player.Team.Name or "Citizen"
+					local color = TEAM_COLORS[teamName] or THEME.Accent
+					local entry = ensureEsp(id, head, 2.8, color)
+					local distance = distanceTo(root.Position)
+					local lines = {}
+					if State.Names then
+						table.insert(lines, string.format("<b>%s</b>", player.Name))
+					end
+					if State.Health then
+						table.insert(lines, string.format("%d hp", math.floor(humanoid.Health)))
+					end
+					if State.Distance then
+						table.insert(lines, formatDistance(distance))
+					end
+					entry.label.Text = table.concat(lines, "  ·  ")
+					entry.label.TextColor3 = color
+					if entry.highlight then
+						entry.highlight.Enabled = State.Chams
+					end
+					updateTracer(id, root.Position, color, State.Tracers)
+				end
+			end
+		end
+	end
+
+	if State.NpcEsp then
+		for _, npc in ipairs(Session.npcCache or {}) do
+			local model = npc.model
+			if model.Parent and npc.humanoid.Health > 0 then
+				local id = "npc_" .. npc.humanoid:GetDebugId()
+				seen[id] = true
+				local anchor = npc.head or npc.root
+				local entry = ensureEsp(id, anchor, 2.8, Color3.fromHex("#FFD166"))
+				local distance = distanceTo(npc.root.Position)
+				local lines = {}
+				if State.Names then
+					table.insert(lines, model.Name)
+				end
+				if State.Health then
+					table.insert(lines, string.format("%d hp", math.floor(npc.humanoid.Health)))
+				end
+				if State.Distance then
+					table.insert(lines, formatDistance(distance))
+				end
+				entry.label.Text = table.concat(lines, "  ·  ")
+				entry.label.TextColor3 = Color3.fromHex("#FFD166")
+				if entry.highlight then
+					entry.highlight.Enabled = State.Chams
+				end
+			end
+		end
+	end
+
+	if State.VehicleEsp then
+		local vehicles = workspace:FindFirstChild("SpawnedVehicles")
+		if vehicles then
+			for _, vehicle in ipairs(vehicles:GetChildren()) do
+				local seat = vehicle:FindFirstChild("DriveSeat") or vehicle:FindFirstChild("VehicleSeat") or vehicle:FindFirstChildWhichIsA("BasePart", true)
+				if seat then
+					local id = "veh_" .. vehicle:GetDebugId()
+					seen[id] = true
+					local entry = ensureEsp(id, seat, 4.5, Color3.fromHex("#5AA9FF"))
+					local owner = vehicle:GetAttribute("OwnerName") or "?"
+					local display = vehicle:GetAttribute("DisplayName") or vehicle.Name
+					local distance = distanceTo(seat.Position)
+					entry.label.Text = string.format("<b>%s</b>  ·  %s  ·  %s", display, owner, formatDistance(distance))
+					entry.label.TextColor3 = Color3.fromHex("#5AA9FF")
+					if entry.highlight then
+						entry.highlight.Enabled = State.Chams
+					end
+				end
+			end
+		end
+	end
+
+	if State.LootEsp then
+		local lootCount = 0
+		for _, entry in ipairs(Session.lootCache or {}) do
+			local part = entry.part
+			if part.Parent and lootCount < 80 then
+				lootCount += 1
+				local id = "loot_" .. part:GetDebugId()
+				seen[id] = true
+				local label = ensureEsp(id, part, 1.4, Color3.fromHex("#7BE38B"))
+				local distance = distanceTo(part.Position)
+				label.label.Text = string.format("$%s  ·  %s", tostring(entry.value), formatDistance(distance))
+				label.label.TextColor3 = Color3.fromHex("#7BE38B")
+				if label.highlight then
+					label.highlight.Enabled = false
+				end
+			end
+		end
+	end
+
+	for id in pairs(Session.esp) do
+		if not seen[id] then
+			dropEsp(id)
+			local line = Session.tracers[id]
+			if line then
+				pcall(function()
+					line:Remove()
+				end)
+				Session.tracers[id] = nil
+			end
+		end
+	end
+end
+
+----- Lighting / performance -----
+
+local function setFullbright(enabled)
+	if enabled then
+		if not Session.fullbrightBackup then
+			Session.fullbrightBackup = {
+				Brightness = Lighting.Brightness,
+				ClockTime = Lighting.ClockTime,
+				Ambient = Lighting.Ambient,
+				OutdoorAmbient = Lighting.OutdoorAmbient,
+				FogEnd = Lighting.FogEnd,
+				FogStart = Lighting.FogStart,
+				GlobalShadows = Lighting.GlobalShadows,
+				ExposureCompensation = Lighting.ExposureCompensation,
+			}
+			local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+			if atmosphere then
+				Session.fullbrightBackup.AtmosphereDensity = atmosphere.Density
+				atmosphere.Density = 0
+			end
+		end
+		Lighting.Brightness = 3
+		Lighting.ClockTime = 14
+		Lighting.Ambient = Color3.fromRGB(180, 180, 180)
+		Lighting.OutdoorAmbient = Color3.fromRGB(180, 180, 180)
+		Lighting.FogEnd = 100000
+		Lighting.FogStart = 0
+		Lighting.GlobalShadows = false
+		Lighting.ExposureCompensation = 0
+	elseif Session.fullbrightBackup then
+		local backup = Session.fullbrightBackup
+		Lighting.Brightness = backup.Brightness
+		Lighting.ClockTime = backup.ClockTime
+		Lighting.Ambient = backup.Ambient
+		Lighting.OutdoorAmbient = backup.OutdoorAmbient
+		Lighting.FogEnd = backup.FogEnd
+		Lighting.FogStart = backup.FogStart
+		Lighting.GlobalShadows = backup.GlobalShadows
+		Lighting.ExposureCompensation = backup.ExposureCompensation
+		local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+		if atmosphere and backup.AtmosphereDensity then
+			atmosphere.Density = backup.AtmosphereDensity
+		end
+		Session.fullbrightBackup = nil
+	end
+end
+
+local function setFpsBoost(enabled)
+	if enabled then
+		for _, effect in ipairs(Lighting:GetChildren()) do
+			if effect:IsA("PostEffect") then
+				Session.fpsBackup[effect] = effect.Enabled
+				effect.Enabled = false
+			end
+		end
+		if workspace:FindFirstChildOfClass("Terrain") then
+			pcall(function()
+				local quality = settings().Rendering.QualityLevel
+				Session.fpsBackup.QualityLevel = quality
+				settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+			end)
+		end
+	else
+		for effect, value in pairs(Session.fpsBackup) do
+			if typeof(effect) == "Instance" and effect.Parent then
+				pcall(function()
+					effect.Enabled = value
+				end)
+			end
+		end
+		if Session.fpsBackup.QualityLevel then
+			pcall(function()
+				settings().Rendering.QualityLevel = Session.fpsBackup.QualityLevel
+			end)
+		end
+		Session.fpsBackup = {}
+	end
+end
+
+-- The game keeps its own screen blur (EmpireInventoryBlur and friends). It stays
+-- on after the inventory closes and is the blur players see behind a hidden hub,
+-- so the switcher remembers every BlurEffect and turns them off.
+local function setNoBlur(enabled)
+	for _, effect in ipairs(Lighting:GetChildren()) do
+		if effect:IsA("BlurEffect") then
+			if enabled then
+				if Session.blurBackup[effect] == nil then
+					Session.blurBackup[effect] = effect.Enabled
+				end
+				if effect.Enabled then
+					Session.blurBackup[effect] = true
+				end
+				effect.Enabled = false
+			else
+				local previous = Session.blurBackup[effect]
+				if previous ~= nil then
+					effect.Enabled = previous
+					Session.blurBackup[effect] = nil
+				end
+			end
+		end
+	end
+end
+
+----- Walking -----
+local function walkTo(position)
+	local humanoid = getHumanoid()
+	if not humanoid or not position then
+		return false
+	end
+	task.spawn(function()
+		local guard = 0
+		while guard < 20 do
+			local root = getRoot()
+			if not root then
+				break
+			end
+			if (position - root.Position).Magnitude < 6 then
+				break
+			end
+			humanoid:MoveTo(position)
+			guard += 1
+			task.wait(0.5)
+		end
+	end)
+	return true
+end
+
+----- Farm -----
+
+local function findNearestPrompt(keyword, radius)
+	local root = getRoot()
+	if not root then
+		return nil
+	end
+	local best, bestDistance
+	for _, entry in ipairs(Session.promptCache or {}) do
+		local matches = keyword == "" or string.find(entry.text, keyword:lower(), 1, true) ~= nil
+		if matches then
+			local distance = (root.Position - entry.position).Magnitude
+			if distance <= radius and (not bestDistance or distance < bestDistance) then
+				best = entry.prompt
+				bestDistance = distance
+			end
+		end
+	end
+	return best, bestDistance
+end
+
+local function triggerPrompt(prompt)
+	if not prompt then
+		return false
+	end
+	local ok = pcall(function()
+		prompt:InputHoldBegin()
+	end)
+	if not ok then
+		return false
+	end
+	task.delay(math.max(prompt.HoldDuration or 0.2, 0.2) + 0.1, function()
+		pcall(function()
+			prompt:InputHoldEnd()
+		end)
+	end)
+	return true
+end
+
+local function farmLoop(log)
+	return task.spawn(function()
+		while true do
+			local active = State.AutoRobbery or State.AutoJewelry or State.AutoPrompt or State.AutoDaily
+			if not active then
+				task.wait(0.5)
+				continue
+			end
+
+			if State.AutoRobbery then
+				local prompt, distance = findNearestPrompt("Rob", State.FarmRadius)
+				if prompt and distance then
+					local anchor = prompt.Parent
+					local position = anchor and (anchor:IsA("BasePart") and anchor.Position or (anchor.PrimaryPart or anchor:FindFirstChildWhichIsA("BasePart", true)) and (anchor.PrimaryPart or anchor:FindFirstChildWhichIsA("BasePart", true)).Position)
+					if position and distance > 12 then
+						walkTo(position)
+						task.wait(1.2)
+					end
+					triggerPrompt(prompt)
+					addLog(log, "<Accent>Robbery</Accent> prompt triggered at " .. string.format("%.0f", distance) .. "m")
+					task.wait(2.5)
+				end
+			end
+
+			if State.AutoJewelry then
+				local prompt, distance = findNearestPrompt("Recover", State.FarmRadius)
+				if prompt then
+					triggerPrompt(prompt)
+					addLog(log, "<Accent>Jewelry</Accent> recover triggered")
+					task.wait(2)
+				end
+			end
+
+			if State.AutoPrompt then
+				local prompt, distance = findNearestPrompt("", 40)
+				if prompt then
+					triggerPrompt(prompt)
+					task.wait(1.5)
+				end
+			end
+
+			if State.AutoDaily then
+				if Remotes then
+					local request = Remotes:FindFirstChild("RequestDailyReward")
+					local claim = Remotes:FindFirstChild("ClaimDailyReward")
+					if request then
+						pcall(function()
+							request:InvokeServer()
+						end)
+					end
+					if claim then
+						pcall(function()
+							claim:InvokeServer()
+						end)
+					end
+				end
+				task.wait(5)
+			end
+
+			task.wait(0.6)
+		end
+	end)
+end
+
+----- Wanted / stats -----
+
+local function getWantedLevel()
+	return tonumber(LocalPlayer:GetAttribute("WantedLevel")) or 0
+end
+
+local function getCash()
+	local stats = LocalPlayer:FindFirstChild("leaderstats")
+	local cash = stats and stats:FindFirstChild("Cash")
+	return cash and cash.Value or 0
+end
+
+local function getWantedRemaining()
+	local expiresAt = tonumber(LocalPlayer:GetAttribute("WantedExpiresAt")) or 0
+	if expiresAt <= 0 then
+		return 0
+	end
+	local now = workspace:GetServerTimeNow()
+	return math.max(0, expiresAt - now)
+end
+
+----- UI -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript · Empire City",
+	LoadingSubtitle = "combat, visuals, movement, farm",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobscriptEmpire" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+Window:Notify({ Title = "Empire City", Content = "Robscript hub is ready", Type = "Success" })
+
+----- Combat tab -----
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local AimBox = CombatTab:CreateGroupbox({ Name = "Aim", Side = "Left" })
+local FireBox = CombatTab:CreateGroupbox({ Name = "Fire", Side = "Left" })
+local CombatStatusBox = CombatTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+local CombatLog = CombatStatusBox:CreateLog({
+	Name = "Combat log",
+	MaxEntries = 200,
+	MaxRows = 8,
+	Timestamps = true,
+	EmptyText = "No shots yet",
+})
+
+AimBox:CreateToggle({
+	Name = "Aimbot",
+	Flag = "Aimbot",
+	CurrentValue = false,
+	Callback = function(value)
+		State.Aimbot = value
+		addLog(CombatLog, value and "<Success>Aimbot on</Success>" or "<Muted>Aimbot off</Muted>")
+	end,
+})
+
+AimBox:CreateDropdown({
+	Name = "Aim part",
+	Options = AIM_PARTS,
+	CurrentOption = "Head",
+	Flag = "AimPart",
+	Callback = function(value)
+		State.AimPart = value
+	end,
+})
+
+AimBox:CreateSlider({
+	Name = "Field of view",
+	Range = { 20, 900 },
+	Increment = 10,
+	Suffix = " px",
+	CurrentValue = 220,
+	Flag = "AimFov",
+	Callback = function(value)
+		State.Fov = value
+	end,
+})
+
+AimBox:CreateSlider({
+	Name = "Smoothness",
+	Range = { 1, 30 },
+	Increment = 1,
+	CurrentValue = 8,
+	Flag = "AimSmooth",
+	Callback = function(value)
+		State.Smoothness = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Visible only",
+	Flag = "AimVisible",
+	CurrentValue = true,
+	Callback = function(value)
+		State.VisibleOnly = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Ignore teammates",
+	Flag = "AimTeam",
+	CurrentValue = false,
+	Callback = function(value)
+		State.IgnoreTeammates = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Target NPCs",
+	Flag = "AimNpc",
+	CurrentValue = false,
+	Callback = function(value)
+		State.TargetNpcs = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "FOV circle",
+	Flag = "AimCircle",
+	CurrentValue = false,
+	Callback = function(value)
+		State.DrawFov = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Silent aim (experimental)",
+	Flag = "SilentAim",
+	CurrentValue = false,
+	Callback = function(value)
+		State.SilentAim = value
+		addLog(CombatLog, value and "<Warning>Silent aim on</Warning> - verify on a live target" or "<Muted>Silent aim off</Muted>")
+	end,
+})
+
+FireBox:CreateToggle({
+	Name = "Auto shoot",
+	Flag = "AutoShoot",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoShoot = value
+		addLog(CombatLog, value and "<Success>Auto shoot on</Success>" or "<Muted>Auto shoot off</Muted>")
+	end,
+})
+
+FireBox:CreateToggle({
+	Name = "Triggerbot",
+	Flag = "Triggerbot",
+	CurrentValue = false,
+	Callback = function(value)
+		State.Triggerbot = value
+	end,
+})
+
+FireBox:CreateSlider({
+	Name = "Fire rate",
+	Range = { 0.05, 0.6 },
+	Increment = 0.01,
+	Suffix = " s",
+	CurrentValue = 0.14,
+	Flag = "FireRate",
+	Callback = function(value)
+		State.FireRate = value
+	end,
+})
+
+FireBox:CreateToggle({
+	Name = "Auto reload",
+	Flag = "AutoReload",
+	CurrentValue = true,
+	Callback = function(value)
+		State.AutoReload = value
+	end,
+})
+
+FireBox:CreateButton({
+	Name = "Verify hit",
+	Icon = "activity",
+	Callback = function()
+		task.spawn(function()
+			local target = resolveTarget()
+			if not target then
+				addLog(CombatLog, "<Warning>No target</Warning>", "Warning")
+				return
+			end
+			local humanoid = target.character:FindFirstChildOfClass("Humanoid")
+			if not humanoid then
+				return
+			end
+			local before = humanoid.Health
+			for _ = 1, 3 do
+				fireOnce()
+				task.wait(0.35)
+			end
+			task.wait(0.6)
+			local after = humanoid.Health
+			local hit = after < before
+			addLog(CombatLog, string.format("Hit check %s: %.0f -> %.0f", tostring(target.label), before, after), hit and "Success" or "Warning")
+		end)
+	end,
+})
+
+FireBox:CreateButton({
+	Name = "Fire once",
+	Icon = "crosshair",
+	Callback = function()
+		local fired = fireOnce()
+		addLog(CombatLog, fired and "<Success>Shot</Success>" or "<Muted>No weapon ready</Muted>")
+	end,
+})
+
+FireBox:CreateButton({
+	Name = "Reload",
+	Icon = "rotate-cw",
+	Callback = function()
+		local ok = reloadWeapon()
+		addLog(CombatLog, ok and "<Success>Reload sent</Success>" or "<Error>Reload failed</Error>")
+	end,
+})
+
+local targetStatus = CombatStatusBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.25,
+	Update = function()
+		local target = Session.target
+		if not target then
+			return "<Muted>none</Muted>"
+		end
+		return string.format("%s  ·  %s", target.label, formatDistance(distanceTo(target.point)))
+	end,
+})
+
+CombatStatusBox:CreateStatus({
+	Name = "Ammo",
+	Style = "Row",
+	UpdateRate = 0.25,
+	Update = function()
+		local mag = getLocalMag()
+		return string.format("%s / %d", tostring(mag or "?"), getAmmo())
+	end,
+})
+
+CombatStatusBox:CreateStatus({
+	Name = "Shots",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return tostring(Session.shots)
+	end,
+})
+
+
+
+----- Visuals tab -----
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local EspBox = VisualsTab:CreateGroupbox({ Name = "ESP", Side = "Left" })
+local EspExtrasBox = VisualsTab:CreateGroupbox({ Name = "Extras", Side = "Left" })
+local WorldBox = VisualsTab:CreateGroupbox({ Name = "World", Side = "Right" })
+local VisualStatusBox = VisualsTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+EspBox:CreateToggle({
+	Name = "Player ESP",
+	Flag = "PlayerEsp",
+	CurrentValue = false,
+	Callback = function(value)
+		State.PlayerEsp = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "NPC ESP",
+	Flag = "NpcEsp",
+	CurrentValue = false,
+	Callback = function(value)
+		State.NpcEsp = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Vehicle ESP",
+	Flag = "VehicleEsp",
+	CurrentValue = false,
+	Callback = function(value)
+		State.VehicleEsp = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Loot ESP",
+	Flag = "LootEsp",
+	CurrentValue = false,
+	Callback = function(value)
+		State.LootEsp = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Names",
+	Flag = "EspNames",
+	CurrentValue = true,
+	Callback = function(value)
+		State.Names = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Health",
+	Flag = "EspHealth",
+	CurrentValue = true,
+	Callback = function(value)
+		State.Health = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Distance",
+	Flag = "EspDistance",
+	CurrentValue = true,
+	Callback = function(value)
+		State.Distance = value
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "Chams",
+	Flag = "Chams",
+	CurrentValue = true,
+	Callback = function(value)
+		State.Chams = value
+	end,
+})
+
+EspExtrasBox:CreateToggle({
+	Name = "Tracers",
+	Flag = "Tracers",
+	CurrentValue = false,
+	Callback = function(value)
+		State.Tracers = value
+	end,
+})
+
+WorldBox:CreateToggle({
+	Name = "Fullbright",
+	Flag = "Fullbright",
+	CurrentValue = false,
+	Callback = function(value)
+		State.Fullbright = value
+		setFullbright(value)
+	end,
+})
+
+WorldBox:CreateToggle({
+	Name = "FPS boost",
+	Flag = "FpsBoost",
+	CurrentValue = false,
+	Callback = function(value)
+		State.FpsBoost = value
+		setFpsBoost(value)
+	end,
+})
+
+WorldBox:CreateToggle({
+	Name = "Remove screen blur",
+	Flag = "NoBlur",
+	CurrentValue = true,
+	Callback = function(value)
+		State.NoBlur = value
+		setNoBlur(value)
+	end,
+})
+
+VisualStatusBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local count = 0
+		for _ in pairs(Session.esp) do
+			count += 1
+		end
+		return tostring(count)
+	end,
+})
+
+VisualStatusBox:CreateStatus({
+	Name = "Loot in world",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(#(Session.lootCache or {}))
+	end,
+})
+
+----- Farm tab -----
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "coins" })
+local FarmBox = FarmTab:CreateGroupbox({ Name = "Automation", Side = "Left" })
+local FarmStatusBox = FarmTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+local FarmLogBox = FarmTab:CreateGroupbox({ Name = "Farm log", Side = "Right" })
+
+local FarmLog = FarmLogBox:CreateLog({
+	Name = "Farm log",
+	MaxEntries = 200,
+	MaxRows = 10,
+	Timestamps = true,
+	EmptyText = "Idle",
+})
+
+FarmBox:CreateSlider({
+	Name = "Farm radius",
+	Range = { 20, 400 },
+	Increment = 10,
+	Suffix = " m",
+	CurrentValue = 120,
+	Flag = "FarmRadius",
+	Callback = function(value)
+		State.FarmRadius = value
+	end,
+})
+
+FarmBox:CreateToggle({
+	Name = "Auto robbery",
+	Flag = "AutoRobbery",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoRobbery = value
+		addLog(FarmLog, value and "<Success>Auto robbery on</Success>" or "<Muted>Auto robbery off</Muted>")
+	end,
+})
+
+FarmBox:CreateToggle({
+	Name = "Auto jewelry",
+	Flag = "AutoJewelry",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoJewelry = value
+		addLog(FarmLog, value and "<Success>Auto jewelry on</Success>" or "<Muted>Auto jewelry off</Muted>")
+	end,
+})
+
+FarmBox:CreateToggle({
+	Name = "Auto prompt",
+	Flag = "AutoPrompt",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoPrompt = value
+	end,
+})
+
+FarmBox:CreateToggle({
+	Name = "Auto daily reward",
+	Flag = "AutoDaily",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoDaily = value
+	end,
+})
+
+FarmBox:CreateButton({
+	Name = "Trigger nearest prompt",
+	Icon = "hand",
+	Callback = function()
+		local prompt, distance = findNearestPrompt("", State.FarmRadius)
+		if prompt then
+			triggerPrompt(prompt)
+			addLog(FarmLog, string.format("<Accent>Prompt</Accent> %s at %.0fm", prompt.ActionText, distance or 0))
+		else
+			addLog(FarmLog, "<Muted>No prompt in range</Muted>")
+		end
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Nearest prompt",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 1,
+	Update = function()
+		local prompt, distance = findNearestPrompt("", State.FarmRadius)
+		if not prompt then
+			return "<Muted>none</Muted>"
+		end
+		return string.format("%s  ·  %.0fm", prompt.ActionText, distance or 0)
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("$%d", getCash())
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Wanted",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local level = getWantedLevel()
+		local remaining = getWantedRemaining()
+		if level <= 0 then
+			return "<Muted>clean</Muted>"
+		end
+		return string.format("<Error>%d</Error>  ·  %.0fs", level, remaining)
+	end,
+})
+
+----- Vehicle tab -----
+
+local VehicleTab = Window:CreateTab({ Name = "Vehicle", Icon = "car" })
+local VehicleBox = VehicleTab:CreateGroupbox({ Name = "Vehicle", Side = "Left" })
+local VehicleStatusBox = VehicleTab:CreateGroupbox({ Name = "Telemetry", Side = "Right" })
+
+VehicleBox:CreateButton({
+	Name = "Enter my vehicle",
+	Icon = "car",
+	Callback = function()
+		local vehicles = workspace:FindFirstChild("SpawnedVehicles")
+		if not vehicles then
+			return
+		end
+		for _, vehicle in ipairs(vehicles:GetChildren()) do
+			local owner = vehicle:GetAttribute("OwnerName")
+			if owner == LocalPlayer.Name then
+				local seat = vehicle:FindFirstChild("DriveSeat") or vehicle:FindFirstChildWhichIsA("VehicleSeat", true)
+				local humanoid = getHumanoid()
+				if seat and humanoid then
+					pcall(function()
+						seat:Sit(humanoid)
+					end)
+				end
+				return
+			end
+		end
+	end,
+})
+
+VehicleBox:CreateToggle({
+	Name = "Vehicle ESP",
+	Flag = "VehicleEspTab",
+	CurrentValue = false,
+	Callback = function(value)
+		State.VehicleEsp = value
+	end,
+})
+
+VehicleStatusBox:CreateStatus({
+	Name = "Speed",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.2,
+	Update = function()
+		local root = getRoot()
+		if not root then
+			return "-"
+		end
+		local seat = root.Parent and root.Parent:FindFirstChildOfClass("Humanoid")
+		if seat and seat.SeatPart and seat.SeatPart.Parent then
+			local velocity = seat.SeatPart.AssemblyLinearVelocity
+			return string.format("%.0f km/h", velocity.Magnitude * 3.6)
+		end
+		return "<Muted>on foot</Muted>"
+	end,
+})
+
+VehicleStatusBox:CreateStatus({
+	Name = "My cars",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		local vehicles = workspace:FindFirstChild("SpawnedVehicles")
+		if not vehicles then
+			return "0"
+		end
+		local count = 0
+		for _, vehicle in ipairs(vehicles:GetChildren()) do
+			if vehicle:GetAttribute("OwnerName") == LocalPlayer.Name then
+				count += 1
+			end
+		end
+		return tostring(count)
+	end,
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local ControlBox = SettingsTab:CreateGroupbox({ Name = "Control", Side = "Left" })
+
+ControlBox:CreateKeybind({
+	Name = "Panic key",
+	CurrentKeybind = "End",
+	Flag = "PanicKey",
+	Callback = function(key)
+		State.PanicKey = key
+	end,
+})
+
+ControlBox:CreateButton({
+	Name = "Panic (disable everything)",
+	Icon = "shield-alert",
+	Style = "Primary",
+	Callback = function()
+		getgenv().RobScriptEmpire.Panic()
+	end,
+})
+
+ControlBox:CreateButton({
+	Name = "Unload hub",
+	Icon = "log-out",
+	Callback = function()
+		getgenv().RobScriptEmpire.Destroy()
+	end,
+})
+
+
+----- Info tab -----
+
+local InfoTab = Window:CreateTab({ Name = "Info", Icon = "info" })
+local InfoLeft = InfoTab:CreateGroupbox({ Name = "Session", Side = "Left" })
+local InfoRight = InfoTab:CreateGroupbox({ Name = "Game", Side = "Right" })
+
+local InfoLog = InfoLeft:CreateLog({
+	Name = "Events",
+	MaxEntries = 300,
+	MaxRows = 12,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+InfoLeft:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 1,
+	Update = function()
+		return string.format("$%d", getCash())
+	end,
+})
+
+InfoLeft:CreateStatus({
+	Name = "Session profit",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local delta = getCash() - Session.cashStart
+		local tone = delta >= 0 and "Success" or "Error"
+		return string.format("<%s>$%+d</%s>", tone, delta, tone)
+	end,
+})
+
+InfoLeft:CreateStatus({
+	Name = "Wanted peak",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(Session.wantedPeak)
+	end,
+})
+
+InfoLeft:CreateButton({
+	Name = "Reset session stats",
+	Icon = "refresh-ccw",
+	Callback = function()
+		Session.cashStart = getCash()
+		Session.shots = 0
+		Session.wantedPeak = 0
+		Session.startedAt = os.clock()
+	end,
+})
+
+
+InfoRight:CreateLabel({
+	Text = "Loading profile...",
+	UpdateRate = 1,
+	Update = function()
+		local humanoid = getHumanoid()
+		local job = LocalPlayer:FindFirstChild("leaderstats")
+		job = job and job:FindFirstChild("Job")
+		return string.format(
+			"%s  ·  %s  ·  %d players  ·  v%d",
+			LocalPlayer.Name,
+			job and job.Value or "?",
+			#Players:GetPlayers(),
+			game.PlaceVersion
+		)
+	end,
+})
+
+----- FOV circle -----
+
+local fovCircle
+local function updateFovCircle()
+	if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+		return
+	end
+	if State.DrawFov then
+		if not fovCircle then
+			local ok, circle = pcall(function()
+				return Drawing.new("Circle")
+			end)
+			if not ok or not circle then
+				return
+			end
+			circle.Thickness = 1.5
+			circle.NumSides = 64
+			circle.Transparency = 0.75
+			circle.Color = THEME.Accent
+			fovCircle = circle
+		end
+		local center = Camera.ViewportSize * 0.5
+		fovCircle.Position = center
+		fovCircle.Radius = State.Fov * 0.5
+		fovCircle.Visible = true
+	elseif fovCircle then
+		pcall(function()
+			fovCircle:Remove()
+		end)
+		fovCircle = nil
+	end
+end
+
+----- Main loops -----
+
+local aimRenderStep = function(deltaTime)
+	if not State.Aimbot then
+		Session.target = nil
+		return
+	end
+
+	local target = resolveTarget()
+	Session.target = target
+	if not target then
+		return
+	end
+
+	if State.SilentAim then
+		return
+	end
+
+	local aimCFrame = CFrame.lookAt(Camera.CFrame.Position, target.point)
+	local alpha = clamp(deltaTime * State.Smoothness * 6, 0, 1)
+	Camera.CFrame = Camera.CFrame:Lerp(aimCFrame, alpha)
+end
+
+RunService:BindToRenderStep("RobScriptEmpireAim", Enum.RenderPriority.Camera.Value + 1, aimRenderStep)
+table.insert(Session.renderSteps, "RobScriptEmpireAim")
+
+local scanLoop = task.spawn(function()
+	pcall(scanWorld)
+	while true do
+		task.wait(1)
+		pcall(scanWorld)
+	end
+end)
+
+local combatLoop = task.spawn(function()
+	while true do
+		task.wait(0.06)
+
+		-- shot accounting from the client magazine, the attribute lags
+		local mag = getLocalMag()
+		if mag and Session.lastMag and mag < Session.lastMag then
+			Session.shots += (Session.lastMag - mag)
+		end
+		Session.lastMag = mag
+
+		if State.AutoShoot or State.Triggerbot then
+			if not getCharacter() then
+				continue
+			end
+
+			local target = resolveTarget()
+			Session.target = target
+
+			if target then
+				local shouldFire = false
+
+				if State.AutoShoot then
+					shouldFire = true
+				end
+
+				if State.Triggerbot then
+					local screenPoint = worldToScreen(target.point)
+					local center = Camera.ViewportSize * 0.5
+					if (screenPoint - center).Magnitude < 40 then
+						shouldFire = true
+					end
+				end
+
+				if shouldFire then
+					if State.SilentAim then
+						local root = getRoot()
+						if root then
+							local flat = Vector3.new(target.point.X, root.Position.Y, target.point.Z)
+							if (flat - root.Position).Magnitude > 0.5 then
+								root.CFrame = CFrame.lookAt(root.Position, flat)
+							end
+						end
+					end
+
+					local localMag = getLocalMag()
+					local outOfAmmo = (localMag ~= nil and localMag <= 0) or (localMag == nil and getAmmo() <= 0)
+					if outOfAmmo then
+						if State.AutoReload then
+							reloadWeapon()
+						end
+					else
+						fireOnce()
+					end
+				end
+			end
+		end
+	end
+end)
+
+local espLoop = task.spawn(function()
+	while true do
+		task.wait(UPDATE_RATE)
+		local ok, err = pcall(updateEsp)
+		if not ok then
+			Session.lastEspError = tostring(err)
+		end
+		pcall(updateFovCircle)
+	end
+end)
+
+local wantedLoop = task.spawn(function()
+	while true do
+		task.wait(0.5)
+		local level = getWantedLevel()
+		if level > Session.wantedPeak then
+			Session.wantedPeak = level
+		end
+		if State.NoBlur then
+			pcall(setNoBlur, true)
+		end
+	end
+end)
+
+
+local panicConnection = track(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if State.PanicKey and input.KeyCode == Enum.KeyCode[State.PanicKey] then
+		getgenv().RobScriptEmpire.Panic()
+	end
+end))
+
+----- Public API -----
+
+local api = {}
+
+function api.Panic()
+	local flags = Airflow.Flags
+	for _, name in ipairs({ "Aimbot", "SilentAim", "AutoShoot", "Triggerbot", "PlayerEsp", "NpcEsp", "VehicleEsp", "LootEsp", "Tracers", "Fullbright", "FpsBoost", "NoBlur", "AutoRobbery", "AutoJewelry", "AutoPrompt", "AutoDaily" }) do
+		local flag = flags[name]
+		if flag and type(flag.Set) == "function" then
+			pcall(function()
+				flag:Set(false, true)
+			end)
+		end
+	end
+	State.Aimbot = false
+	State.SilentAim = false
+	State.AutoShoot = false
+	State.Triggerbot = false
+	State.PlayerEsp = false
+	State.NpcEsp = false
+	State.VehicleEsp = false
+	State.LootEsp = false
+	State.Tracers = false
+	State.Fullbright = false
+	State.FpsBoost = false
+	State.NoBlur = false
+
+	State.AutoRobbery = false
+	State.AutoJewelry = false
+	State.AutoPrompt = false
+	State.AutoDaily = false
+	pcall(setFullbright, false)
+	pcall(setFpsBoost, false)
+	pcall(setNoBlur, false)
+
+	pcall(clearEsp)
+	addLog(InfoLog, "<Warning>Panic</Warning> everything disabled", "Warning")
+end
+
+function api.Destroy()
+	pcall(api.Panic)
+	for _, name in ipairs(Session.renderSteps) do
+		pcall(function()
+			RunService:UnbindFromRenderStep(name)
+		end)
+	end
+	for _, connection in ipairs(Session.connections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+
+	if combatLoop then
+		pcall(task.cancel, combatLoop)
+	end
+	if espLoop then
+		pcall(task.cancel, espLoop)
+	end
+	if wantedLoop then
+		pcall(task.cancel, wantedLoop)
+	end
+	if scanLoop then
+		pcall(task.cancel, scanLoop)
+	end
+	pcall(clearEsp)
+	if fovCircle then
+		pcall(function()
+			fovCircle:Remove()
+		end)
+		fovCircle = nil
+	end
+	if EspFolder then
+		pcall(function()
+			EspFolder:Destroy()
+		end)
+	end
+	pcall(function()
+		Window:Destroy()
+	end)
+	getgenv().RobScriptEmpire = nil
+end
+
+function api.SetFlag(name, value)
+	local flag = Airflow.Flags[name]
+	if flag and type(flag.Set) == "function" then
+		flag:Set(value)
+		return true
+	end
+	return false
+end
+
+
+getgenv().RobScriptEmpire = api
+api.State = State
+api.Session = Session
+api.Window = Window
+api.Airflow = Airflow
+
+
+----- Startup -----
+
+Session.cashStart = getCash()
+pcall(setNoBlur, true)
+farmLoop(FarmLog)
+
+Window:LoadAutoload()
+
+addLog(InfoLog, "<Success>Robscript Empire loaded</Success> - RightControl toggles the window")
+addLog(CombatLog, "Aim on <Accent>Head</Accent>, fire rate 0.14 s")
