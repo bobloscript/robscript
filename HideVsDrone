@@ -1,0 +1,987 @@
+-- Robscript Team - Hide vs Drone ESP
+-- Game: HIDE VS DRONE [UPD] | placeId 77771744210396 | gameId 10769511303
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptHvD
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its loops, highlights and drawings die first.
+do
+	local existing = getgenv().RobScriptHvD
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript HvD] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local COLLECT_INTERVAL = 0.4
+local VISUAL_INTERVAL = 0.033
+local TEXT_INTERVAL = 0.2
+
+local COLOR_SURVIVOR = Color3.fromRGB(94, 255, 132)
+local COLOR_OPERATOR = Color3.fromRGB(255, 78, 122)
+local COLOR_DRONE = Color3.fromRGB(255, 196, 64)
+local COLOR_OWN_DRONE = Color3.fromRGB(90, 214, 255)
+local COLOR_DEAD = Color3.fromRGB(150, 150, 160)
+
+local PLAYER_BOX_SIZE = Vector3.new(2.6, 5.2, 2.6)
+
+-- Role names as the game stores them in Player:GetAttribute("Role").
+local ROLE_OPERATOR = "Operator"
+local ROLE_SURVIVOR = "Survivor"
+
+----- Drawing -----
+
+local DrawingLib = nil
+if type(Drawing) == "table" and type(Drawing.new) == "function" then
+	DrawingLib = Drawing
+end
+
+local function newLine()
+	if not DrawingLib then
+		return nil
+	end
+	local ok, line = pcall(DrawingLib.new, "Line")
+	if ok and line then
+		line.Visible = false
+		return line
+	end
+	return nil
+end
+
+----- Flags -----
+
+-- Flags are cached after the interface is built, so a config load cannot
+-- desync the runtime: every tick reads the same objects the user sees.
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local function colorToHex(color)
+	local red = math.floor(math.clamp(color.R, 0, 1) * 255 + 0.5)
+	local green = math.floor(math.clamp(color.G, 0, 1) * 255 + 0.5)
+	local blue = math.floor(math.clamp(color.B, 0, 1) * 255 + 0.5)
+	return string.format("#%02X%02X%02X", red, green, blue)
+end
+
+-- Distance is measured from the camera by default, because a drone operator
+-- looks at the map through a scriptable camera that is not on the character.
+local function distanceOrigin()
+	if flag("DistanceFrom", "Camera") == "Character" then
+		local character = LocalPlayer.Character
+		if character then
+			local root = character:FindFirstChild("HumanoidRootPart")
+			if root then
+				return root.Position
+			end
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		return camera.CFrame.Position
+	end
+	return Vector3.zero
+end
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function runtimeFolder()
+	local runtime = workspace:FindFirstChild("Runtime")
+	if runtime then
+		return runtime:FindFirstChild("ActiveDrones")
+	end
+	return nil
+end
+
+local function roleOf(player)
+	local role = player:GetAttribute("Role")
+	if type(role) == "string" and role ~= "" then
+		return role
+	end
+	return ROLE_SURVIVOR
+end
+
+local function isAlive(player)
+	return player:GetAttribute("Alive") ~= false
+end
+
+----- State -----
+
+local targets = {}
+local stats = { players = 0, drones = 0 }
+local running = true
+
+----- Visual objects -----
+
+local function releaseVisuals(target)
+	if target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+	if target.billboard then
+		pcall(function()
+			target.billboard:Destroy()
+		end)
+		target.billboard = nil
+		target.label = nil
+	end
+	if target.lines then
+		for _, line in ipairs(target.lines) do
+			pcall(function()
+				line.Visible = false
+				line:Remove()
+			end)
+		end
+		target.lines = nil
+	end
+	if target.tracer then
+		pcall(function()
+			target.tracer.Visible = false
+			target.tracer:Remove()
+		end)
+		target.tracer = nil
+	end
+	target.hasVisual = false
+end
+
+local function buildBillboard(part, offsetY)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ESP_Billboard"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(260, 44)
+	billboard.StudsOffset = Vector3.new(0, offsetY, 0)
+	billboard.Enabled = false
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ESP_Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 14
+	label.RichText = true
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Bottom
+	label.TextStrokeTransparency = 0.35
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = ""
+	label.Parent = billboard
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard, label
+end
+
+local function buildHighlight(model)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "ESP_Chams"
+	highlight.Adornee = model
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillTransparency = 0.65
+	highlight.OutlineTransparency = 0.1
+	highlight.Parent = model
+	return highlight
+end
+
+----- Target registry -----
+
+local function resolveParts(target)
+	local model = target.model
+	if not model or not model.Parent then
+		return false
+	end
+	if target.kind == "player" then
+		target.root = model:FindFirstChild("HumanoidRootPart")
+		target.focusPart = model:FindFirstChild("Head") or target.root
+		target.humanoid = model:FindFirstChildOfClass("Humanoid")
+	else
+		target.root = model:FindFirstChild("Core") or model.PrimaryPart
+		target.focusPart = target.root
+		target.humanoid = nil
+	end
+	return target.root ~= nil and target.focusPart ~= nil
+end
+
+local function createTarget(kind, model, player)
+	local target = {
+		kind = kind,
+		model = model,
+		player = player,
+		hasVisual = false,
+		lastTextAt = 0,
+	}
+	if not resolveParts(target) then
+		return nil
+	end
+	return target
+end
+
+local function dropTarget(model)
+	local target = targets[model]
+	if not target then
+		return
+	end
+	releaseVisuals(target)
+	targets[model] = nil
+end
+
+local function clearAllTargets()
+	for model in pairs(targets) do
+		dropTarget(model)
+	end
+	stats.players = 0
+	stats.drones = 0
+end
+
+----- Collection -----
+
+local function shouldTrackPlayer(player)
+	if player == LocalPlayer then
+		return false
+	end
+	if player:GetAttribute("DataReady") == false then
+		return false
+	end
+	local role = roleOf(player)
+	if role == ROLE_OPERATOR and not flag("ShowOperator", true) then
+		return false
+	end
+	if role ~= ROLE_OPERATOR and not flag("ShowSurvivor", true) then
+		return false
+	end
+	return true
+end
+
+local function collectPlayers(seen)
+	if not flag("PlayerESP", true) then
+		return
+	end
+	for _, player in ipairs(Players:GetPlayers()) do
+		if shouldTrackPlayer(player) then
+			local character = player.Character
+			if character and character.Parent then
+				local target = targets[character]
+				if not target then
+					target = createTarget("player", character, player)
+					if target then
+						targets[character] = target
+					end
+				else
+					target.player = player
+				end
+				if target then
+					seen[character] = true
+				end
+			end
+		end
+	end
+end
+
+local function ignoreOwnDrone()
+	return flag("IgnoreOwnDrone", true)
+end
+
+local function collectDrones(seen)
+	if not flag("DroneESP", true) then
+		return
+	end
+	local container = runtimeFolder()
+	if not container then
+		return
+	end
+	local localUserId = LocalPlayer.UserId
+	for _, drone in ipairs(container:GetChildren()) do
+		if drone:IsA("Model") then
+			local ownerId = drone:GetAttribute("OwnerId")
+			local ownDrone = ownerId == localUserId
+			if not (ownDrone and ignoreOwnDrone()) then
+				local target = targets[drone]
+				if not target then
+					target = createTarget("drone", drone, nil)
+					if target then
+						targets[drone] = target
+					end
+				end
+				if target then
+					seen[drone] = true
+				end
+			end
+		end
+	end
+end
+
+local function collectTargets()
+	local seen = {}
+	collectPlayers(seen)
+	collectDrones(seen)
+	for model in pairs(targets) do
+		if not seen[model] then
+			dropTarget(model)
+		end
+	end
+end
+
+----- Rendering -----
+
+local function playerColor(player)
+	if not isAlive(player) then
+		return COLOR_DEAD
+	end
+	if roleOf(player) == ROLE_OPERATOR then
+		return flag("OperatorColor", COLOR_OPERATOR)
+	end
+	return flag("SurvivorColor", COLOR_SURVIVOR)
+end
+
+local function droneColor(drone)
+	if drone:GetAttribute("OwnerId") == LocalPlayer.UserId then
+		return flag("OwnDroneColor", COLOR_OWN_DRONE)
+	end
+	return flag("DroneColor", COLOR_DRONE)
+end
+
+local function playerLabelText(target, distance)
+	local player = target.player
+	if not player then
+		return ""
+	end
+	local parts = {}
+	if flag("PlayerName", true) then
+		parts[#parts + 1] = string.format('<font color="#FFFFFF">%s</font>', player.Name)
+	end
+	local details = {}
+	if flag("PlayerRole", true) then
+		details[#details + 1] = roleOf(player)
+	end
+	if flag("PlayerHealth", true) and target.humanoid then
+		details[#details + 1] = string.format("%d HP", math.floor(target.humanoid.Health + 0.5))
+	end
+	if flag("PlayerDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	if not isAlive(player) then
+		details[#details + 1] = "DEAD"
+	end
+	if #details > 0 then
+		parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+	end
+	return table.concat(parts, "\n")
+end
+
+local function droneLabelText(target, distance)
+	local drone = target.model
+	local parts = {}
+	local droneId = drone:GetAttribute("DroneId")
+	local title = string.format("Drone #%s", tostring(droneId or "?"))
+	if drone.Name:match("^Spotter") then
+		title = string.format("Spotter #%s", tostring(droneId or "?"))
+	end
+	if drone:GetAttribute("OwnerId") == LocalPlayer.UserId then
+		title = title .. "  (YOU)"
+	end
+	parts[#parts + 1] = string.format('<font color="#FFFFFF">%s</font>', title)
+
+	local details = {}
+	if flag("DroneOwner", true) then
+		local owner = Players:GetPlayerByUserId(drone:GetAttribute("OwnerId") or 0)
+		details[#details + 1] = owner and owner.Name or "no pilot"
+	end
+	if flag("DroneHealth", true) then
+		local health = drone:GetAttribute("Health")
+		if typeof(health) == "number" then
+			details[#details + 1] = string.format("%d HP", math.floor(health + 0.5))
+		end
+	end
+	if flag("DroneDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	if #details > 0 then
+		parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+	end
+	return table.concat(parts, "\n")
+end
+
+local function updateChams(target, color, enabled)
+	if not enabled then
+		if target.highlight then
+			pcall(function()
+				target.highlight:Destroy()
+			end)
+			target.highlight = nil
+		end
+		return
+	end
+	if not target.highlight or not target.highlight.Parent then
+		target.highlight = buildHighlight(target.model)
+	end
+	local highlight = target.highlight
+	highlight.FillColor = color
+	highlight.OutlineColor = color
+	highlight.FillTransparency = 0.65
+	highlight.OutlineTransparency = 0.1
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+end
+
+local function updateBillboard(target, color, distance, visible)
+	if not target.billboard or not target.billboard.Parent then
+		local offsetY = target.kind == "player" and 2.6 or 1.6
+		target.billboard, target.label = buildBillboard(target.focusPart, offsetY)
+	end
+	local billboard = target.billboard
+	local renderDistance = flag("RenderDistance", 2500)
+	billboard.MaxDistance = renderDistance
+	billboard.Enabled = visible
+	if not visible then
+		return
+	end
+	local now = os.clock()
+	if now - target.lastTextAt >= TEXT_INTERVAL then
+		target.lastTextAt = now
+		local text
+		if target.kind == "player" then
+			text = playerLabelText(target, distance)
+		else
+			text = droneLabelText(target, distance)
+		end
+		target.label.Text = text
+	end
+	target.label.TextColor3 = color
+end
+
+local function projectBox(center, size)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local half = size * 0.5
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+	local depthHits = 0
+	for x = -1, 1, 2 do
+		for y = -1, 1, 2 do
+			for z = -1, 1, 2 do
+				local world = center + Vector3.new(half.X * x, half.Y * y, half.Z * z)
+				local screen = camera:WorldToViewportPoint(world)
+				if screen.Z > 0 then
+					depthHits = depthHits + 1
+					minX = math.min(minX, screen.X)
+					minY = math.min(minY, screen.Y)
+					maxX = math.max(maxX, screen.X)
+					maxY = math.max(maxY, screen.Y)
+				end
+			end
+		end
+	end
+	if depthHits < 2 then
+		return nil
+	end
+	return minX, minY, maxX, maxY
+end
+
+local function updateBox(target, color, visible)
+	local boxFlag = target.kind == "player" and "PlayerBox" or "DroneBox"
+	if not visible or not flag(boxFlag, false) then
+		if target.lines then
+			for _, line in ipairs(target.lines) do
+				if line.Visible then
+					line.Visible = false
+				end
+			end
+		end
+		return
+	end
+
+	local center, size
+	if target.kind == "player" then
+		center = target.root.Position
+		size = PLAYER_BOX_SIZE
+	else
+		local ok, boxCenter, boxSize = pcall(function()
+			local cf, sz = target.model:GetBoundingBox()
+			return cf.Position, sz
+		end)
+		if not ok then
+			return
+		end
+		center = boxCenter
+		size = boxSize
+	end
+
+	local minX, minY, maxX, maxY = projectBox(center, size)
+	if not minX then
+		if target.lines then
+			for _, line in ipairs(target.lines) do
+				line.Visible = false
+			end
+		end
+		return
+	end
+
+	if not target.lines then
+		target.lines = { newLine(), newLine(), newLine(), newLine() }
+	end
+	local lines = target.lines
+	if not lines[1] then
+		return
+	end
+
+	local topLeft = Vector2.new(minX, minY)
+	local topRight = Vector2.new(maxX, minY)
+	local bottomLeft = Vector2.new(minX, maxY)
+	local bottomRight = Vector2.new(maxX, maxY)
+
+	local segments = {
+		{ topLeft, topRight },
+		{ topRight, bottomRight },
+		{ bottomRight, bottomLeft },
+		{ bottomLeft, topLeft },
+	}
+	for index = 1, 4 do
+		local line = lines[index]
+		if line then
+			local segment = segments[index]
+			line.From = segment[1]
+			line.To = segment[2]
+			line.Color = color
+			line.Thickness = 1
+			line.Visible = true
+		end
+	end
+end
+
+local function updateTracer(target, color, visible)
+	local enabled = visible and flag("PlayerTracer", false) and target.kind == "player"
+	if not enabled then
+		if target.tracer and target.tracer.Visible then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local viewport = camera.ViewportSize
+	local screen = camera:WorldToViewportPoint(target.focusPart.Position)
+	if screen.Z <= 0 then
+		if target.tracer then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	if not target.tracer then
+		target.tracer = newLine()
+	end
+	if not target.tracer then
+		return
+	end
+	local tracer = target.tracer
+	tracer.From = Vector2.new(viewport.X * 0.5, viewport.Y)
+	tracer.To = Vector2.new(screen.X, screen.Y)
+	tracer.Color = color
+	tracer.Thickness = 1
+	tracer.Visible = true
+end
+
+local function updateTarget(target)
+	if not target.model or not target.model.Parent then
+		releaseVisuals(target)
+		return
+	end
+	if not target.root or not target.root.Parent then
+		if not resolveParts(target) then
+			releaseVisuals(target)
+			return
+		end
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local origin = distanceOrigin()
+	local distance = (target.focusPart.Position - origin).Magnitude
+	local renderDistance = flag("RenderDistance", 2500)
+	local inRange = distance <= renderDistance
+
+	local color
+	local visible = inRange
+	if target.kind == "player" then
+		color = playerColor(target.player or LocalPlayer)
+		if not target.player then
+			visible = false
+		end
+	else
+		color = droneColor(target.model)
+	end
+
+	updateChams(target, color, visible and flag(target.kind == "player" and "PlayerChams" or "DroneChams", true))
+	updateBillboard(target, color, distance, visible)
+	updateBox(target, color, visible)
+	updateTracer(target, color, visible)
+	target.hasVisual = visible
+end
+
+local function updateStats()
+	local playerCount = 0
+	local droneCount = 0
+	for _, target in pairs(targets) do
+		if target.hasVisual then
+			if target.kind == "player" then
+				playerCount = playerCount + 1
+			else
+				droneCount = droneCount + 1
+			end
+		end
+	end
+	stats.players = playerCount
+	stats.drones = droneCount
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "hide vs drone - esp",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptHvD" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "ESP 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- Visuals tab -----
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local PlayersBox = VisualsTab:CreateGroupbox({ Name = "Players", Side = "Left" })
+local DronesBox = VisualsTab:CreateGroupbox({ Name = "Drones", Side = "Right" })
+
+PlayersBox:CreateToggle({
+	Name = "Player ESP",
+	Desc = "Track every player in the round",
+	Flag = "PlayerESP",
+	CurrentValue = true,
+})
+
+PlayersBox:CreateToggle({ Name = "Name", Flag = "PlayerName", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Role", Flag = "PlayerRole", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Health", Flag = "PlayerHealth", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Distance", Flag = "PlayerDistance", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Chams", Flag = "PlayerChams", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Box", Flag = "PlayerBox", CurrentValue = false, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Tracer", Flag = "PlayerTracer", CurrentValue = false, DependsOn = "PlayerESP" })
+PlayersBox:CreateDivider()
+PlayersBox:CreateToggle({ Name = "Survivors", Flag = "ShowSurvivor", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateToggle({ Name = "Operators", Flag = "ShowOperator", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayersBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>players</Muted>", stats.players)
+	end,
+})
+
+DronesBox:CreateToggle({
+	Name = "Drone ESP",
+	Desc = "Track every drone in the air",
+	Flag = "DroneESP",
+	CurrentValue = true,
+})
+
+DronesBox:CreateToggle({ Name = "Owner", Flag = "DroneOwner", CurrentValue = true, DependsOn = "DroneESP" })
+DronesBox:CreateToggle({ Name = "Health", Flag = "DroneHealth", CurrentValue = true, DependsOn = "DroneESP" })
+DronesBox:CreateToggle({ Name = "Distance", Flag = "DroneDistance", CurrentValue = true, DependsOn = "DroneESP" })
+DronesBox:CreateToggle({ Name = "Chams", Flag = "DroneChams", CurrentValue = true, DependsOn = "DroneESP" })
+DronesBox:CreateToggle({ Name = "Box", Flag = "DroneBox", CurrentValue = false, DependsOn = "DroneESP" })
+DronesBox:CreateDivider()
+DronesBox:CreateToggle({
+	Name = "Ignore own drone",
+	Desc = "Do not draw the drone you pilot",
+	Flag = "IgnoreOwnDrone",
+	CurrentValue = true,
+	DependsOn = "DroneESP",
+})
+DronesBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>drones</Muted>", stats.drones)
+	end,
+})
+
+----- Style tab -----
+
+local StyleTab = Window:CreateTab({ Name = "Style", Icon = "palette" })
+local ColorBox = StyleTab:CreateGroupbox({ Name = "Colors", Side = "Left" })
+local RangeBox = StyleTab:CreateGroupbox({ Name = "Range", Side = "Right" })
+
+ColorBox:CreateColorPicker({ Name = "Survivor", Color = COLOR_SURVIVOR, Flag = "SurvivorColor" })
+ColorBox:CreateColorPicker({ Name = "Operator", Color = COLOR_OPERATOR, Flag = "OperatorColor" })
+ColorBox:CreateDivider()
+ColorBox:CreateColorPicker({ Name = "Drone", Color = COLOR_DRONE, Flag = "DroneColor" })
+ColorBox:CreateColorPicker({ Name = "Own drone", Color = COLOR_OWN_DRONE, Flag = "OwnDroneColor" })
+
+RangeBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 100, 5000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 2500,
+	Flag = "RenderDistance",
+})
+RangeBox:CreateDropdown({
+	Name = "Distance from",
+	Options = { "Camera", "Character" },
+	CurrentOption = "Camera",
+	Flag = "DistanceFrom",
+	Desc = "Camera follows the drone, the character stays on the ground",
+})
+RangeBox:CreateButton({
+	Name = "Clear ESP",
+	Desc = "Remove every highlight and label",
+	Callback = function()
+		clearAllTargets()
+		Window:Notify({ Title = "Cleared", Content = "All ESP objects removed", Type = "Info" })
+	end,
+})
+RangeBox:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop the ESP",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptHvD
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----- Runtime -----
+
+resetFlagCache()
+
+local collectAccumulator = 0
+local visualAccumulator = 0
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	collectAccumulator = collectAccumulator + deltaTime
+	visualAccumulator = visualAccumulator + deltaTime
+
+	if collectAccumulator >= COLLECT_INTERVAL then
+		collectAccumulator = 0
+		pcall(collectTargets)
+	end
+
+	if visualAccumulator >= VISUAL_INTERVAL then
+		visualAccumulator = 0
+		for _, target in pairs(targets) do
+			pcall(updateTarget, target)
+		end
+		updateStats()
+	end
+end)
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			setFlag("PlayerESP", false)
+			setFlag("DroneESP", false)
+			clearAllTargets()
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	clearAllTargets()
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptHvD then
+		getgenv().RobScriptHvD = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptHvD = {
+	Version = "1.0",
+	Actions = {
+		Refresh = collectTargets,
+		Clear = clearAllTargets,
+		Destroy = destroy,
+	},
+	GetStats = function()
+		return { players = stats.players, drones = stats.drones }
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	GetTargets = function()
+		local list = {}
+		for model, target in pairs(targets) do
+			local boxVisible = false
+			if target.lines then
+				for _, line in ipairs(target.lines) do
+					if line and line.Visible then
+						boxVisible = true
+						break
+					end
+				end
+			end
+			list[#list + 1] = {
+				name = (target.player and target.player.Name) or model.Name,
+				kind = target.kind,
+				visible = target.hasVisual,
+				billboard = target.billboard ~= nil and target.billboard.Enabled or false,
+				chams = target.highlight ~= nil,
+				box = boxVisible,
+				tracer = target.tracer ~= nil and target.tracer.Visible or false,
+			}
+		end
+		return list
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+Window:Notify({ Title = "Robscript Team", Content = "Hide vs Drone ESP is ready", Type = "Success" })
+
+return getgenv().RobScriptHvD
