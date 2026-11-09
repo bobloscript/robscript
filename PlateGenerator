@@ -1,0 +1,2099 @@
+-- Robscript Team - Number Generator (⚒️ ГЕНЕРАТОР НОМЕРОВ)
+-- placeId 138578132401096 / gameId 10769793590
+-- Window: RightControl, panic: End, API: getgenv().RobScriptNumbers
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its loops and connections die first.
+do
+	local existing = getgenv().RobScriptNumbers
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript Numbers] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+local themeApplied = pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+if not themeApplied then
+	pcall(function()
+		Airflow:SetDefaultTheme(THEME)
+	end)
+end
+
+----- Game bridge -----
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 20)
+local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
+
+local function remote(name)
+	return Remotes:WaitForChild(name, 15)
+end
+
+-- Plate timers (free roll, upkeep, wheel) are server timestamps.
+local ClockScript = LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlatesClient", 10)
+
+local function serverNow()
+	local offset = 0
+	if ClockScript then
+		offset = tonumber(ClockScript:GetAttribute("TimeOffset")) or 0
+	end
+	return workspace:GetServerTimeNow() + offset
+end
+
+local function loadModule(name)
+	local module = Shared:FindFirstChild(name)
+	if not module then
+		return nil
+	end
+	local ok, result = pcall(require, module)
+	if ok and type(result) == "table" then
+		return result
+	end
+	warn("[RobScript Numbers] shared module failed: " .. name .. " - " .. tostring(result))
+	return nil
+end
+
+local Plate = loadModule("Plate")
+local Upgrades = loadModule("Upgrades")
+local Config = loadModule("Config")
+local Reveal = loadModule("Reveal")
+
+local RARITY_ORDER = { COMMON = 1, UNCOMMON = 2, RARE = 3, EPIC = 4, MYTHIC = 5, LEGEND = 6 }
+local RARITY_LABEL = {
+	COMMON = "Common",
+	UNCOMMON = "Uncommon",
+	RARE = "Rare",
+	EPIC = "Epic",
+	MYTHIC = "Mythic",
+	LEGEND = "Legendary",
+}
+local RARITY_LIST = { "COMMON", "UNCOMMON", "RARE", "EPIC", "MYTHIC", "LEGEND" }
+
+if Plate and Plate.RARITY then
+	for key, value in pairs(Plate.RARITY) do
+		if value and value.order then
+			RARITY_ORDER[key] = value.order
+		end
+	end
+end
+
+local function rarityOrder(tier)
+	return RARITY_ORDER[tier] or 0
+end
+
+local function rarityLabel(tier)
+	return RARITY_LABEL[tier] or tostring(tier)
+end
+
+local function rarityColor(tier)
+	local rgb = Config and Config.RarityColor and Config.RarityColor[tier]
+	if rgb then
+		return Color3.fromRGB(rgb[1], rgb[2], rgb[3])
+	end
+	return Color3.fromHex("#8D8D99")
+end
+
+----- Formatting -----
+
+local function formatMoney(value)
+	value = math.floor(tonumber(value) or 0)
+	local digits = tostring(math.abs(value))
+	local groups = {}
+	while #digits > 3 do
+		table.insert(groups, 1, digits:sub(-3))
+		digits = digits:sub(1, #digits - 3)
+	end
+	table.insert(groups, 1, digits)
+	return (value < 0 and "-" or "") .. table.concat(groups, " ") .. " ₽"
+end
+
+local function formatCompact(value)
+	value = tonumber(value) or 0
+	if value >= 1e9 then
+		return string.format("%.2fB", value / 1e9)
+	elseif value >= 1e6 then
+		return string.format("%.2fM", value / 1e6)
+	elseif value >= 1e3 then
+		return string.format("%.1fK", value / 1e3)
+	end
+	return tostring(math.floor(value))
+end
+
+local function escapeRich(text)
+	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function clockText()
+	return os.date("%H:%M:%S")
+end
+
+----- Runtime state -----
+
+local State = {
+	AutoRoll = false,
+	RollRegion = "Any region",
+	RollBatch = 1,
+	RollMode = "Normal",
+	RollPayment = "Auto (free when broke)",
+	RollExtraDelay = 0.15,
+	RollMoneyGuard = 0,
+	RollStopRare = 0,
+
+	AutoEquip = false,
+	EquipInterval = 2,
+	EquipAfterRoll = true,
+
+	SellEnabled = false,
+	SellScript = true,
+	SellRarities = { "COMMON" },
+	KeepBest = 3,
+	SellBelow = 0,
+	SellInterval = 1.5,
+	FreeSlot = true,
+	ProtectEquipped = true,
+
+	AutoUpgrade = false,
+	UpgradeStrategy = "Cheapest first",
+	UpgradeReserve = 0,
+	UpgradeMaxPrice = 100000,
+	UpgradeInterval = 1,
+
+	AutoUpkeep = true,
+	AutoClaimSold = true,
+	ClaimInterval = 5,
+
+	WebhookEnabled = false,
+	WebhookUrl = "",
+	WebhookMinRarity = "EPIC",
+	WebhookNotable = true,
+	WebhookScreenshots = false,
+
+	PanicKey = "End",
+
+	Paused = false,
+}
+
+local Session = {
+	connections = {},
+	rolls = 0,
+	spent = 0,
+	earned = 0,
+	sold = 0,
+	upgradesBought = 0,
+	best = nil,
+	bestPrice = 0,
+	counts = { COMMON = 0, UNCOMMON = 0, RARE = 0, EPIC = 0, MYTHIC = 0, LEGEND = 0 },
+	startedAt = os.time(),
+	history = {},
+	historyDirty = false,
+	lastRollAt = 0,
+	nextRollAt = 0,
+	lastSellAt = 0,
+	lastEquipAt = 0,
+	lastUpgradeAt = 0,
+	lastUpkeepAt = 0,
+	lastClaimAt = 0,
+	lastGarageWarn = 0,
+	rollPenalty = 0,
+	rejects = 0,
+	rolling = false,
+	freeRolls = 0,
+	webhookQueue = 0,
+	lastWebhookAt = "",
+	log = nil,
+}
+
+local GameState = nil
+local RegionById = {}
+local RegionByName = {}
+
+local function track(connection)
+	if connection then
+		table.insert(Session.connections, connection)
+	end
+	return connection
+end
+
+local function pushLog(text, tone)
+	if Session.log then
+		pcall(function()
+			Session.log:Push(text, tone)
+		end)
+	end
+end
+
+local function refreshState()
+	local getState = Remotes:FindFirstChild("GetState")
+	if not getState then
+		return nil
+	end
+	local ok, result = pcall(function()
+		return getState:InvokeServer()
+	end)
+	if ok and type(result) == "table" then
+		GameState = result
+		return result
+	end
+	return nil
+end
+
+local function indexRegions(state)
+	RegionById = {}
+	RegionByName = {}
+	for _, region in ipairs(state and state.regions or {}) do
+		RegionById[region.id] = region
+		RegionByName[region.name] = region
+	end
+end
+
+local function regionOptions(state)
+	local options = { "Any region" }
+	local list = {}
+	for _, region in ipairs(state and state.regions or {}) do
+		table.insert(list, region)
+	end
+	table.sort(list, function(a, b)
+		local left = tonumber(a.regionMult) or 0
+		local right = tonumber(b.regionMult) or 0
+		if left == right then
+			return tostring(a.name) < tostring(b.name)
+		end
+		return left > right
+	end)
+	for _, region in ipairs(list) do
+		table.insert(options, tostring(region.name))
+	end
+	return options
+end
+
+local function selectedRegionId()
+	if State.RollRegion == "Any region" then
+		return nil
+	end
+	local region = RegionByName[State.RollRegion]
+	return region and region.id or nil
+end
+
+local function rollCost(state)
+	local regionId = selectedRegionId()
+	if regionId and RegionById[regionId] and RegionById[regionId].cost then
+		return RegionById[regionId].cost
+	end
+	return (state and state.cheapestRoll) or (Config and Config.Roll and Config.Roll.costAnyRegion) or 2500
+end
+
+local function rollCooldown(state)
+	local value = tonumber(state and state.cooldown)
+	if value and value > 0 then
+		return value
+	end
+	local effects = Upgrades and state and Upgrades.effects(state.upgrades)
+	if effects and effects.cooldown then
+		return effects.cooldown
+	end
+	return 2
+end
+
+-- The server keeps the roll locked for the whole reveal animation, so the pace
+-- is derived from the same schedule the game client plays.
+local function revealSeconds(state, results)
+	if not (Reveal and results) then
+		return 0
+	end
+	local ratio = 1
+	local configCooldown = Config and Config.Roll and Config.Roll.cooldownSeconds
+	if configCooldown and configCooldown > 0 then
+		ratio = math.max(0.2, rollCooldown(state) / configCooldown)
+	end
+	local okOrder, order = pcall(Reveal.order, results)
+	if not okOrder or type(order) ~= "table" then
+		return 0
+	end
+	local ordered = {}
+	for index, position in ipairs(order) do
+		ordered[index] = results[position]
+	end
+	local okSchedule, _, times = pcall(Reveal.schedule, ordered, ratio)
+	if not okSchedule or type(times) ~= "table" then
+		return 0
+	end
+	local longest = 0
+	for _, value in ipairs(times) do
+		longest = math.max(longest, tonumber(value) or 0)
+	end
+	return longest
+end
+
+local function platePrice(plate)
+	if not plate then
+		return 0
+	end
+	if Plate then
+		local ok, price = pcall(Plate.price, plate)
+		if ok and tonumber(price) then
+			return math.floor(price)
+		end
+	end
+	return 0
+end
+
+----- Webhook -----
+
+local webhookQueue = {}
+
+local function queueWebhook(entry)
+	if not State.WebhookEnabled or State.WebhookUrl == "" then
+		return
+	end
+	if rarityOrder(entry.rarity) < rarityOrder(State.WebhookMinRarity) then
+		return
+	end
+	if State.WebhookNotable and not entry.notable then
+		return
+	end
+	table.insert(webhookQueue, entry)
+	Session.webhookQueue = #webhookQueue
+end
+
+local function buildWebhookPayload(entry)
+	local color = rarityColor(entry.rarity)
+	local colorInt = math.floor(color.R * 255) * 65536 + math.floor(color.G * 255) * 256 + math.floor(color.B * 255)
+	local fields = {
+		{ name = "Region", value = escapeRich(entry.region or "-"), inline = true },
+		{ name = "Rarity", value = rarityLabel(entry.rarity), inline = true },
+		{ name = "Condition", value = escapeRich(entry.quality or "-"), inline = true },
+		{ name = "Value", value = formatMoney(entry.price), inline = true },
+		{ name = "Rolls", value = tostring(Session.rolls), inline = true },
+		{ name = "Money", value = formatMoney(GameState and GameState.money or 0), inline = true },
+	}
+	return {
+		username = "Robscript Team",
+		embeds = {
+			{
+				title = "New " .. rarityLabel(entry.rarity) .. " plate",
+				description = "**" .. escapeRich(entry.text) .. " " .. escapeRich(entry.codeText or "") .. "**",
+				color = colorInt,
+				fields = fields,
+				footer = { text = "Robscript Numbers · " .. tostring(LocalPlayer.Name) },
+				timestamp = entry.iso,
+			},
+		},
+	}
+end
+
+-- Executor request wrapper: returns success, http code and the transport message,
+-- so the UI can tell "no network to this host" from "webhook deleted".
+local function postJson(url, payload)
+	local encoded, body = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not encoded then
+		return false, 0, "json encode failed"
+	end
+	local ok, response = pcall(function()
+		return request({
+			Url = url,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = body,
+		})
+	end)
+	if not ok then
+		return false, 0, tostring(response)
+	end
+	local code = 0
+	local message = ""
+	local success = false
+	if type(response) == "table" then
+		code = tonumber(response.StatusCode) or 0
+		message = tostring(response.StatusMessage or "")
+		success = response.Success == true
+	end
+	local delivered = success and code >= 200 and code < 300
+	return delivered, code, message
+end
+
+local function runWebhookLoop()
+	while true do
+		task.wait(1.2)
+		Session.webhookQueue = #webhookQueue
+		if #webhookQueue == 0 then
+			continue
+		end
+		if not State.WebhookEnabled or State.WebhookUrl == "" then
+			webhookQueue = {}
+			continue
+		end
+		local entry = table.remove(webhookQueue, 1)
+		local delivered, code, message = postJson(State.WebhookUrl, buildWebhookPayload(entry))
+		if delivered then
+			Session.lastWebhookAt = clockText()
+			Session.webhookFails = 0
+		else
+			Session.webhookFails = (Session.webhookFails or 0) + 1
+			Session.lastWebhookError = string.format("HTTP %d %s", code, message)
+			if Session.webhookFails == 1 or Session.webhookFails % 10 == 0 then
+				pushLog("<Error>Webhook failed</Error> " .. escapeRich(Session.lastWebhookError), "Error")
+			end
+		end
+	end
+end
+
+----- Game actions -----
+
+local sellStep
+
+local function applyRollResults(response, cost)
+	if type(response) ~= "table" then
+		return 0
+	end
+	if response.cost then
+		cost = response.cost
+	end
+	local count = 0
+	for _, result in ipairs(response.results or {}) do
+		count = count + 1
+		local tier = result.rarity or "COMMON"
+		local entry = {
+			uid = result.uid,
+			text = result.text or "?",
+			codeText = result.codeText,
+			region = result.regionName,
+			rarity = tier,
+			quality = result.qualityName,
+			price = tonumber(result.price) or platePrice(result.plate),
+			notable = result.notable == true,
+			autosold = result.autosold == true,
+			iso = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+			clock = clockText(),
+			event = result.byEvent == true,
+		}
+		Session.counts[tier] = (Session.counts[tier] or 0) + 1
+		if entry.price > Session.bestPrice then
+			Session.bestPrice = entry.price
+			Session.best = entry
+		end
+		table.insert(Session.history, 1, entry)
+		if #Session.history > 400 then
+			table.remove(Session.history)
+		end
+		Session.historyDirty = true
+		queueWebhook(entry)
+		if entry.notable and tier ~= "COMMON" then
+			pushLog(string.format("<Accent>%s</Accent> %s %s · %s", rarityLabel(tier), escapeRich(entry.text), escapeRich(entry.codeText or ""), formatMoney(entry.price)))
+		end
+	end
+	Session.rolls = Session.rolls + count
+	Session.spent = Session.spent + (tonumber(cost) or 0)
+	return count
+end
+
+local function garageStatus(state)
+	local slots = tonumber(state and state.slots) or 5
+	local stored = #((state and state.inventory) or {})
+	return stored, slots, stored >= slots
+end
+
+-- Decision for the next roll: "paid", "free" (ticket) or "wait".
+-- The ticket roll is only granted by the server while the balance is below the
+-- cheapest roll, so the plan mirrors exactly that rule.
+local function rollPlan(state, mode)
+	local money = tonumber(state and state.money) or 0
+	local quote = rollCost(state)
+	local threshold = tonumber(state and state.cheapestRoll) or quote
+	local freeAt = tonumber(state and state.freeRollAt) or 0
+	local freeIn = math.max(0, freeAt - serverNow())
+	local freeReady = freeAt <= serverNow()
+	local plan = { money = money, cost = quote, freeIn = freeIn, action = "paid" }
+	if mode ~= nil then
+		return plan
+	end
+	if State.RollPayment ~= "Paid only" and freeReady and money < threshold then
+		plan.action = "free"
+		plan.cost = 0
+		return plan
+	end
+	if money < quote then
+		plan.action = "wait"
+		if money < threshold then
+			plan.reason = freeReady and "ticket" or "money"
+		else
+			plan.reason = "region"
+		end
+	end
+	return plan
+end
+
+local function rollStep()
+	if Session.rolling then
+		return
+	end
+	local state = GameState or refreshState()
+	if not state then
+		return
+	end
+	local stored, slots, full = garageStatus(state)
+	if full then
+		if State.SellEnabled and State.SellScript then
+			sellStep(State.FreeSlot)
+		end
+		if os.clock() - (Session.lastGarageWarn or 0) > 6 then
+			Session.lastGarageWarn = os.clock()
+			pushLog(string.format("<Warning>Garage is full</Warning> %d of %d slots — enable auto sell, free a slot or buy more space", stored, slots), "Warning")
+		end
+		Session.nextRollAt = os.clock() + 1
+		return
+	end
+	local count = math.clamp(math.floor(State.RollBatch), 1, math.max(1, state.maxBatch or 1))
+	local mode = nil
+	local inventory = state.inv or {}
+	if State.RollMode == "Lucky roll" and inventory.lucky then
+		mode = "lucky"
+	elseif State.RollMode == "Coupon" and inventory.next then
+		mode = "coupon"
+	end
+	local plan = rollPlan(state, mode)
+	local money = plan.money
+	local quote = plan.cost
+	local regionId = selectedRegionId()
+	local useFree = plan.action == "free"
+	local freeIn = plan.freeIn
+	if plan.action == "wait" then
+		-- Nothing to pay with: wait for the ticket instead of poking the server.
+		Session.nextRollAt = os.clock() + math.clamp(freeIn + 0.5, 0.5, 10)
+		if os.clock() - (Session.lastBrokeLog or 0) > 12 then
+			Session.lastBrokeLog = os.clock()
+			if plan.reason == "ticket" then
+				pushLog("<Warning>Free roll is ready</Warning> switch Payment to Auto to use it", "Warning")
+			elseif plan.reason == "region" then
+				pushLog(string.format("<Warning>Not enough for this region</Warning> needs %s", formatMoney(quote)), "Warning")
+			else
+				pushLog(string.format("<Warning>Not enough money</Warning> free roll in %d s", math.ceil(freeIn)), "Warning")
+			end
+		end
+		return
+	end
+	if State.RollMoneyGuard > 0 and not useFree and money - quote < State.RollMoneyGuard then
+		Session.nextRollAt = os.clock() + 1
+		return
+	end
+	if useFree then
+		-- The ticket always rolls one plate in a random region.
+		count = 1
+		mode = true
+		regionId = nil
+	end
+	Session.rolling = true
+	local ok, response = pcall(function()
+		return remote("Roll"):InvokeServer(regionId, count, mode)
+	end)
+	Session.rolling = false
+	if not ok then
+		pushLog("<Error>Roll failed</Error> " .. escapeRich(response), "Error")
+		task.wait(0.5)
+		return
+	end
+	if type(response) ~= "table" or response.ok ~= true then
+		local message = tostring(type(response) == "table" and response.err or response or "unknown")
+		if message:find("рано") then
+			-- Server cooldown is still running: stretch the pace and retry soon.
+			Session.rollPenalty = math.min((Session.rollPenalty or 0) + 0.35, 5)
+			Session.rejects = (Session.rejects or 0) + 1
+			Session.nextRollAt = os.clock() + 0.4
+			if Session.rejects % 6 == 1 then
+				pushLog(string.format("<Warning>Server cooldown</Warning> pacing at %.2f s", rollCooldown(state) + Session.rollPenalty))
+			end
+			return
+		elseif message:find("гараж") then
+			if State.SellEnabled and State.SellScript then
+				sellStep()
+			end
+			Session.nextRollAt = os.clock() + 0.8
+			return
+		elseif message:find("денег") or message:find("money") or message:find("бесплатн") then
+			-- Balance too low for a paid roll: retry when the ticket is up.
+			Session.nextRollAt = os.clock() + math.clamp(freeIn + 0.5, 0.5, 10)
+			if os.clock() - (Session.lastBrokeLog or 0) > 12 then
+				Session.lastBrokeLog = os.clock()
+				pushLog("<Warning>Roll needs money</Warning> " .. escapeRich(message), "Warning")
+			end
+			return
+		end
+		pushLog("<Error>Roll rejected</Error> " .. escapeRich(message), "Error")
+		Session.nextRollAt = os.clock() + 0.8
+		return
+	end
+	local rolled = applyRollResults(response, rollCost(state))
+	if rolled > 0 and GameState then
+		GameState.money = (tonumber(GameState.money) or 0) - (tonumber(response.cost) or 0)
+	end
+	if (tonumber(response.cost) or 0) == 0 then
+		Session.freeRolls = (Session.freeRolls or 0) + 1
+		pushLog("<Success>Free roll used</Success> no money spent")
+	end
+	Session.rejects = 0
+	Session.lastRollAt = os.clock()
+	local animation = revealSeconds(state, response.results)
+	local pace = math.max(rollCooldown(state), animation + 0.15) + State.RollExtraDelay + (Session.rollPenalty or 0)
+	Session.nextRollAt = Session.lastRollAt + pace
+	Session.lastPace = pace
+	if Session.rollPenalty and Session.rollPenalty > 0.4 then
+		Session.rollPenalty = Session.rollPenalty - 0.1
+	end
+	if State.EquipAfterRoll and State.AutoEquip then
+		pcall(function()
+			remote("EquipBest"):InvokeServer()
+		end)
+	end
+	if State.RollStopRare > 0 then
+		for _, result in ipairs(response.results or {}) do
+			if rarityOrder(result.rarity) >= State.RollStopRare then
+				State.AutoRoll = false
+				local flag = Airflow.Flags.AutoRoll
+				if flag then
+					pcall(function()
+						flag:Set(false, true)
+					end)
+				end
+				pushLog("<Warning>Auto roll stopped</Warning> rare plate found", "Warning")
+				break
+			end
+		end
+	end
+end
+
+local function plateNumber(uid)
+	local text = tostring(uid or "")
+	return tonumber(text:match("_(%d+)$"))
+end
+
+local function equippedUids(state)
+	local set = {}
+	local function add(slot)
+		if type(slot) == "table" then
+			if slot.uid then
+				set[slot.uid] = true
+				local number = plateNumber(slot.uid)
+				if number then
+					set[number] = true
+				end
+			end
+		elseif type(slot) == "number" then
+			set[slot] = true
+		elseif type(slot) == "string" then
+			set[slot] = true
+			local number = plateNumber(slot)
+			if number then
+				set[number] = true
+			end
+		end
+	end
+	for _, slot in pairs(state and state.wall or {}) do
+		add(slot)
+	end
+	if state then
+		add(state.hand)
+	end
+	return set
+end
+
+function sellStep(force)
+	local state = GameState or refreshState()
+	if not state then
+		return
+	end
+	if not State.SellScript then
+		return
+	end
+	local inventory = {}
+	for _, item in ipairs(state.inventory or {}) do
+		table.insert(inventory, item)
+	end
+	if #inventory == 0 then
+		return
+	end
+	table.sort(inventory, function(a, b)
+		return (tonumber(a.price) or 0) > (tonumber(b.price) or 0)
+	end)
+	local wanted = {}
+	for _, tier in ipairs(State.SellRarities or {}) do
+		wanted[tier] = true
+	end
+	local protected = State.ProtectEquipped and equippedUids(state) or {}
+	local keep = math.max(0, math.floor(State.KeepBest))
+	local forced = force == true
+	for index, item in ipairs(inventory) do
+		local isProtected = protected[item.uid] == true or protected[plateNumber(item.uid)] == true
+		if index > keep and not isProtected then
+			local price = tonumber(item.price) or 0
+			local byRarity = wanted[item.rarity] == true
+			local byPrice = State.SellBelow > 0 and price <= State.SellBelow
+			if byRarity or byPrice or forced then
+				local ok, response = pcall(function()
+					return remote("SellFromInventory"):InvokeServer(item.uid)
+				end)
+				if ok and type(response) == "table" and response.ok then
+					Session.sold = Session.sold + 1
+					Session.earned = Session.earned + price
+					if GameState then
+						GameState.money = (tonumber(GameState.money) or 0) + price
+					end
+					pushLog(string.format("Sold <Accent>%s</Accent> for %s", escapeRich(item.text or "?"), formatMoney(price)))
+				elseif ok then
+					pushLog("<Error>Sale rejected</Error> " .. escapeRich(type(response) == "table" and (response.err or "unknown") or "unknown"))
+				end
+				return
+			end
+		end
+	end
+end
+
+local UPGRADE_PRIORITY = {
+	luck = 100,
+	speed = 90,
+	multi = 85,
+	autosell = 80,
+	autoroll = 78,
+	garage = 75,
+	slots = 70,
+	wall = 65,
+	tasks = 55,
+	polish = 50,
+	stall = 45,
+	phone = 40,
+	car = 35,
+	craft = 30,
+}
+local STRATEGY_FEATURES = { autosell = 1, autoroll = 1, garage = 1, phone = 1, tasks = 1, polish = 1, car = 1, craft = 1, stall = 1 }
+
+local function upgradeCandidates(state)
+	local list = {}
+	if not Upgrades then
+		return list
+	end
+	local upgrades = state and state.upgrades or {}
+	local budget = (tonumber(state and state.money) or 0) - State.UpgradeReserve
+	if budget <= 0 then
+		return list
+	end
+	for _, node in ipairs(Upgrades.list or {}) do
+		local level = Upgrades.level(upgrades, node.id)
+		local cost = Upgrades.cost(node.id, level)
+		if cost and cost <= budget and cost <= State.UpgradeMaxPrice then
+			local unlocked = Upgrades.unlocked(upgrades, node.id)
+			if unlocked then
+				table.insert(list, { node = node, cost = cost, level = level })
+			end
+		end
+	end
+	return list
+end
+
+local function upgradeScore(candidate)
+	local node = candidate.node
+	if State.UpgradeStrategy == "Cheapest first" then
+		return -candidate.cost
+	elseif State.UpgradeStrategy == "Features first" then
+		local feature = node.feature or (node.kind == "feature" and node.id or nil)
+		local bonus = feature and 1 or 0
+		return bonus * 1e9 - candidate.cost
+	elseif State.UpgradeStrategy == "Luck first" then
+		local priority = 0
+		if node.kind == "special" then
+			priority = 110
+		elseif node.stat and UPGRADE_PRIORITY[node.stat] then
+			priority = UPGRADE_PRIORITY[node.stat]
+		elseif STRATEGY_FEATURES[node.feature or node.id] then
+			priority = 60
+		end
+		return priority * 1e9 - candidate.cost
+	end
+	return -candidate.cost
+end
+
+local function upgradeStep()
+	local state = GameState or refreshState()
+	if not state then
+		return
+	end
+	if #upgradeCandidates(state) == 0 then
+		return
+	end
+	local candidates = upgradeCandidates(state)
+	table.sort(candidates, function(a, b)
+		return upgradeScore(a) > upgradeScore(b)
+	end)
+	local pick = candidates[1]
+	if not pick then
+		return
+	end
+	local ok, response = pcall(function()
+		return remote("BuyUpgrade"):InvokeServer(pick.node.id)
+	end)
+	if ok and type(response) == "table" and response.ok then
+		Session.upgradesBought = Session.upgradesBought + 1
+		if GameState then
+			GameState.money = (tonumber(GameState.money) or 0) - pick.cost
+			GameState.upgrades = GameState.upgrades or {}
+			GameState.upgrades[pick.node.id] = (GameState.upgrades[pick.node.id] or 0) + 1
+		end
+		pushLog(string.format("Upgrade <Accent>%s</Accent> for %s", escapeRich(pick.node.short or pick.node.name or pick.node.id), formatMoney(pick.cost)))
+	elseif ok and type(response) == "table" then
+		local message = tostring(response.err or "unknown")
+		if message:find("уже максимум") then
+			if GameState then
+				GameState.upgrades = GameState.upgrades or {}
+				GameState.upgrades[pick.node.id] = 1
+			end
+		else
+			pushLog("<Error>Upgrade rejected</Error> " .. escapeRich(message))
+			task.wait(0.5)
+		end
+	end
+end
+
+local function equipStep()
+	local ok, response = pcall(function()
+		return remote("EquipBest"):InvokeServer()
+	end)
+	if not ok then
+		return
+	end
+	if type(response) == "table" and response.ok == false then
+		pushLog("<Error>Equip best failed</Error> " .. escapeRich(tostring(response.err or "unknown")))
+	end
+end
+
+local function upkeepStep()
+	pcall(function()
+		return remote("PayAllUpkeep"):InvokeServer()
+	end)
+end
+
+local function claimStep()
+	local state = GameState
+	if not state or type(state.sold) ~= "table" then
+		return
+	end
+	for _, entry in ipairs(state.sold) do
+		local id = entry.id or entry.uid
+		if id ~= nil then
+			pcall(function()
+				return remote("ClaimSold"):InvokeServer(id)
+			end)
+		end
+	end
+end
+
+----- Scheduler -----
+
+-- Flags are the source of truth: config loading and LoadAutoload can change them
+-- without firing every callback, so the runtime state mirrors them every tick.
+local function flagValue(name, current)
+	local flag = Airflow.Flags[name]
+	if not flag or type(flag.Get) ~= "function" then
+		return current
+	end
+	local ok, value = pcall(flag.Get, flag)
+	if ok and value ~= nil then
+		return value
+	end
+	return current
+end
+
+local function syncFlags()
+	State.AutoRoll = flagValue("AutoRoll", State.AutoRoll) == true
+	State.RollPayment = tostring(flagValue("RollPayment", State.RollPayment))
+	State.AutoEquip = flagValue("AutoEquip", State.AutoEquip) == true
+	State.EquipAfterRoll = flagValue("EquipAfterRoll", State.EquipAfterRoll) == true
+	State.SellEnabled = flagValue("AutoSell", State.SellEnabled) == true
+	State.SellScript = flagValue("SellScript", State.SellScript) == true
+	State.ProtectEquipped = flagValue("ProtectEquipped", State.ProtectEquipped) == true
+	State.FreeSlot = flagValue("FreeSlot", State.FreeSlot) == true
+	State.AutoUpgrade = flagValue("AutoUpgrade", State.AutoUpgrade) == true
+	State.AutoUpkeep = flagValue("AutoUpkeep", State.AutoUpkeep) == true
+	State.AutoClaimSold = flagValue("AutoClaimSold", State.AutoClaimSold) == true
+	State.WebhookEnabled = flagValue("WebhookEnabled", State.WebhookEnabled) == true
+	State.WebhookNotable = flagValue("WebhookNotable", State.WebhookNotable) == true
+	State.RollMoneyGuard = tonumber(flagValue("RollMoneyGuard", State.RollMoneyGuard)) or State.RollMoneyGuard
+	State.RollExtraDelay = tonumber(flagValue("RollExtraDelay", State.RollExtraDelay)) or State.RollExtraDelay
+	State.EquipInterval = tonumber(flagValue("EquipInterval", State.EquipInterval)) or State.EquipInterval
+	State.KeepBest = tonumber(flagValue("KeepBest", State.KeepBest)) or State.KeepBest
+	State.SellBelow = tonumber(flagValue("SellBelow", State.SellBelow)) or State.SellBelow
+	State.SellInterval = tonumber(flagValue("SellInterval", State.SellInterval)) or State.SellInterval
+	State.UpgradeReserve = tonumber(flagValue("UpgradeReserve", State.UpgradeReserve)) or State.UpgradeReserve
+	State.UpgradeMaxPrice = tonumber(flagValue("UpgradeMaxPrice", State.UpgradeMaxPrice)) or State.UpgradeMaxPrice
+	State.UpgradeInterval = tonumber(flagValue("UpgradeInterval", State.UpgradeInterval)) or State.UpgradeInterval
+end
+
+local function scheduler()
+	while true do
+		task.wait(0.15)
+		Session.ticks = (Session.ticks or 0) + 1
+		local now = os.clock()
+		local ok, err = pcall(function()
+			syncFlags()
+			if State.Paused then
+				return
+			end
+			if State.AutoRoll and now >= Session.nextRollAt then
+				rollStep()
+			end
+			if State.AutoEquip and now - Session.lastEquipAt >= State.EquipInterval then
+				Session.lastEquipAt = now
+				equipStep()
+			end
+			if State.SellEnabled and now - Session.lastSellAt >= State.SellInterval then
+				Session.lastSellAt = now
+				sellStep()
+			end
+			if State.AutoUpgrade and now - Session.lastUpgradeAt >= State.UpgradeInterval then
+				Session.lastUpgradeAt = now
+				upgradeStep()
+			end
+			if State.AutoUpkeep and now - Session.lastUpkeepAt >= 30 then
+				Session.lastUpkeepAt = now
+				upkeepStep()
+			end
+			if State.AutoClaimSold and now - Session.lastClaimAt >= State.ClaimInterval then
+				Session.lastClaimAt = now
+				claimStep()
+			end
+		end)
+		if not ok then
+			warn("[RobScript Numbers] scheduler: " .. tostring(err))
+		end
+	end
+end
+
+----- Window -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript · Number Generator",
+	LoadingSubtitle = "roll, sell, upgrade, webhook",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobscriptNumbers" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+Window:Notify({ Title = "Number Generator", Content = "Robscript hub is ready", Type = "Success" })
+
+local initial = refreshState()
+indexRegions(initial)
+if initial then
+	State.RollBatch = math.clamp(State.RollBatch, 1, math.max(1, initial.maxBatch or 1))
+end
+
+track(Remotes.StateChanged.OnClientEvent:Connect(function(state)
+	if type(state) == "table" then
+		GameState = state
+		if not next(RegionByName) then
+			indexRegions(state)
+		end
+	end
+end))
+
+----- Farm tab -----
+
+-- Numeric inputs accept plain numbers and the library amount suffixes (2.5k, 1m).
+local function parseAmount(value)
+	local number = tonumber(value)
+	if number then
+		return number
+	end
+	local ok, parsed = pcall(function()
+		return Airflow._parseAmount(value)
+	end)
+	if ok and type(parsed) == "number" then
+		return parsed
+	end
+	return nil
+end
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "dices" })
+local RollBox = FarmTab:CreateGroupbox({ Name = "Auto roll", Side = "Left" })
+local FarmAdvanced = FarmTab:CreateGroupbox({ Name = "Advanced", Side = "Left", Collapsed = true })
+local FarmStatusBox = FarmTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+local FarmLogBox = FarmTab:CreateGroupbox({ Name = "Session log", Side = "Right", Collapsed = true })
+
+local FarmLog = FarmLogBox:CreateLog({
+	Name = "Session log",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+Session.log = FarmLog
+
+RollBox:CreateToggle({
+	Name = "Auto roll",
+	Desc = "Rolls plates while the money guard allows it",
+	Flag = "AutoRoll",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoRoll = value
+		Session.nextRollAt = 0
+		pushLog(value and "<Success>Auto roll on</Success>" or "<Muted>Auto roll off</Muted>")
+	end,
+})
+
+local RegionDropdown = RollBox:CreateDropdown({
+	Name = "Region",
+	Options = regionOptions(initial),
+	CurrentOption = "Any region",
+	Stacked = false,
+	Flag = "RollRegion",
+	Callback = function(value)
+		State.RollRegion = value
+	end,
+})
+
+RollBox:CreateDropdown({
+	Name = "Plates per roll",
+	Options = { "1", "2", "3", "4" },
+	CurrentOption = "1",
+	Stacked = false,
+	Flag = "RollBatch",
+	Callback = function(value)
+		State.RollBatch = tonumber(value) or 1
+	end,
+})
+
+RollBox:CreateDropdown({
+	Name = "Roll mode",
+	Options = { "Normal", "Lucky roll", "Coupon" },
+	CurrentOption = "Normal",
+	Stacked = false,
+	Flag = "RollMode",
+	Callback = function(value)
+		State.RollMode = value
+	end,
+})
+
+RollBox:CreateDropdown({
+	Name = "Payment",
+	Options = { "Auto (free when broke)", "Paid only" },
+	CurrentOption = "Auto (free when broke)",
+	Stacked = false,
+	Flag = "RollPayment",
+	Callback = function(value)
+		State.RollPayment = value
+	end,
+})
+
+RollBox:CreateButton({
+	Name = "Roll once",
+	Icon = "dice-5",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(rollStep)
+	end,
+})
+
+FarmAdvanced:CreateSlider({
+	Name = "Extra delay",
+	Desc = "Added on top of the game cooldown",
+	Range = { 0, 2 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.15,
+	Flag = "RollExtraDelay",
+	Callback = function(value)
+		State.RollExtraDelay = value
+	end,
+})
+
+FarmAdvanced:CreateInput({
+	Name = "Keep money",
+	Desc = "Stop rolling below this balance",
+	PlaceholderText = "0",
+	CurrentValue = "0",
+	Numeric = true,
+	Flag = "RollMoneyGuard",
+	Callback = function(value)
+		local parsed = parseAmount(value)
+		if parsed then
+			State.RollMoneyGuard = parsed
+		end
+	end,
+})
+
+FarmAdvanced:CreateDropdown({
+	Name = "Stop at rarity",
+	Options = { "Never", "Rare", "Epic", "Mythic", "Legendary" },
+	CurrentOption = "Never",
+	Stacked = false,
+	Flag = "RollStopRare",
+	Callback = function(value)
+		local map = { Never = 0, Rare = 3, Epic = 4, Mythic = 5, Legendary = 6 }
+		State.RollStopRare = map[value] or 0
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "State",
+	Style = "Dot",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		if State.Paused then
+			return "<Warning>Paused</Warning>"
+		elseif State.AutoRoll then
+			return "<Success>Rolling</Success>"
+		end
+		return "<Muted>Idle</Muted>"
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Money",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return formatMoney(GameState and GameState.money or 0)
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Session rolls",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return tostring(Session.rolls)
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Luck",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local luck = GameState and tonumber(GameState.luck)
+		if not luck then
+			return "-"
+		end
+		return string.format("×%.2f", luck / 10)
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Cooldown",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		local left = (Session.nextRollAt or 0) - os.clock()
+		if left <= 0 then
+			return "<Success>ready</Success>"
+		end
+		return string.format("%.2f s", left)
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Free roll",
+	Style = "Badge",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local state = GameState
+		if not state then
+			return "-"
+		end
+		local left = (tonumber(state.freeRollAt) or 0) - serverNow()
+		if left <= 0 then
+			return "<Success>ready</Success>"
+		end
+		return string.format("%d s", math.ceil(left))
+	end,
+})
+
+FarmStatusBox:CreateStatus({
+	Name = "Free rolls used",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(Session.freeRolls or 0)
+	end,
+})
+
+----- Garage tab -----
+
+local GarageTab = Window:CreateTab({ Name = "Garage", Icon = "warehouse" })
+local SellBox = GarageTab:CreateGroupbox({ Name = "Sell", Side = "Left" })
+local SellAdvanced = GarageTab:CreateGroupbox({ Name = "Sell: advanced", Side = "Left", Collapsed = true })
+local EquipBox = GarageTab:CreateGroupbox({ Name = "Equip", Side = "Right" })
+local GarageStatusBox = GarageTab:CreateGroupbox({ Name = "Maintenance", Side = "Right" })
+
+SellBox:CreateToggle({
+	Name = "Auto sell",
+	Flag = "AutoSell",
+	CurrentValue = false,
+	Callback = function(value)
+		State.SellEnabled = value
+		pushLog(value and "<Success>Auto sell on</Success>" or "<Muted>Auto sell off</Muted>")
+	end,
+})
+
+SellBox:CreateToggle({
+	Name = "Script selling",
+	Desc = "Off: only the in game autosell switch is used",
+	Flag = "SellScript",
+	CurrentValue = true,
+	Callback = function(value)
+		State.SellScript = value
+	end,
+})
+
+SellBox:CreateDropdown({
+	Name = "Sell rarities",
+	MultipleOptions = true,
+	Options = { "Common", "Uncommon", "Rare", "Epic", "Mythic", "Legendary" },
+	CurrentOption = { "Common" },
+	Stacked = false,
+	Flag = "SellRarities",
+	Callback = function(list)
+		local selected = {}
+		for _, label in ipairs(list) do
+			for tier, name in pairs(RARITY_LABEL) do
+				if name == label then
+					table.insert(selected, tier)
+				end
+			end
+		end
+		State.SellRarities = selected
+	end,
+})
+
+SellBox:CreateStepper({
+	Name = "Keep best plates",
+	Desc = "Always keep this many most valuable plates",
+	Min = 0,
+	Max = 50,
+	Step = 1,
+	CurrentValue = 3,
+	Flag = "KeepBest",
+	Callback = function(value)
+		State.KeepBest = value
+	end,
+})
+
+SellBox:CreateInput({
+	Name = "Sell cheaper than",
+	Desc = "0 disables the price rule",
+	PlaceholderText = "0",
+	CurrentValue = "0",
+	Numeric = true,
+	Flag = "SellBelow",
+	Callback = function(value)
+		local parsed = parseAmount(value)
+		if parsed then
+			State.SellBelow = parsed
+		end
+	end,
+})
+
+SellBox:CreateToggle({
+	Name = "Protect equipped",
+	Flag = "ProtectEquipped",
+	CurrentValue = true,
+	Callback = function(value)
+		State.ProtectEquipped = value
+	end,
+})
+
+SellBox:CreateToggle({
+	Name = "Free a slot when full",
+	Desc = "Sells the cheapest unlocked plate so the garage never blocks rolls",
+	Flag = "FreeSlot",
+	CurrentValue = true,
+	Callback = function(value)
+		State.FreeSlot = value
+	end,
+})
+
+SellBox:CreateToggle({
+	Name = "Use game autosell",
+	Desc = "Requires the autosell upgrade",
+	Flag = "GameAutosell",
+	CurrentValue = false,
+	Callback = function(value)
+		local state = GameState
+		if value and not (state and state.hasAutosell) then
+			pushLog("<Warning>Autosell upgrade not owned</Warning>", "Warning")
+		end
+		task.spawn(function()
+			pcall(function()
+				remote("SetAutosell"):InvokeServer(value)
+			end)
+		end)
+	end,
+})
+
+SellBox:CreateButton({
+	Name = "Sell matching now",
+	Icon = "coins",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(sellStep)
+	end,
+})
+
+SellAdvanced:CreateSlider({
+	Name = "Sell interval",
+	Desc = "One plate per pass, keeps the server calm",
+	Range = { 0.5, 10 },
+	Increment = 0.5,
+	Suffix = " s",
+	CurrentValue = 1.5,
+	Flag = "SellInterval",
+	Callback = function(value)
+		State.SellInterval = value
+	end,
+})
+
+EquipBox:CreateToggle({
+	Name = "Auto equip best",
+	Desc = "Calls the game equip best button on a timer",
+	Flag = "AutoEquip",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoEquip = value
+	end,
+})
+
+EquipBox:CreateToggle({
+	Name = "Equip after every roll",
+	Flag = "EquipAfterRoll",
+	CurrentValue = true,
+	Callback = function(value)
+		State.EquipAfterRoll = value
+	end,
+})
+
+EquipBox:CreateSlider({
+	Name = "Equip interval",
+	Range = { 0.5, 15 },
+	Increment = 0.5,
+	Suffix = " s",
+	CurrentValue = 2,
+	Flag = "EquipInterval",
+	Callback = function(value)
+		State.EquipInterval = value
+	end,
+})
+
+EquipBox:CreateButton({
+	Name = "Equip best now",
+	Icon = "swords",
+	Callback = function()
+		task.spawn(equipStep)
+	end,
+})
+
+GarageStatusBox:CreateStatus({
+	Name = "Plates stored",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return tostring(#(GameState and GameState.inventory or {}))
+	end,
+})
+
+GarageStatusBox:CreateStatus({
+	Name = "Best plate",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if not Session.best then
+			return "<Muted>-</Muted>"
+		end
+		return string.format("<Accent>%s</Accent> %s", escapeRich(Session.best.text), formatMoney(Session.best.price))
+	end,
+})
+
+GarageStatusBox:CreateStatus({
+	Name = "Sold",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("%d · %s", Session.sold, formatMoney(Session.earned))
+	end,
+})
+
+GarageStatusBox:CreateToggle({
+	Name = "Auto pay upkeep",
+	Desc = "Pays the daily fee so plates do not expire",
+	Flag = "AutoUpkeep",
+	CurrentValue = true,
+	Callback = function(value)
+		State.AutoUpkeep = value
+	end,
+})
+
+GarageStatusBox:CreateToggle({
+	Name = "Auto claim sold",
+	Desc = "Collects money from sold plates",
+	Flag = "AutoClaimSold",
+	CurrentValue = true,
+	Callback = function(value)
+		State.AutoClaimSold = value
+	end,
+})
+
+GarageStatusBox:CreateButton({
+	Name = "Pay all upkeep",
+	Icon = "wallet",
+	Callback = function()
+		task.spawn(upkeepStep)
+	end,
+})
+
+----- Upgrades tab -----
+
+local UpgradeTab = Window:CreateTab({ Name = "Upgrades", Icon = "wrench" })
+local UpgradeBox = UpgradeTab:CreateGroupbox({ Name = "Auto upgrade", Side = "Left" })
+local UpgradeAdvanced = UpgradeTab:CreateGroupbox({ Name = "Advanced", Side = "Left", Collapsed = true })
+local UpgradeStatusBox = UpgradeTab:CreateGroupbox({ Name = "Tree", Side = "Right" })
+
+UpgradeBox:CreateToggle({
+	Name = "Auto buy upgrades",
+	Desc = "Buys the next affordable node of the tree",
+	Flag = "AutoUpgrade",
+	CurrentValue = false,
+	Callback = function(value)
+		State.AutoUpgrade = value
+	end,
+})
+
+UpgradeBox:CreateDropdown({
+	Name = "Strategy",
+	Options = { "Cheapest first", "Luck first", "Features first" },
+	CurrentOption = "Cheapest first",
+	Stacked = false,
+	Flag = "UpgradeStrategy",
+	Callback = function(value)
+		State.UpgradeStrategy = value
+	end,
+})
+
+UpgradeBox:CreateInput({
+	Name = "Keep money",
+	PlaceholderText = "0",
+	CurrentValue = "0",
+	Numeric = true,
+	Flag = "UpgradeReserve",
+	Callback = function(value)
+		local parsed = parseAmount(value)
+		if parsed then
+			State.UpgradeReserve = parsed
+		end
+	end,
+})
+
+UpgradeBox:CreateInput({
+	Name = "Max price per node",
+	PlaceholderText = "100000",
+	CurrentValue = "100000",
+	Numeric = true,
+	Flag = "UpgradeMaxPrice",
+	Callback = function(value)
+		local parsed = parseAmount(value)
+		if parsed then
+			State.UpgradeMaxPrice = parsed
+		end
+	end,
+})
+
+UpgradeBox:CreateButton({
+	Name = "Buy next upgrade",
+	Icon = "circle-arrow-up",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(upgradeStep)
+	end,
+})
+
+UpgradeAdvanced:CreateSlider({
+	Name = "Upgrade interval",
+	Range = { 0.3, 5 },
+	Increment = 0.1,
+	Suffix = " s",
+	CurrentValue = 1,
+	Flag = "UpgradeInterval",
+	Callback = function(value)
+		State.UpgradeInterval = value
+	end,
+})
+
+UpgradeStatusBox:CreateStatus({
+	Name = "Owned nodes",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 1,
+	Update = function()
+		local owned = 0
+		for _ in pairs(GameState and GameState.upgrades or {}) do
+			owned = owned + 1
+		end
+		return tostring(owned)
+	end,
+})
+
+UpgradeStatusBox:CreateStatus({
+	Name = "Next node",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local state = GameState
+		if not state or not Upgrades then
+			return "-"
+		end
+		local candidates = upgradeCandidates(state)
+		if #candidates == 0 then
+			return "<Muted>nothing affordable</Muted>"
+		end
+		table.sort(candidates, function(a, b)
+			return upgradeScore(a) > upgradeScore(b)
+		end)
+		local pick = candidates[1]
+		return string.format("%s · %s", escapeRich(pick.node.short or pick.node.id), formatMoney(pick.cost))
+	end,
+})
+
+UpgradeStatusBox:CreateStatus({
+	Name = "Bought this session",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(Session.upgradesBought)
+	end,
+})
+----- History tab -----
+
+local HistoryTab = Window:CreateTab({ Name = "History", Icon = "history" })
+
+local HistoryTable = HistoryTab:CreateTable({
+	Name = "Roll history",
+	Columns = {
+		{ Name = "Plate", Key = "plate", Width = 140 },
+		{ Name = "Region", Key = "region", Width = 160 },
+		{ Name = "Rarity", Key = "rarity", Width = 100 },
+		{ Name = "Value", Key = "value", Width = 110 },
+		{ Name = "Time", Key = "time", Width = 80 },
+	},
+	Rows = {},
+	Rank = true,
+	MaxRows = 14,
+})
+
+local HistoryActions = HistoryTab:CreateGroupbox({ Name = "Export", Side = "Left" })
+local HistoryStatusBox = HistoryTab:CreateGroupbox({ Name = "Totals", Side = "Right" })
+
+local function refreshHistoryTable()
+	if not Session.historyDirty then
+		return
+	end
+	Session.historyDirty = false
+	local rows = {}
+	for index = 1, math.min(#Session.history, 60) do
+		local entry = Session.history[index]
+		rows[index] = {
+			plate = entry.text .. " " .. tostring(entry.codeText or ""),
+			region = tostring(entry.region or "-"),
+			rarity = rarityLabel(entry.rarity),
+			value = formatMoney(entry.price),
+			time = entry.clock,
+		}
+	end
+	pcall(function()
+		HistoryTable:SetRows(rows)
+	end)
+end
+
+HistoryStatusBox:CreateStatus({
+	Name = "Rolls",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 1,
+	Update = function()
+		return tostring(Session.rolls)
+	end,
+})
+
+HistoryStatusBox:CreateStatus({
+	Name = "Spent",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return formatMoney(Session.spent)
+	end,
+})
+
+HistoryStatusBox:CreateStatus({
+	Name = "Legendary",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(Session.counts.LEGEND or 0)
+	end,
+})
+
+HistoryStatusBox:CreateStatus({
+	Name = "Mythic",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(Session.counts.MYTHIC or 0)
+	end,
+})
+
+HistoryStatusBox:CreateStatus({
+	Name = "Best value",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if not Session.best then
+			return "-"
+		end
+		return formatMoney(Session.bestPrice)
+	end,
+})
+
+local function historyToText()
+	local lines = { "time\tplate\tregion\trarity\tvalue" }
+	for index = #Session.history, 1, -1 do
+		local entry = Session.history[index]
+		table.insert(lines, table.concat({
+			entry.clock,
+			entry.text .. " " .. tostring(entry.codeText or ""),
+			tostring(entry.region or "-"),
+			rarityLabel(entry.rarity),
+			tostring(math.floor(tonumber(entry.price) or 0)),
+		}, "\t"))
+	end
+	return table.concat(lines, "\n")
+end
+
+HistoryActions:CreateButton({
+	Name = "Copy history",
+	Icon = "clipboard",
+	Callback = function()
+		local ok = pcall(function()
+			setclipboard(historyToText())
+		end)
+		Window:Notify({
+			Title = "History",
+			Content = ok and "Copied to clipboard" or "Clipboard is unavailable",
+			Type = ok and "Success" or "Error",
+		})
+	end,
+})
+
+HistoryActions:CreateButton({
+	Name = "Save history to file",
+	Icon = "save",
+	Callback = function()
+		local ok = pcall(function()
+			writefile("RobscriptNumbers_history.tsv", historyToText())
+		end)
+		Window:Notify({
+			Title = "History",
+			Content = ok and "Saved as RobscriptNumbers_history.tsv" or "File writing is unavailable",
+			Type = ok and "Success" or "Error",
+		})
+	end,
+})
+
+HistoryActions:CreateButton({
+	Name = "Clear history",
+	Icon = "trash-2",
+	Confirm = true,
+	Callback = function()
+		Session.history = {}
+		Session.historyDirty = true
+		refreshHistoryTable()
+		Window:Notify({ Title = "History", Content = "Cleared", Type = "Success" })
+	end,
+})
+
+----- Webhook tab -----
+
+local WebhookTab = Window:CreateTab({ Name = "Webhook", Icon = "webhook" })
+local WebhookBox = WebhookTab:CreateGroupbox({ Name = "Discord webhook", Side = "Left" })
+local WebhookStatusBox = WebhookTab:CreateGroupbox({ Name = "Delivery", Side = "Right" })
+
+WebhookBox:CreateToggle({
+	Name = "Send to webhook",
+	Flag = "WebhookEnabled",
+	CurrentValue = false,
+	Callback = function(value)
+		State.WebhookEnabled = value
+	end,
+})
+
+WebhookBox:CreateInput({
+	Name = "Webhook URL",
+	PlaceholderText = "https://discord.com/api/webhooks/...",
+	CurrentValue = "",
+	Flag = "WebhookUrl",
+	Callback = function(text)
+		State.WebhookUrl = tostring(text)
+	end,
+})
+
+WebhookBox:CreateDropdown({
+	Name = "Minimum rarity",
+	Options = { "Common", "Uncommon", "Rare", "Epic", "Mythic", "Legendary" },
+	CurrentOption = "Epic",
+	Flag = "WebhookMinRarity",
+	Callback = function(value)
+		for tier, label in pairs(RARITY_LABEL) do
+			if label == value then
+				State.WebhookMinRarity = tier
+				return
+			end
+		end
+	end,
+})
+
+WebhookBox:CreateToggle({
+	Name = "Notable plates only",
+	Desc = "Uses the game notable flag",
+	Flag = "WebhookNotable",
+	CurrentValue = true,
+	Callback = function(value)
+		State.WebhookNotable = value
+	end,
+})
+
+local function sendTestWebhook()
+	if State.WebhookUrl == "" then
+		Window:Notify({ Title = "Webhook", Content = "Set the URL first", Type = "Warning" })
+		return false, 0
+	end
+	local delivered, code, message = postJson(State.WebhookUrl, {
+		username = "Robscript Team",
+		embeds = {
+			{
+				title = "Webhook connected",
+				description = "Robscript Numbers is ready to report plates",
+				color = 16726815,
+				footer = { text = "Robscript Numbers" },
+			},
+		},
+	})
+	Session.lastWebhookError = string.format("HTTP %d %s", code, message)
+	if delivered then
+		Window:Notify({ Title = "Webhook", Content = "Test message sent", Type = "Success" })
+	elseif code == 0 then
+		Window:Notify({
+			Title = "Webhook",
+			Content = "No connection to this host: " .. message .. ". Discord is blocked in some regions, use a relay or a VPN.",
+			Type = "Error",
+			Duration = 8,
+		})
+	else
+		Window:Notify({ Title = "Webhook", Content = string.format("HTTP %d %s", code, message), Type = "Error" })
+	end
+	return delivered, code
+end
+
+WebhookBox:CreateButton({
+	Name = "Test webhook",
+	Icon = "send",
+	Callback = function()
+		task.spawn(sendTestWebhook)
+	end,
+})
+
+WebhookStatusBox:CreateStatus({
+	Name = "Queue",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return tostring(#webhookQueue)
+	end,
+})
+
+WebhookStatusBox:CreateStatus({
+	Name = "Last sent",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if Session.lastWebhookAt == "" then
+			return "<Muted>never</Muted>"
+		end
+		return Session.lastWebhookAt
+	end,
+})
+
+WebhookStatusBox:CreateStatus({
+	Name = "Last error",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if not Session.lastWebhookError or Session.lastWebhookError == "" then
+			return "<Muted>none</Muted>"
+		end
+		return "<Error>" .. escapeRich(Session.lastWebhookError) .. "</Error>"
+	end,
+})
+
+WebhookStatusBox:CreateParagraph({
+	Title = "Format",
+	Content = "Each message is a Discord embed with the plate, region, condition, value and session totals. Sending is rate limited to one message per 1.2 seconds. The URL is not Discord only: any endpoint that accepts JSON works. If the test reports HTTP 0, the host is unreachable from this network.",
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local SettingsBox = SettingsTab:CreateGroupbox({ Name = "Session", Side = "Left" })
+
+SettingsBox:CreateKeybind({
+	Name = "Panic key",
+	CurrentKeybind = "End",
+	Flag = "PanicKey",
+	Callback = function(key)
+		State.PanicKey = tostring(key)
+	end,
+})
+
+SettingsBox:CreateButton({
+	Name = "Panic (stop everything)",
+	Icon = "octagon-x",
+	Callback = function()
+		getgenv().RobScriptNumbers.Panic()
+	end,
+})
+
+SettingsBox:CreateButton({
+	Name = "Reload interface",
+	Icon = "refresh-cw",
+	Callback = function()
+		local api = getgenv().RobScriptNumbers
+		if api and type(api.Destroy) == "function" then
+			pcall(api.Destroy)
+		end
+	end,
+})
+
+SettingsBox:CreateParagraph({
+	Title = "About",
+	Content = "Robscript Team · Number Generator. Roll, sell, equip and upgrade through the game's own remotes. RightControl toggles the window, End is the panic key.",
+})
+
+----- Panic and API -----
+
+local panicFlags = {
+	"AutoRoll",
+	"AutoEquip",
+	"AutoSell",
+	"GameAutosell",
+	"AutoUpgrade",
+	"AutoUpkeep",
+	"AutoClaimSold",
+	"WebhookEnabled",
+}
+
+local api = {}
+
+function api.Panic()
+	State.Paused = true
+	State.AutoRoll = false
+	State.AutoEquip = false
+	State.SellEnabled = false
+	State.AutoUpgrade = false
+	State.AutoUpkeep = false
+	State.AutoClaimSold = false
+	State.WebhookEnabled = false
+	for _, name in ipairs(panicFlags) do
+		local flag = Airflow.Flags[name]
+		if flag and type(flag.Set) == "function" then
+			pcall(function()
+				flag:Set(false, true)
+			end)
+		end
+	end
+	pushLog("<Warning>Panic</Warning> everything stopped", "Warning")
+	Window:Notify({ Title = "Panic", Content = "All automation stopped", Type = "Warning" })
+	if Session.panicThread then
+		pcall(task.cancel, Session.panicThread)
+	end
+	Session.panicThread = task.delay(1.5, function()
+		State.Paused = false
+	end)
+end
+
+function api.Destroy()
+	pcall(api.Panic)
+	for _, connection in ipairs(Session.connections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	Session.connections = {}
+	if Session.schedulerThread then
+		pcall(task.cancel, Session.schedulerThread)
+	end
+	if Session.historyThread then
+		pcall(task.cancel, Session.historyThread)
+	end
+	if Session.webhookThread then
+		pcall(task.cancel, Session.webhookThread)
+	end
+	pcall(function()
+		Window:Destroy()
+	end)
+	getgenv().RobScriptNumbers = nil
+end
+
+function api.Roll(count)
+	return remote("Roll"):InvokeServer(selectedRegionId(), count or 1, nil)
+end
+
+function api.SellMatching()
+	task.spawn(sellStep)
+end
+
+function api.EquipBest()
+	task.spawn(equipStep)
+end
+
+function api.BuyNextUpgrade()
+	task.spawn(upgradeStep)
+end
+
+function api.RefreshState()
+	return refreshState()
+end
+
+function api.SetFlag(name, value)
+	local flag = Airflow.Flags[name]
+	if flag and type(flag.Set) == "function" then
+		flag:Set(value)
+		return true
+	end
+	return false
+end
+
+getgenv().RobScriptNumbers = api
+api.State = State
+api.Session = Session
+api.Window = Window
+api.Airflow = Airflow
+api.Actions = {
+	Roll = api.Roll,
+	RollOnce = rollStep,
+	SellOnce = sellStep,
+	UpgradeOnce = upgradeStep,
+	EquipOnce = equipStep,
+	UpkeepOnce = upkeepStep,
+	ClaimOnce = claimStep,
+	TestWebhook = sendTestWebhook,
+	Plan = rollPlan,
+	Sell = api.SellMatching,
+	Equip = api.EquipBest,
+	Upgrade = api.BuyNextUpgrade,
+	PayUpkeep = upkeepStep,
+	ClaimSold = claimStep,
+}
+
+----- Hotkeys -----
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if State.PanicKey and input.KeyCode == Enum.KeyCode[State.PanicKey] then
+		api.Panic()
+	end
+end))
+
+----- Startup -----
+
+Session.historyThread = task.spawn(function()
+	while true do
+		task.wait(0.4)
+		pcall(refreshHistoryTable)
+	end
+end)
+
+Session.schedulerThread = task.spawn(scheduler)
+Session.webhookThread = task.spawn(runWebhookLoop)
+
+Window:LoadAutoload()
+
+if GameState then
+	RegionDropdown:SetOptions(regionOptions(GameState), { KeepSelection = true, Silent = true })
+end
+
+local autosellHint = ""
+if GameState and not GameState.hasAutosell then
+	autosellHint = " · autosell upgrade not owned yet"
+end
+
+pushLog(string.format("<Success>Robscript Numbers loaded</Success> RightControl toggles the window%s", autosellHint))
+Window:Notify({
+	Title = "Number Generator",
+	Content = "Auto roll, sell, equip and upgrades are ready",
+	Type = "Success",
+})
