@@ -1,0 +1,2588 @@
+-- Robscript Team - The Backrooms With Guns
+-- Game: The Backrooms With Guns [UPD] | placeId 8455137364 | gameId 3232181171
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptBWG
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its loops, hooks and highlights die first.
+do
+	local existing = getgenv().RobScriptBWG
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript BWG] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local COLLECT_INTERVAL = 0.4
+local VISUAL_INTERVAL = 0.033
+local TEXT_INTERVAL = 0.2
+local WEAPON_INTERVAL = 1
+local WAYPOINT_FILE = "RobScriptBWG_waypoints.json"
+
+local COLOR_ENTITY = Color3.fromRGB(255, 86, 86)
+local COLOR_BOSS = Color3.fromRGB(214, 32, 32)
+local COLOR_PLAYER = Color3.fromRGB(94, 255, 132)
+local COLOR_PICKUP = Color3.fromRGB(255, 196, 64)
+local COLOR_MARKER = Color3.fromRGB(120, 190, 255)
+
+local PLAYER_BOX_SIZE = Vector3.new(2.6, 5.2, 2.6)
+
+local DEFAULT_WALK_SPEED = 16
+local DEFAULT_JUMP_POWER = 40
+
+local ENTITY_TYPES = { "SkinStealer", "Hound", "Smiler", "Insanity", "Lighter" }
+local PICKUP_TYPES = {
+	"MedkitPickup",
+	"RiflePickup",
+	"ShotgunPickup",
+	"HeavyPickup",
+	"LightPickup",
+	"ExplosivePickup",
+	"SpecialPickup",
+	"UniversalPickup",
+}
+
+local PICKUP_LABELS = {
+	MedkitPickup = "Medkit",
+	RiflePickup = "Rifle",
+	ShotgunPickup = "Shotgun",
+	HeavyPickup = "Heavy",
+	LightPickup = "Light",
+	ExplosivePickup = "Explosive",
+	SpecialPickup = "Special",
+	UniversalPickup = "Ammo",
+}
+
+local MARKER_DEFS = {
+	{
+		Flag = "MarkerShops",
+		Label = "SHOP",
+		Names = { "StoreOwner", "SecondStoreOwner", "WrapStoreOwner", "AttachmentStoreOwner" },
+	},
+	{
+		Flag = "MarkerDummies",
+		Label = "DUMMY",
+		Names = { "PVP Dummy", "Milestone Dummy", "Moderator Dummy", "Creator Dummy", "Scale Dummy" },
+	},
+	{
+		Flag = "MarkerBoss",
+		Label = "BOSS",
+		Names = { "KingIllusion" },
+	},
+}
+
+local PLACE_NAMES = {
+	"StoreOwner",
+	"SecondStoreOwner",
+	"WrapStoreOwner",
+	"AttachmentStoreOwner",
+	"KingIllusion",
+	"PVP Dummy",
+	"Milestone Dummy",
+	"The Hub",
+	"Museum",
+	"Penthouses",
+	"SecretRoom",
+	"Funrooms",
+	"Poolrooms",
+	"The End",
+}
+
+local SPAWN_FOLDERS = {
+	["Enemy spawn"] = "EnemySpawnPoints",
+	["Boss spawn"] = "KingIllusionSpawnPoints",
+	["Ammo crate"] = "AmmoSpawnPoints",
+}
+
+----- Flags -----
+
+-- Flags are cached after the interface is built, so a config load cannot
+-- desync the runtime: every tick reads the same objects the user sees.
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function flagList(name, fallback)
+	local value = flag(name, fallback)
+	if type(value) == "table" then
+		return value
+	end
+	if type(value) == "string" then
+		return { value }
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local function colorToHex(color)
+	local red = math.floor(math.clamp(color.R, 0, 1) * 255 + 0.5)
+	local green = math.floor(math.clamp(color.G, 0, 1) * 255 + 0.5)
+	local blue = math.floor(math.clamp(color.B, 0, 1) * 255 + 0.5)
+	return string.format("%02X%02X%02X", red, green, blue)
+end
+
+local function escapeText(text)
+	local value = tostring(text)
+	value = string.gsub(value, "&", "&amp;")
+	value = string.gsub(value, "<", "&lt;")
+	value = string.gsub(value, ">", "&gt;")
+	return value
+end
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function formatHealth(humanoid)
+	if not humanoid then
+		return "?"
+	end
+	local current = humanoid.Health
+	local maximum = humanoid.MaxHealth
+	if maximum == math.huge then
+		return "inf"
+	end
+	if current == math.huge then
+		return "inf"
+	end
+	return string.format("%d/%d", math.floor(current + 0.5), math.floor(maximum + 0.5))
+end
+
+local function cameraOrigin()
+	local camera = workspace.CurrentCamera
+	if camera then
+		return camera.CFrame.Position
+	end
+	return Vector3.zero
+end
+
+local function characterRoot()
+	local character = LocalPlayer.Character
+	return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function currentTool()
+	local character = LocalPlayer.Character
+	return character and character:FindFirstChildWhichIsA("Tool")
+end
+
+local function inMenu()
+	return LocalPlayer:GetAttribute("InMenu") == true
+end
+
+local function humanoidOf(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		return humanoid
+	end
+	return nil
+end
+
+local function headOf(model)
+	if model:IsA("BasePart") then
+		return model
+	end
+	local head = model:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head
+	end
+	local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			return descendant
+		end
+	end
+	return nil
+end
+
+----- Drawing -----
+
+local DrawingLib = nil
+if type(Drawing) == "table" and type(Drawing.new) == "function" then
+	DrawingLib = Drawing
+end
+
+local function newLine()
+	if not DrawingLib then
+		return nil
+	end
+	local ok, line = pcall(DrawingLib.new, "Line")
+	if ok and line then
+		line.Visible = false
+		return line
+	end
+	return nil
+end
+
+----- State -----
+
+local targets = {}
+local stats = { entities = 0, players = 0, pickups = 0 }
+local running = true
+local aimStatus = "none"
+local aimTarget = nil
+
+----- Visual objects -----
+
+local function releaseVisuals(target)
+	if target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+	if target.billboard then
+		pcall(function()
+			target.billboard:Destroy()
+		end)
+		target.billboard = nil
+		target.label = nil
+	end
+	if target.healthBar then
+		pcall(function()
+			target.healthBar:Destroy()
+		end)
+		target.healthBar = nil
+	end
+	if target.lines then
+		for _, line in ipairs(target.lines) do
+			pcall(function()
+				line.Visible = false
+				line:Remove()
+			end)
+		end
+		target.lines = nil
+	end
+	if target.tracer then
+		pcall(function()
+			target.tracer.Visible = false
+			target.tracer:Remove()
+		end)
+		target.tracer = nil
+	end
+	target.hasVisual = false
+end
+
+local function buildBillboard(part, offsetY)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ESP_Billboard"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(240, 40)
+	billboard.StudsOffset = Vector3.new(0, offsetY, 0)
+	billboard.Enabled = false
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ESP_Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.RichText = true
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Bottom
+	label.TextStrokeTransparency = 0.35
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = ""
+	label.Parent = billboard
+
+	local healthBar = Instance.new("Frame")
+	healthBar.Name = "ESP_HealthBar"
+	healthBar.AnchorPoint = Vector2.new(0.5, 1)
+	healthBar.Position = UDim2.fromScale(0.5, 1)
+	healthBar.Size = UDim2.new(0.7, 0, 0, 3)
+	healthBar.BackgroundColor3 = Color3.fromRGB(94, 255, 132)
+	healthBar.BorderSizePixel = 0
+	healthBar.Visible = false
+	healthBar.Parent = billboard
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard, label, healthBar
+end
+
+local function buildHighlight(model, color)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "ESP_Chams"
+	highlight.Adornee = model
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillColor = color
+	highlight.OutlineColor = color
+	highlight.FillTransparency = 0.65
+	highlight.OutlineTransparency = 0.1
+	highlight.Parent = model
+	return highlight
+end
+
+----- Target registry -----
+
+local function resolveParts(target)
+	local model = target.model
+	if not model or not model.Parent then
+		return false
+	end
+	if model:IsA("BasePart") then
+		target.root = model
+		target.head = model
+		return true
+	end
+	target.root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	if target.kind == "entity" then
+		target.humanoid = humanoidOf(model)
+		target.head = headOf(model)
+	elseif target.kind == "player" then
+		target.humanoid = humanoidOf(model)
+		target.head = model:FindFirstChild("Head") or target.root
+	else
+		target.head = model
+	end
+	return target.head ~= nil
+end
+
+local function createTarget(kind, model, player)
+	local target = {
+		kind = kind,
+		model = model,
+		player = player,
+		hasVisual = false,
+		lastTextAt = 0,
+	}
+	if not resolveParts(target) then
+		return nil
+	end
+	return target
+end
+
+local function dropTarget(model)
+	local target = targets[model]
+	if not target then
+		return
+	end
+	releaseVisuals(target)
+	targets[model] = nil
+end
+
+local function clearAllTargets()
+	for model in pairs(targets) do
+		dropTarget(model)
+	end
+	stats.entities = 0
+	stats.players = 0
+	stats.pickups = 0
+end
+
+----- Collection -----
+
+local function entityTypeOf(model)
+	local discovery = model:GetAttribute("DiscoveryId")
+	if type(discovery) == "string" and discovery ~= "" then
+		return discovery
+	end
+	return model.Name
+end
+
+local function targetName(target)
+	if not target then
+		return "none"
+	end
+	if target.kind == "player" and target.player then
+		return target.player.Name
+	end
+	return entityTypeOf(target.model)
+end
+
+local function isBossEntity(model, humanoid)
+	if model.Name == "Lighter" or model.Name == "KingIllusion" then
+		return true
+	end
+	if humanoid and humanoid.MaxHealth >= 400 then
+		return true
+	end
+	return false
+end
+
+local function selectedEntityTypes()
+	local selection = flagList("EntityTypes", ENTITY_TYPES)
+	local lookup = {}
+	for _, name in ipairs(selection) do
+		lookup[name] = true
+	end
+	return lookup
+end
+
+local function collectEntities(seen)
+	if not flag("EntityESP", true) then
+		return
+	end
+	local allowed = selectedEntityTypes()
+	local candidates = {}
+	local present = {}
+
+	local folder = workspace:FindFirstChild("Enemies")
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			if model:IsA("Model") then
+				candidates[#candidates + 1] = model
+				present[model] = true
+			end
+		end
+	end
+	for _, model in ipairs(CollectionService:GetTagged("Enemy")) do
+		if model:IsA("Model") and not present[model] then
+			present[model] = true
+			candidates[#candidates + 1] = model
+		end
+	end
+
+	for _, model in ipairs(candidates) do
+		local humanoid = humanoidOf(model)
+		local typeName = entityTypeOf(model)
+		if humanoid and humanoid.Health > 0 and allowed[typeName] then
+			local target = targets[model]
+			if not target then
+				target = createTarget("entity", model, nil)
+				if target then
+					targets[model] = target
+				end
+			end
+			if target then
+				seen[model] = true
+			end
+		end
+	end
+end
+
+local function shouldTrackPlayer(player)
+	if player == LocalPlayer then
+		return false
+	end
+	local character = player.Character
+	if not character or not character.Parent then
+		return false
+	end
+	local humanoid = humanoidOf(character)
+	if not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+	return true
+end
+
+local function collectPlayers(seen)
+	if not flag("PlayerESP", true) then
+		return
+	end
+	for _, player in ipairs(Players:GetPlayers()) do
+		if shouldTrackPlayer(player) then
+			local character = player.Character
+			local target = targets[character]
+			if not target then
+				target = createTarget("player", character, player)
+				if target then
+					targets[character] = target
+				end
+			else
+				target.player = player
+			end
+			if target then
+				seen[character] = true
+			end
+		end
+	end
+end
+
+local function collectPickups(seen)
+	if not flag("PickupESP", false) then
+		return
+	end
+	local selection = flagList("PickupTypes", PICKUP_TYPES)
+	local allowed = {}
+	for _, name in ipairs(selection) do
+		allowed[name] = true
+	end
+	local folder = workspace:FindFirstChild("SpawnedPickups")
+	if not folder then
+		return
+	end
+	for _, part in ipairs(folder:GetChildren()) do
+		if allowed[part.Name] and (part:IsA("BasePart") or part:IsA("Model")) then
+			local target = targets[part]
+			if not target then
+				target = createTarget("pickup", part, nil)
+				if target then
+					targets[part] = target
+				end
+			end
+			if target then
+				seen[part] = true
+			end
+		end
+	end
+end
+
+local function collectTargets()
+	local seen = {}
+	collectEntities(seen)
+	collectPlayers(seen)
+	collectPickups(seen)
+	for model in pairs(targets) do
+		if not seen[model] then
+			dropTarget(model)
+		end
+	end
+end
+
+----- Rendering -----
+
+local function entityColor(model, humanoid)
+	if isBossEntity(model, humanoid) then
+		return flag("BossColor", COLOR_BOSS)
+	end
+	return flag("EntityColor", COLOR_ENTITY)
+end
+
+local function playerColor()
+	return flag("PlayerColor", COLOR_PLAYER)
+end
+
+local function pickupColor()
+	return flag("PickupColor", COLOR_PICKUP)
+end
+
+local function entityLabel(target, distance)
+	local model = target.model
+	local parts = {}
+	if flag("EntityName", true) then
+		parts[#parts + 1] = string.format(
+			'<font color="#%s">%s</font>',
+			colorToHex(entityColor(model, target.humanoid)),
+			escapeText(entityTypeOf(model))
+		)
+	end
+	local details = {}
+	if flag("EntityHealth", true) and target.humanoid then
+		details[#details + 1] = formatHealth(target.humanoid)
+	end
+	if flag("EntityDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	if #details > 0 then
+		parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+	end
+	return table.concat(parts, "\n")
+end
+
+local function playerLabel(target, distance)
+	local player = target.player
+	if not player then
+		return ""
+	end
+	local humanoid = target.humanoid
+	local parts = {}
+	if flag("PlayerName", true) then
+		parts[#parts + 1] = string.format('<font color="#%s">%s</font>', colorToHex(playerColor()), escapeText(player.Name))
+	end
+	local details = {}
+	if flag("PlayerMode", true) then
+		details[#details + 1] = player:GetAttribute("SurvivalMode") == true and "Survival" or "Classic"
+	end
+	if flag("PlayerHealth", true) then
+		details[#details + 1] = formatHealth(humanoid)
+	end
+	if flag("PlayerTokens", true) then
+		local tokens = player:GetAttribute("WrapTokens")
+		if typeof(tokens) == "number" then
+			details[#details + 1] = string.format("%d tokens", tokens)
+		end
+	end
+	if flag("PlayerDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	if #details > 0 then
+		parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+	end
+	return table.concat(parts, "\n")
+end
+
+local function pickupLabel(target, distance)
+	local part = target.model
+	local parts = {}
+	if flag("PickupName", true) then
+		local label = PICKUP_LABELS[part.Name] or part.Name
+		parts[#parts + 1] = string.format('<font color="#%s">%s</font>', colorToHex(pickupColor()), escapeText(label))
+	end
+	if flag("PickupDistance", true) then
+		parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', formatDistance(distance))
+	end
+	return table.concat(parts, "\n")
+end
+
+local function updateChams(target, color, enabled)
+	if not enabled then
+		if target.highlight then
+			pcall(function()
+				target.highlight:Destroy()
+			end)
+			target.highlight = nil
+		end
+		return
+	end
+	if not target.highlight or not target.highlight.Parent then
+		target.highlight = buildHighlight(target.model, color)
+	end
+	local highlight = target.highlight
+	highlight.FillColor = color
+	highlight.OutlineColor = color
+	highlight.FillTransparency = 0.65
+	highlight.OutlineTransparency = 0.1
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+end
+
+local function updateBillboard(target, color, distance, visible)
+	if not visible then
+		if target.billboard then
+			target.billboard.Enabled = false
+		end
+		return
+	end
+	if not target.billboard or not target.billboard.Parent then
+		local offsetY = 2.6
+		if target.kind == "entity" then
+			offsetY = 2.2
+		elseif target.kind == "pickup" then
+			offsetY = 1.1
+		end
+		target.billboard, target.label, target.healthBar = buildBillboard(target.head, offsetY)
+	end
+	local billboard = target.billboard
+	if not billboard then
+		return
+	end
+	local renderDistance = flag(target.kind == "pickup" and "PickupRenderDistance" or "RenderDistance", 2500)
+	billboard.MaxDistance = renderDistance
+	billboard.Enabled = visible
+	if not visible then
+		return
+	end
+	local now = os.clock()
+	if now - target.lastTextAt >= TEXT_INTERVAL then
+		target.lastTextAt = now
+		local text
+		if target.kind == "entity" then
+			text = entityLabel(target, distance)
+		elseif target.kind == "player" then
+			text = playerLabel(target, distance)
+		else
+			text = pickupLabel(target, distance)
+		end
+		if target.label then
+			target.label.Text = text
+			target.label.TextColor3 = color
+		end
+		local healthBar = target.healthBar
+		if healthBar then
+			local humanoid = target.humanoid
+			local showBar = humanoid ~= nil and target.kind ~= "pickup"
+			healthBar.Visible = showBar and flag("HealthBar", true) or false
+			if showBar and humanoid.MaxHealth > 0 and humanoid.MaxHealth ~= math.huge then
+				local fraction = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+				healthBar.Size = UDim2.new(0.7 * fraction, 0, 0, 3)
+				healthBar.BackgroundColor3 = fraction > 0.5 and Color3.fromRGB(120, 235, 130)
+					or fraction > 0.25 and Color3.fromRGB(255, 196, 64)
+					or Color3.fromRGB(235, 86, 86)
+			end
+		end
+	end
+end
+
+local function projectBox(center, size)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local half = size * 0.5
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+	local hits = 0
+	for x = -1, 1, 2 do
+		for y = -1, 1, 2 do
+			for z = -1, 1, 2 do
+				local world = center + Vector3.new(half.X * x, half.Y * y, half.Z * z)
+				local screen = camera:WorldToViewportPoint(world)
+				if screen.Z > 0 then
+					hits = hits + 1
+					minX = math.min(minX, screen.X)
+					minY = math.min(minY, screen.Y)
+					maxX = math.max(maxX, screen.X)
+					maxY = math.max(maxY, screen.Y)
+				end
+			end
+		end
+	end
+	if hits < 2 then
+		return nil
+	end
+	return minX, minY, maxX, maxY
+end
+
+local function updateBox(target, color, visible)
+	local boxFlag = target.kind == "player" and "PlayerBox" or "EntityBox"
+	if not visible or not flag(boxFlag, false) then
+		if target.lines then
+			for _, line in ipairs(target.lines) do
+				if line.Visible then
+					line.Visible = false
+				end
+			end
+		end
+		return
+	end
+
+	local center, size
+	if target.kind == "player" then
+		center = target.root.Position
+		size = PLAYER_BOX_SIZE
+	else
+		local ok, boxCenter, boxSize = pcall(function()
+			local cf, sz = target.model:GetBoundingBox()
+			return cf.Position, sz
+		end)
+		if not ok then
+			return
+		end
+		center = boxCenter
+		size = boxSize
+	end
+
+	local minX, minY, maxX, maxY = projectBox(center, size)
+	if not minX then
+		if target.lines then
+			for _, line in ipairs(target.lines) do
+				line.Visible = false
+			end
+		end
+		return
+	end
+
+	if not target.lines then
+		target.lines = { newLine(), newLine(), newLine(), newLine() }
+	end
+	local lines = target.lines
+	if not lines[1] then
+		return
+	end
+
+	local topLeft = Vector2.new(minX, minY)
+	local topRight = Vector2.new(maxX, minY)
+	local bottomLeft = Vector2.new(minX, maxY)
+	local bottomRight = Vector2.new(maxX, maxY)
+	local segments = {
+		{ topLeft, topRight },
+		{ topRight, bottomRight },
+		{ bottomRight, bottomLeft },
+		{ bottomLeft, topLeft },
+	}
+	for index = 1, 4 do
+		local line = lines[index]
+		if line then
+			local segment = segments[index]
+			line.From = segment[1]
+			line.To = segment[2]
+			line.Color = color
+			line.Thickness = 1
+			line.Visible = true
+		end
+	end
+end
+
+local function updateTracer(target, color, visible)
+	local enabled = visible and flag("PlayerTracer", false) and target.kind == "player"
+	if not enabled then
+		if target.tracer and target.tracer.Visible then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local viewport = camera.ViewportSize
+	local screen = camera:WorldToViewportPoint(target.head.Position)
+	if screen.Z <= 0 then
+		if target.tracer then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	if not target.tracer then
+		target.tracer = newLine()
+	end
+	if not target.tracer then
+		return
+	end
+	local tracer = target.tracer
+	tracer.From = Vector2.new(viewport.X * 0.5, viewport.Y)
+	tracer.To = Vector2.new(screen.X, screen.Y)
+	tracer.Color = color
+	tracer.Thickness = 1
+	tracer.Visible = true
+end
+
+local function updateTarget(target)
+	if not target.model or not target.model.Parent then
+		releaseVisuals(target)
+		return
+	end
+	if not target.head or not target.head.Parent then
+		if not resolveParts(target) then
+			releaseVisuals(target)
+			return
+		end
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local origin = cameraOrigin()
+	local distance = (target.head.Position - origin).Magnitude
+	local renderDistance = flag(target.kind == "pickup" and "PickupRenderDistance" or "RenderDistance", 2500)
+	local visible = distance <= renderDistance
+	if not visible and target.billboard and distance > renderDistance * 2 then
+		pcall(function()
+			target.billboard:Destroy()
+		end)
+		target.billboard = nil
+		target.label = nil
+		target.healthBar = nil
+	end
+
+	local color
+	if target.kind == "entity" then
+		color = entityColor(target.model, target.humanoid)
+	elseif target.kind == "player" then
+		color = playerColor()
+	else
+		color = pickupColor()
+	end
+
+	updateChams(target, color, visible and flag(target.kind == "pickup" and "PickupChams" or (target.kind == "player" and "PlayerChams" or "EntityChams"), true))
+	updateBillboard(target, color, distance, visible)
+	updateBox(target, color, visible)
+	updateTracer(target, color, visible)
+	target.hasVisual = visible
+end
+
+local function updateStats()
+	local entityCount, playerCount, pickupCount = 0, 0, 0
+	for _, target in pairs(targets) do
+		if target.hasVisual then
+			if target.kind == "entity" then
+				entityCount = entityCount + 1
+			elseif target.kind == "player" then
+				playerCount = playerCount + 1
+			else
+				pickupCount = pickupCount + 1
+			end
+		end
+	end
+	stats.entities = entityCount
+	stats.players = playerCount
+	stats.pickups = pickupCount
+end
+
+----- Markers -----
+
+local markerObjects = {}
+
+local function clearMarkers()
+	for _, entry in pairs(markerObjects) do
+		if entry.billboard then
+			pcall(function()
+				entry.billboard:Destroy()
+			end)
+		end
+		if entry.highlight then
+			pcall(function()
+				entry.highlight:Destroy()
+			end)
+		end
+		markerObjects[entry.object] = nil
+	end
+	markerObjects = {}
+end
+
+local function collectMarkers()
+	local wanted = {}
+	for _, definition in ipairs(MARKER_DEFS) do
+		if flag(definition.Flag, false) then
+			for _, name in ipairs(definition.Names) do
+				local object = workspace:FindFirstChild(name, true)
+				if object and not wanted[object] then
+					wanted[object] = definition.Label
+				end
+			end
+		end
+	end
+
+	for object in pairs(markerObjects) do
+		if not wanted[object] then
+			local entry = markerObjects[object]
+			if entry.billboard then
+				pcall(function()
+					entry.billboard:Destroy()
+				end)
+			end
+			if entry.highlight then
+				pcall(function()
+					entry.highlight:Destroy()
+				end)
+			end
+			markerObjects[object] = nil
+		end
+	end
+
+	for object, label in pairs(wanted) do
+		if not markerObjects[object] then
+			local anchor = object:IsA("BasePart") and object or nil
+			if not anchor and object:IsA("Model") then
+				anchor = headOf(object)
+			end
+			if not anchor then
+				for _, descendant in ipairs(object:GetDescendants()) do
+					if descendant:IsA("BasePart") then
+						anchor = descendant
+						break
+					end
+				end
+			end
+			if anchor then
+				local billboard = Instance.new("BillboardGui")
+				billboard.Name = "POI_Marker"
+				billboard.AlwaysOnTop = true
+				billboard.LightInfluence = 0
+				billboard.Size = UDim2.fromOffset(160, 24)
+				billboard.StudsOffset = Vector3.new(0, 3, 0)
+				billboard.MaxDistance = 2000
+				local text = Instance.new("TextLabel")
+				text.BackgroundTransparency = 1
+				text.Size = UDim2.fromScale(1, 1)
+				text.Font = Enum.Font.GothamBold
+				text.TextSize = 12
+				text.TextColor3 = COLOR_MARKER
+				text.TextStrokeTransparency = 0.4
+				text.Text = label
+				text.Parent = billboard
+				billboard.Adornee = anchor
+				billboard.Parent = anchor
+				markerObjects[object] = { object = object, billboard = billboard }
+			end
+		end
+	end
+end
+
+----- Aim -----
+
+local fovCircle = { lines = {}, visible = false }
+
+local function buildFovCircle()
+	if not DrawingLib or #fovCircle.lines > 0 then
+		return
+	end
+	for index = 1, 36 do
+		local line = newLine()
+		if line then
+			line.Thickness = 1
+			line.Color = Color3.fromHex("#FF3B7F")
+			line.Transparency = 0.45
+			fovCircle.lines[#fovCircle.lines + 1] = line
+		end
+	end
+end
+
+local function updateFovCircle()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local enabled = flag("AimCircle", true) and flag("AimAssist", true) and not inMenu()
+	buildFovCircle()
+	if not enabled then
+		for _, line in ipairs(fovCircle.lines) do
+			if line.Visible then
+				line.Visible = false
+			end
+		end
+		fovCircle.visible = false
+		return
+	end
+	fovCircle.visible = true
+	local radius = flag("AimFOV", 160)
+	local center = camera.ViewportSize * 0.5
+	local count = #fovCircle.lines
+	if count == 0 then
+		return
+	end
+	for index = 1, count do
+		local line = fovCircle.lines[index]
+		local angleA = (index - 1) / count * math.pi * 2
+		local angleB = index / count * math.pi * 2
+		line.From = center + Vector2.new(math.cos(angleA), math.sin(angleA)) * radius
+		line.To = center + Vector2.new(math.cos(angleB), math.sin(angleB)) * radius
+		line.Visible = true
+	end
+end
+
+local aimCache = { at = 0, list = {} }
+
+local function aimCandidates()
+	local now = os.clock()
+	if now - aimCache.at < 0.1 then
+		return aimCache.list
+	end
+	aimCache.at = now
+	local list = {}
+	local selection = flagList("AimTargets", { "Entities" })
+	local wantEntities, wantPlayers = false, false
+	for _, value in ipairs(selection) do
+		if value == "Entities" then
+			wantEntities = true
+		elseif value == "Players" then
+			wantPlayers = true
+		end
+	end
+
+	if wantEntities then
+		for model, target in pairs(targets) do
+			if target.kind == "entity" and target.head and target.head.Parent then
+				local humanoid = target.humanoid
+				if humanoid and humanoid.Health > 0 then
+					list[#list + 1] = target
+				end
+			end
+		end
+	end
+	if wantPlayers then
+		for model, target in pairs(targets) do
+			if target.kind == "player" and target.head and target.head.Parent then
+				local humanoid = target.humanoid
+				if humanoid and humanoid.Health > 0 then
+					list[#list + 1] = target
+				end
+			end
+		end
+	end
+	aimCache.list = list
+	return list
+end
+
+local function pickAimTarget(radiusMultiplier)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local center = camera.ViewportSize * 0.5
+	local radius = flag("AimFOV", 160) * (radiusMultiplier or 1)
+	local headOnly = flag("AimHead", true)
+	local best, bestScore = nil, math.huge
+	for _, target in ipairs(aimCandidates()) do
+		local part = target.head
+		if headOnly and target.kind == "entity" then
+			local head = target.model:FindFirstChild("Head")
+			if head and head:IsA("BasePart") then
+				part = head
+			end
+		end
+		if part and part.Parent then
+			local screen = camera:WorldToViewportPoint(part.Position)
+			if screen.Z > 0 then
+				local delta = Vector2.new(screen.X, screen.Y) - center
+				local magnitude = delta.Magnitude
+				if magnitude <= radius and magnitude < bestScore then
+					best = { target = target, part = part, screen = delta, distance = magnitude }
+					bestScore = magnitude
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function canAimNow()
+	if inMenu() then
+		return false
+	end
+	if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+		return false
+	end
+	if flag("AimRMB", true) and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		return false
+	end
+	return true
+end
+
+local function stepAim()
+	if not flag("AimAssist", true) then
+		aimStatus = "disabled"
+		return
+	end
+	if not canAimNow() then
+		aimStatus = "idle"
+		return
+	end
+	local result = pickAimTarget(1)
+	if not result then
+		aimStatus = "no target"
+		return
+	end
+	aimStatus = targetName(result.target)
+	aimTarget = result.target
+	local smooth = math.max(1, flag("AimSmooth", 6))
+	local delta = result.screen
+	if delta.Magnitude > 240 then
+		delta = delta.Unit * 240
+	end
+	pcall(function()
+		mousemoverel(delta.X / smooth, delta.Y / smooth)
+	end)
+end
+
+----- Silent aim -----
+
+local silentAimInstalled = false
+local silentAimOriginal
+local inflictTarget
+
+local function installSilentAim()
+	if silentAimInstalled then
+		return true
+	end
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	inflictTarget = remotes and remotes:FindFirstChild("InflictTarget")
+	if not inflictTarget then
+		return false
+	end
+	local ok = pcall(function()
+		silentAimOriginal = hookmetamethod(game, "__namecall", function(self, ...)
+			local method = getnamecallmethod()
+			if method == "FireServer" and self == inflictTarget and flag("SilentAim", false) then
+				local arguments = table.pack(...)
+				local payload = arguments[1]
+				if type(payload) == "table" and payload.Type == "Gun" then
+					local result = pickAimTarget(1.5)
+					if result and result.part then
+						payload.Hit = result.part
+						payload.IsHeadshot = result.part.Name == "Head"
+						payload.Position = result.part.Position
+						local root = characterRoot()
+						if root then
+							payload.Distance = (result.part.Position - root.Position).Magnitude
+						end
+					end
+				end
+				return silentAimOriginal(self, table.unpack(arguments, 1, arguments.n))
+			end
+			return silentAimOriginal(self, ...)
+		end)
+	end)
+	if not ok then
+		return false
+	end
+	silentAimInstalled = true
+	return true
+end
+
+local function uninstallSilentAim()
+	if not silentAimInstalled or not silentAimOriginal then
+		return
+	end
+	pcall(function()
+		hookmetamethod(game, "__namecall", silentAimOriginal)
+	end)
+	silentAimInstalled = false
+	silentAimOriginal = nil
+end
+
+----- Weapon config -----
+
+local configOriginals = setmetatable({}, { __mode = "k" })
+local PATCH_KEYS = { "Recoil", "Spread", "BulletBloom", "FireRate", "ReloadTime", "CameraRecoilingEnabled", "BaseDamage" }
+
+local function snapshotConfig(config)
+	local snapshot = configOriginals[config]
+	if snapshot then
+		return snapshot
+	end
+	snapshot = {}
+	for _, key in ipairs(PATCH_KEYS) do
+		snapshot[key] = config[key]
+	end
+	configOriginals[config] = snapshot
+	return snapshot
+end
+
+local function applyWeaponConfig(config)
+	if type(config) ~= "table" or config.BaseDamage == nil then
+		return false
+	end
+	local snapshot = snapshotConfig(config)
+	local noRecoil = flag("NoRecoil", true)
+	local noSpread = flag("NoSpread", true)
+	local rapid = flag("RapidFire", false)
+	local fastReload = flag("InstantReload", false)
+	local rapidRate = flag("RapidRate", 0.08)
+
+	config.Recoil = noRecoil and 0 or snapshot.Recoil
+	if noRecoil then
+		config.CameraRecoilingEnabled = false
+	else
+		config.CameraRecoilingEnabled = snapshot.CameraRecoilingEnabled
+	end
+	config.Spread = noSpread and 0 or snapshot.Spread
+	config.BulletBloom = noSpread and 0 or snapshot.BulletBloom
+	config.ReloadTime = fastReload and 0 or snapshot.ReloadTime
+	if rapid then
+		local base = snapshot.FireRate or 0.4
+		config.FireRate = math.min(base, rapidRate)
+	else
+		config.FireRate = snapshot.FireRate
+	end
+	return true
+end
+
+local function weaponConfigs()
+	local list = {}
+	local character = LocalPlayer.Character
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	for _, container in ipairs({ character, backpack }) do
+		if container then
+			for _, tool in ipairs(container:GetChildren()) do
+				if tool:IsA("Tool") then
+					local folder = tool:FindFirstChild("Setting")
+					if folder then
+						for _, module in ipairs(folder:GetChildren()) do
+							if module:IsA("ModuleScript") then
+								local ok, config = pcall(require, module)
+								if ok then
+									list[#list + 1] = config
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function refreshWeaponConfig()
+	local patched = 0
+	for _, config in ipairs(weaponConfigs()) do
+		if applyWeaponConfig(config) then
+			patched = patched + 1
+		end
+	end
+	return patched
+end
+
+local function restoreWeaponConfig()
+	for config, snapshot in pairs(configOriginals) do
+		for key, value in pairs(snapshot) do
+			pcall(function()
+				config[key] = value
+			end)
+		end
+	end
+	configOriginals = setmetatable({}, { __mode = "k" })
+end
+
+local function applyNoHeat()
+	if not flag("NoHeat", true) then
+		return
+	end
+	local tool = currentTool()
+	local folder = tool and tool:FindFirstChild("ValueFolder")
+	if not folder then
+		return
+	end
+	for _, holder in ipairs(folder:GetChildren()) do
+		local heat = holder:FindFirstChild("Heat")
+		if heat and heat:IsA("NumberValue") and heat.Value > 0 then
+			heat.Value = 0
+		end
+	end
+end
+
+----- World: lighting and screen -----
+
+local lightingSnapshot = nil
+
+local function setFullbright(on)
+	local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+	if on then
+		if not lightingSnapshot then
+			lightingSnapshot = {
+				ClockTime = Lighting.ClockTime,
+				Brightness = Lighting.Brightness,
+				Ambient = Lighting.Ambient,
+				OutdoorAmbient = Lighting.OutdoorAmbient,
+				FogEnd = Lighting.FogEnd,
+				FogStart = Lighting.FogStart,
+				GlobalShadows = Lighting.GlobalShadows,
+				ExposureCompensation = Lighting.ExposureCompensation,
+			}
+		end
+		Lighting.ClockTime = 12
+		Lighting.Brightness = 4
+		Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+		Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+		Lighting.FogEnd = 100000
+		Lighting.FogStart = 0
+		Lighting.GlobalShadows = false
+		Lighting.ExposureCompensation = 1
+		if atmosphere then
+			pcall(function()
+				atmosphere.Density = 0
+			end)
+		end
+	elseif lightingSnapshot then
+		for key, value in pairs(lightingSnapshot) do
+			pcall(function()
+				Lighting[key] = value
+			end)
+		end
+		lightingSnapshot = nil
+	end
+end
+
+local graphicsOriginals = {}
+local bobbleOriginal = nil
+
+local function applyFullbright()
+	local wanted = flag("Fullbright", false)
+	if wanted and not lightingSnapshot then
+		setFullbright(true)
+	elseif not wanted and lightingSnapshot then
+		setFullbright(false)
+	end
+end
+
+local function graphicsFolder()
+	local settings = ReplicatedStorage:FindFirstChild("Settings")
+	return settings and settings:FindFirstChild("Graphics")
+end
+
+-- The world toggles only touch a setting while they are enabled and restore
+-- the value the user had before. They never force a setting back on.
+local function applyGraphicsToggles()
+	local folder = graphicsFolder()
+	local list = {
+		{ Flag = "NoVHS", Name = "VHS" },
+		{ Flag = "NoVignette", Name = "Vignette" },
+		{ Flag = "NoShake", Name = "ScreenShake" },
+		{ Flag = "NoDamageNumbers", Name = "DamageNumbers" },
+	}
+	for _, entry in ipairs(list) do
+		local value = folder and folder:FindFirstChild(entry.Name)
+		if value and value:IsA("BoolValue") then
+			if flag(entry.Flag, false) then
+				if graphicsOriginals[entry.Name] == nil then
+					graphicsOriginals[entry.Name] = value.Value
+				end
+				if value.Value then
+					value.Value = false
+				end
+			elseif graphicsOriginals[entry.Name] ~= nil then
+				value.Value = graphicsOriginals[entry.Name]
+				graphicsOriginals[entry.Name] = nil
+			end
+		end
+	end
+
+	local attribute = LocalPlayer:GetAttribute("CameraBobbleEnabled")
+	if flag("NoBobble", false) then
+		if bobbleOriginal == nil then
+			bobbleOriginal = attribute
+		end
+		if attribute ~= false then
+			LocalPlayer:SetAttribute("CameraBobbleEnabled", false)
+		end
+	elseif bobbleOriginal ~= nil then
+		LocalPlayer:SetAttribute("CameraBobbleEnabled", bobbleOriginal)
+		bobbleOriginal = nil
+	end
+end
+
+local lastForcedFov = 70
+
+-- A custom FOV is enforced only when it differs from the game default, so the
+-- native scope and sprint FOV logic keeps working at 70.
+local function setCameraFov()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local value = flag("FovValue", 70)
+	if math.abs(value - 70) < 0.5 then
+		if lastForcedFov ~= 70 then
+			camera.FieldOfView = 70
+			lastForcedFov = 70
+		end
+		return
+	end
+	lastForcedFov = value
+	if math.abs(camera.FieldOfView - value) > 0.5 then
+		camera.FieldOfView = value
+	end
+end
+
+----- Movement -----
+
+local noclipParts = {}
+local noclipActive = false
+local speedApplied = false
+local jumpApplied = false
+local flyVelocity = nil
+
+local function setNoclip(on)
+	local character = LocalPlayer.Character
+	if on then
+		if not character then
+			return
+		end
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				noclipParts[part] = true
+				part.CanCollide = false
+			end
+		end
+	else
+		for part in pairs(noclipParts) do
+			if part.Parent then
+				pcall(function()
+					part.CanCollide = true
+				end)
+			end
+		end
+		noclipParts = {}
+	end
+end
+
+local function setFly(on)
+	if on then
+		local root = characterRoot()
+		if not root then
+			return
+		end
+		if flyVelocity then
+			flyVelocity:Destroy()
+		end
+		flyVelocity = Instance.new("BodyVelocity")
+		flyVelocity.Name = "BWG_Fly"
+		flyVelocity.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+		flyVelocity.Velocity = Vector3.zero
+		flyVelocity.Parent = root
+	else
+		if flyVelocity then
+			pcall(function()
+				flyVelocity:Destroy()
+			end)
+			flyVelocity = nil
+		end
+	end
+end
+
+local function updateFly()
+	if not flag("Fly", false) then
+		if flyVelocity then
+			setFly(false)
+		end
+		return
+	end
+	if not flyVelocity or not flyVelocity.Parent then
+		setFly(true)
+		if not flyVelocity then
+			return
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local direction = Vector3.zero
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+		direction += camera.CFrame.LookVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+		direction -= camera.CFrame.LookVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+		direction += camera.CFrame.RightVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+		direction -= camera.CFrame.RightVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+		direction += Vector3.yAxis
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+		direction -= Vector3.yAxis
+	end
+	if direction.Magnitude > 0 then
+		direction = direction.Unit
+	end
+	flyVelocity.Velocity = direction * flag("FlySpeed", 60)
+end
+
+local function enforceSpeed()
+	local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+	if flag("SpeedEnabled", false) then
+		local speed = flag("WalkSpeed", 16)
+		if math.abs(humanoid.WalkSpeed - speed) > 0.1 then
+			humanoid.WalkSpeed = speed
+			speedApplied = true
+		end
+	elseif speedApplied then
+		humanoid.WalkSpeed = DEFAULT_WALK_SPEED
+		speedApplied = false
+	end
+	if flag("JumpEnabled", false) then
+		local power = flag("JumpPower", 50)
+		if math.abs(humanoid.JumpPower - power) > 0.1 then
+			humanoid.UseJumpPower = true
+			humanoid.JumpPower = power
+			jumpApplied = true
+		end
+	elseif jumpApplied then
+		humanoid.UseJumpPower = true
+		humanoid.JumpPower = DEFAULT_JUMP_POWER
+		jumpApplied = false
+	end
+end
+
+local function enforceMovement()
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+	local wantNoclip = flag("Noclip", false)
+	if wantNoclip ~= noclipActive then
+		noclipActive = wantNoclip
+		setNoclip(wantNoclip)
+	end
+	if wantNoclip then
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				noclipParts[part] = true
+				part.CanCollide = false
+			end
+		end
+	end
+end
+
+----- Teleport -----
+
+local levelOptions, levelAnchors = {}, {}
+local areaOptions, areaAnchors = {}, {}
+local placeOptions, placeAnchors = {}, {}
+local waypoints = {}
+
+local function findAnchor(name)
+	local ok, object = pcall(function()
+		return workspace:FindFirstChild(name, true)
+	end)
+	if not object then
+		return nil
+	end
+	if object:IsA("BasePart") then
+		return object.Position
+	end
+	if object:IsA("Model") then
+		local okPivot, pivot = pcall(function()
+			return object:GetPivot().Position
+		end)
+		if okPivot and pivot then
+			return pivot
+		end
+	end
+	for _, descendant in ipairs(object:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			return descendant.Position
+		end
+	end
+	return nil
+end
+
+local function teleportTo(position, label)
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false, "no character"
+	end
+	local target = position + Vector3.new(0, 4, 0)
+	pcall(function()
+		character:PivotTo(CFrame.new(target))
+	end)
+	root.CFrame = CFrame.new(target)
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		pcall(function()
+			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		end)
+	end
+	task.spawn(function()
+		task.wait(0.5)
+		if root.Parent and root.Position.Y < target.Y - 40 then
+			pcall(function()
+				character:PivotTo(CFrame.new(target))
+			end)
+		end
+	end)
+	return true, label
+end
+
+local function buildLevelData()
+	local orderMap = {}
+	local modules = ReplicatedStorage:FindFirstChild("Modules")
+	local config = modules and modules:FindFirstChild("DiscoveryConfig")
+	if config then
+		local ok, data = pcall(require, config)
+		if ok and type(data) == "table" and data.Levels then
+			for index, level in ipairs(data.Levels) do
+				orderMap[level.Id] = index
+			end
+		end
+	end
+
+	local seen = {}
+	local levels = workspace:FindFirstChild("Levels")
+	if levels then
+		for _, part in ipairs(levels:GetChildren()) do
+			if part:IsA("BasePart") then
+				if not seen[part.Name] then
+					seen[part.Name] = true
+					levelOptions[#levelOptions + 1] = part.Name
+					levelAnchors[part.Name] = part.Position
+				end
+			end
+		end
+	end
+
+	for name in pairs(orderMap) do
+		if not seen[name] then
+			local anchor = findAnchor(name)
+			if anchor then
+				seen[name] = true
+				levelOptions[#levelOptions + 1] = name
+				levelAnchors[name] = anchor
+			end
+		end
+	end
+
+	table.sort(levelOptions, function(a, b)
+		local orderA = orderMap[a] or 999
+		local orderB = orderMap[b] or 999
+		if orderA == orderB then
+			return a < b
+		end
+		return orderA < orderB
+	end)
+end
+
+local function buildAreaData()
+	local areas = workspace:FindFirstChild("Areas")
+	if not areas then
+		return
+	end
+	local seen = {}
+	for _, part in ipairs(areas:GetChildren()) do
+		if part:IsA("BasePart") and not seen[part.Name] then
+			seen[part.Name] = true
+			areaOptions[#areaOptions + 1] = part.Name
+			areaAnchors[part.Name] = part.Position
+		end
+	end
+	table.sort(areaOptions)
+end
+
+local function buildPlaceData()
+	for _, name in ipairs(PLACE_NAMES) do
+		local anchor = findAnchor(name)
+		if anchor then
+			placeOptions[#placeOptions + 1] = name
+			placeAnchors[name] = anchor
+		end
+	end
+end
+
+local function loadWaypoints()
+	if type(isfile) ~= "function" or type(readfile) ~= "function" then
+		return
+	end
+	if not isfile(WAYPOINT_FILE) then
+		return
+	end
+	local ok, raw = pcall(readfile, WAYPOINT_FILE)
+	if not ok or type(raw) ~= "string" or raw == "" then
+		return
+	end
+	local decodedOk, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if not decodedOk or type(decoded) ~= "table" then
+		return
+	end
+	for slot, value in pairs(decoded) do
+		if type(value) == "table" and type(value.x) == "number" then
+			waypoints[tostring(slot)] = Vector3.new(value.x, value.y, value.z)
+		end
+	end
+end
+
+local function saveWaypoints()
+	if type(writefile) ~= "function" then
+		return
+	end
+	local payload = {}
+	for slot, position in pairs(waypoints) do
+		payload[slot] = { x = position.X, y = position.Y, z = position.Z }
+	end
+	pcall(function()
+		writefile(WAYPOINT_FILE, HttpService:JSONEncode(payload))
+	end)
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "backrooms with guns - combat / visuals / teleport",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptBWG" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "BWG 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- Combat tab -----
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local AimBox = CombatTab:CreateGroupbox({ Name = "Aim", Side = "Left" })
+local WeaponBox = CombatTab:CreateGroupbox({ Name = "Weapon", Side = "Right" })
+
+AimBox:CreateToggle({
+	Name = "Aim assist",
+	Desc = "Smoothly pulls the crosshair to the closest target",
+	Flag = "AimAssist",
+	CurrentValue = true,
+})
+AimBox:CreateToggle({ Name = "FOV circle", Flag = "AimCircle", CurrentValue = true, DependsOn = "AimAssist" })
+AimBox:CreateSlider({
+	Name = "Aim FOV",
+	Range = { 40, 700 },
+	Increment = 10,
+	Suffix = " px",
+	CurrentValue = 160,
+	Flag = "AimFOV",
+	DependsOn = "AimAssist",
+})
+AimBox:CreateSlider({
+	Name = "Smoothing",
+	Range = { 1, 15 },
+	Increment = 1,
+	CurrentValue = 6,
+	Flag = "AimSmooth",
+	Desc = "Higher is slower and more human",
+	DependsOn = "AimAssist",
+})
+AimBox:CreateDropdown({
+	Name = "Aim at",
+	Options = { "Entities", "Players" },
+	MultipleOptions = true,
+	CurrentOption = { "Entities" },
+	Flag = "AimTargets",
+	DependsOn = "AimAssist",
+})
+AimBox:CreateToggle({ Name = "Head only", Flag = "AimHead", CurrentValue = true, DependsOn = "AimAssist" })
+AimBox:CreateToggle({ Name = "Only while RMB", Flag = "AimRMB", CurrentValue = true, DependsOn = "AimAssist" })
+AimBox:CreateDivider()
+AimBox:CreateToggle({
+	Name = "Silent aim",
+	Desc = "Redirects hit registration to the target head",
+	Flag = "SilentAim",
+	CurrentValue = false,
+})
+AimBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		return string.format("<Muted>%s</Muted>", escapeText(aimStatus))
+	end,
+})
+
+WeaponBox:CreateToggle({
+	Name = "No recoil",
+	Desc = "Patches camera recoil in the weapon config",
+	Flag = "NoRecoil",
+	CurrentValue = true,
+	Callback = function()
+		refreshWeaponConfig()
+	end,
+})
+WeaponBox:CreateToggle({
+	Name = "No spread",
+	Desc = "Removes bullet spread and bloom",
+	Flag = "NoSpread",
+	CurrentValue = true,
+	Callback = function()
+		refreshWeaponConfig()
+	end,
+})
+WeaponBox:CreateToggle({
+	Name = "Instant reload",
+	Flag = "InstantReload",
+	CurrentValue = false,
+	Callback = function()
+		refreshWeaponConfig()
+	end,
+})
+WeaponBox:CreateToggle({
+	Name = "Rapid fire",
+	Desc = "Overrides the weapon fire rate client-side",
+	Flag = "RapidFire",
+	CurrentValue = false,
+	Callback = function()
+		refreshWeaponConfig()
+	end,
+})
+WeaponBox:CreateSlider({
+	Name = "Fire rate",
+	Range = { 0.02, 0.4 },
+	Increment = 0.01,
+	Suffix = " s",
+	CurrentValue = 0.08,
+	Flag = "RapidRate",
+	DependsOn = "RapidFire",
+	Callback = function()
+		refreshWeaponConfig()
+	end,
+})
+WeaponBox:CreateToggle({
+	Name = "No overheat",
+	Desc = "Keeps the heat value of the held weapon at zero",
+	Flag = "NoHeat",
+	CurrentValue = true,
+})
+WeaponBox:CreateDivider()
+WeaponBox:CreateButton({
+	Name = "Re-apply weapon patch",
+	Desc = "Use after buying or swapping a weapon",
+	Callback = function()
+		local count = refreshWeaponConfig()
+		Window:Notify({ Title = "Weapon patch", Content = string.format("%d weapon(s) updated", count), Type = "Success" })
+	end,
+})
+WeaponBox:CreateStatus({
+	Name = "Weapon",
+	Style = "Row",
+	UpdateRate = 0.4,
+	Update = function()
+		local tool = currentTool()
+		if not tool then
+			return "<Muted>none</Muted>"
+		end
+		return string.format("<Accent>%s</Accent>", escapeText(tool.Name))
+	end,
+})
+
+----- Visuals tab -----
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local EntityBox = VisualsTab:CreateGroupbox({ Name = "Entities", Side = "Left" })
+local PlayerBox = VisualsTab:CreateGroupbox({ Name = "Players", Side = "Right" })
+
+EntityBox:CreateToggle({
+	Name = "Entity ESP",
+	Desc = "Track every entity on the map",
+	Flag = "EntityESP",
+	CurrentValue = true,
+})
+EntityBox:CreateDropdown({
+	Name = "Types",
+	Options = { table.unpack(ENTITY_TYPES) },
+	MultipleOptions = true,
+	CurrentOption = { table.unpack(ENTITY_TYPES) },
+	Flag = "EntityTypes",
+	DependsOn = "EntityESP",
+})
+EntityBox:CreateToggle({ Name = "Name", Flag = "EntityName", CurrentValue = true, DependsOn = "EntityESP" })
+EntityBox:CreateToggle({ Name = "Health", Flag = "EntityHealth", CurrentValue = true, DependsOn = "EntityESP" })
+EntityBox:CreateToggle({ Name = "Distance", Flag = "EntityDistance", CurrentValue = true, DependsOn = "EntityESP" })
+EntityBox:CreateToggle({ Name = "Health bar", Flag = "HealthBar", CurrentValue = true, DependsOn = "EntityESP" })
+EntityBox:CreateToggle({ Name = "Chams", Flag = "EntityChams", CurrentValue = true, DependsOn = "EntityESP" })
+EntityBox:CreateToggle({ Name = "Box", Flag = "EntityBox", CurrentValue = false, DependsOn = "EntityESP" })
+EntityBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 200, 5000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 2500,
+	Flag = "RenderDistance",
+})
+EntityBox:CreateColorPicker({ Name = "Entity color", Color = COLOR_ENTITY, Flag = "EntityColor" })
+EntityBox:CreateColorPicker({ Name = "Boss color", Color = COLOR_BOSS, Flag = "BossColor" })
+EntityBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>entities</Muted>", stats.entities)
+	end,
+})
+
+PlayerBox:CreateToggle({
+	Name = "Player ESP",
+	Desc = "Track every player in the session",
+	Flag = "PlayerESP",
+	CurrentValue = true,
+})
+PlayerBox:CreateToggle({ Name = "Name", Flag = "PlayerName", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Mode", Flag = "PlayerMode", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Health", Flag = "PlayerHealth", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Tokens", Flag = "PlayerTokens", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Distance", Flag = "PlayerDistance", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Chams", Flag = "PlayerChams", CurrentValue = true, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Box", Flag = "PlayerBox", CurrentValue = false, DependsOn = "PlayerESP" })
+PlayerBox:CreateToggle({ Name = "Tracer", Flag = "PlayerTracer", CurrentValue = false, DependsOn = "PlayerESP" })
+PlayerBox:CreateColorPicker({ Name = "Player color", Color = COLOR_PLAYER, Flag = "PlayerColor" })
+PlayerBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>players</Muted>", stats.players)
+	end,
+})
+
+----- Loot tab -----
+
+local LootTab = Window:CreateTab({ Name = "Loot", Icon = "package" })
+local PickupBox = LootTab:CreateGroupbox({ Name = "Pickups", Side = "Left" })
+local MarkerBox = LootTab:CreateGroupbox({ Name = "Markers", Side = "Right" })
+
+PickupBox:CreateToggle({
+	Name = "Pickup ESP",
+	Desc = "Highlight weapons, medkits and ammo on the floor",
+	Flag = "PickupESP",
+	CurrentValue = false,
+})
+PickupBox:CreateDropdown({
+	Name = "Types",
+	Options = { table.unpack(PICKUP_TYPES) },
+	MultipleOptions = true,
+	CurrentOption = { table.unpack(PICKUP_TYPES) },
+	Flag = "PickupTypes",
+	DependsOn = "PickupESP",
+})
+PickupBox:CreateToggle({ Name = "Name", Flag = "PickupName", CurrentValue = true, DependsOn = "PickupESP" })
+PickupBox:CreateToggle({ Name = "Distance", Flag = "PickupDistance", CurrentValue = true, DependsOn = "PickupESP" })
+PickupBox:CreateToggle({ Name = "Chams", Flag = "PickupChams", CurrentValue = true, DependsOn = "PickupESP" })
+PickupBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 50, 2000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 300,
+	Flag = "PickupRenderDistance",
+	DependsOn = "PickupESP",
+})
+PickupBox:CreateColorPicker({ Name = "Pickup color", Color = COLOR_PICKUP, Flag = "PickupColor" })
+PickupBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>pickups</Muted>", stats.pickups)
+	end,
+})
+
+MarkerBox:CreateToggle({ Name = "Shops", Flag = "MarkerShops", CurrentValue = false })
+MarkerBox:CreateToggle({ Name = "Dummies", Flag = "MarkerDummies", CurrentValue = false })
+MarkerBox:CreateToggle({ Name = "Boss", Flag = "MarkerBoss", CurrentValue = false })
+MarkerBox:CreateDivider()
+
+----- Teleport tab -----
+
+local TeleportTab = Window:CreateTab({ Name = "Teleport", Icon = "map-pin" })
+local TravelBox = TeleportTab:CreateGroupbox({ Name = "Travel", Side = "Left" })
+local WaypointBox = TeleportTab:CreateGroupbox({ Name = "Waypoints", Side = "Right" })
+
+local LevelDropdown = TravelBox:CreateDropdown({
+	Name = "Level",
+	Options = { "loading" },
+	CurrentOption = "The Lobby",
+	Flag = "LevelTarget",
+})
+local AreaDropdown = TravelBox:CreateDropdown({
+	Name = "Area",
+	Options = { "loading" },
+	CurrentOption = "MainRoom",
+	Flag = "AreaTarget",
+})
+local SpawnDropdown = TravelBox:CreateDropdown({
+	Name = "Spawn point",
+	Options = { "Enemy spawn", "Boss spawn", "Ammo crate" },
+	CurrentOption = "Enemy spawn",
+	Flag = "SpawnTarget",
+})
+local PlaceDropdown = TravelBox:CreateDropdown({
+	Name = "Place",
+	Options = { "loading" },
+	CurrentOption = "loading",
+	Flag = "PlaceTarget",
+})
+
+local function doTeleport(position, label)
+	if not position then
+		Window:Notify({ Title = "Teleport", Content = "Anchor not found", Type = "Warning" })
+		return
+	end
+	local ok, err = teleportTo(position, label)
+	if ok then
+		Window:Notify({ Title = "Teleport", Content = string.format("Moved to %s", tostring(label)), Type = "Success" })
+	else
+		Window:Notify({ Title = "Teleport", Content = tostring(err), Type = "Error" })
+	end
+end
+
+TravelBox:CreateButton({
+	Name = "Go to level",
+	Desc = "Uses the level zone parts",
+	Style = "Primary",
+	Callback = function()
+		local name = flag("LevelTarget", levelOptions[1])
+		doTeleport(levelAnchors[name], name)
+	end,
+})
+TravelBox:CreateButton({
+	Name = "Go to area",
+	Desc = "Uses the area trigger parts",
+	Callback = function()
+		local name = flag("AreaTarget", areaOptions[1])
+		doTeleport(areaAnchors[name], name)
+	end,
+})
+TravelBox:CreateButton({
+	Name = "Go to spawn point",
+	Desc = "Random point from the selected spawn folder",
+	Callback = function()
+		local label = flag("SpawnTarget", "Enemy spawn")
+		local folderName = SPAWN_FOLDERS[label]
+		local folder = folderName and workspace:FindFirstChild(folderName)
+		if not folder or #folder:GetChildren() == 0 then
+			Window:Notify({ Title = "Teleport", Content = "Spawn folder is empty", Type = "Warning" })
+			return
+		end
+		local point = folder:GetChildren()[math.random(1, #folder:GetChildren())]
+		doTeleport(point:IsA("BasePart") and point.Position or findAnchor(point.Name), label)
+	end,
+})
+TravelBox:CreateButton({
+	Name = "Go to place",
+	Desc = "Shops, boss, dummies, special rooms",
+	Callback = function()
+		local name = flag("PlaceTarget", placeOptions[1])
+		doTeleport(placeAnchors[name], name)
+	end,
+})
+
+WaypointBox:CreateDropdown({
+	Name = "Slot",
+	Options = { "1", "2", "3" },
+	CurrentOption = "1",
+	Flag = "WaypointSlot",
+})
+WaypointBox:CreateButton({
+	Name = "Save position",
+	Callback = function()
+		local root = characterRoot()
+		if not root then
+			return
+		end
+		local slot = tostring(flag("WaypointSlot", "1"))
+		waypoints[slot] = root.Position
+		saveWaypoints()
+		Window:Notify({ Title = "Waypoint", Content = string.format("Slot %s saved", slot), Type = "Success" })
+	end,
+})
+WaypointBox:CreateButton({
+	Name = "Go to position",
+	Callback = function()
+		local slot = tostring(flag("WaypointSlot", "1"))
+		local position = waypoints[slot]
+		if not position then
+			Window:Notify({ Title = "Waypoint", Content = string.format("Slot %s is empty", slot), Type = "Warning" })
+			return
+		end
+		doTeleport(position, string.format("waypoint %s", slot))
+	end,
+})
+WaypointBox:CreateButton({
+	Name = "Clear slot",
+	Callback = function()
+		local slot = tostring(flag("WaypointSlot", "1"))
+		waypoints[slot] = nil
+		saveWaypoints()
+		Window:Notify({ Title = "Waypoint", Content = string.format("Slot %s cleared", slot), Type = "Info" })
+	end,
+})
+WaypointBox:CreateDivider()
+WaypointBox:CreateStatus({
+	Name = "Saved slots",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local count = 0
+		for _ in pairs(waypoints) do
+			count = count + 1
+		end
+		return string.format("<Success>%d</Success> <Muted>of 3</Muted>", count)
+	end,
+})
+
+----- World tab -----
+
+local WorldTab = Window:CreateTab({ Name = "World", Icon = "sun" })
+local LightBox = WorldTab:CreateGroupbox({ Name = "Light and screen", Side = "Left" })
+local MoveBox = WorldTab:CreateGroupbox({ Name = "Movement", Side = "Right" })
+
+LightBox:CreateToggle({
+	Name = "Fullbright",
+	Desc = "Time, ambient, fog and atmosphere",
+	Flag = "Fullbright",
+	CurrentValue = false,
+	Callback = function(on)
+		setFullbright(on)
+	end,
+})
+LightBox:CreateSlider({
+	Name = "Field of view",
+	Range = { 70, 120 },
+	Increment = 1,
+	CurrentValue = 70,
+	Flag = "FovValue",
+})
+LightBox:CreateToggle({ Name = "No camera bobble", Flag = "NoBobble", CurrentValue = false })
+LightBox:CreateToggle({ Name = "No screen shake", Flag = "NoShake", CurrentValue = false })
+LightBox:CreateToggle({ Name = "No vignette", Flag = "NoVignette", CurrentValue = false })
+LightBox:CreateToggle({ Name = "No VHS", Flag = "NoVHS", CurrentValue = false })
+LightBox:CreateToggle({ Name = "No damage numbers", Flag = "NoDamageNumbers", CurrentValue = false })
+
+MoveBox:CreateToggle({ Name = "Custom speed", Flag = "SpeedEnabled", CurrentValue = false })
+MoveBox:CreateSlider({
+	Name = "Walk speed",
+	Range = { 16, 200 },
+	Increment = 1,
+	CurrentValue = 32,
+	Flag = "WalkSpeed",
+	DependsOn = "SpeedEnabled",
+})
+MoveBox:CreateToggle({ Name = "Custom jump", Flag = "JumpEnabled", CurrentValue = false })
+MoveBox:CreateSlider({
+	Name = "Jump power",
+	Range = { 50, 300 },
+	Increment = 5,
+	CurrentValue = 80,
+	Flag = "JumpPower",
+	DependsOn = "JumpEnabled",
+})
+MoveBox:CreateToggle({ Name = "Infinite jump", Flag = "InfiniteJump", CurrentValue = false })
+MoveBox:CreateDivider()
+MoveBox:CreateToggle({
+	Name = "Noclip",
+	Flag = "Noclip",
+	CurrentValue = false,
+	Callback = function(on)
+		setNoclip(on)
+	end,
+})
+MoveBox:CreateToggle({
+	Name = "Fly",
+	Flag = "Fly",
+	CurrentValue = false,
+	Callback = function(on)
+		setFly(on)
+	end,
+})
+MoveBox:CreateSlider({
+	Name = "Fly speed",
+	Range = { 20, 220 },
+	Increment = 10,
+	Suffix = " studs/s",
+	CurrentValue = 60,
+	Flag = "FlySpeed",
+	DependsOn = "Fly",
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----- Runtime -----
+
+resetFlagCache()
+loadWaypoints()
+buildLevelData()
+buildAreaData()
+buildPlaceData()
+
+if #levelOptions > 0 then
+	pcall(function()
+		LevelDropdown:SetOptions(levelOptions, { KeepSelection = false, Silent = true })
+		LevelDropdown:Set(levelOptions[1])
+	end)
+end
+if #areaOptions > 0 then
+	pcall(function()
+		AreaDropdown:SetOptions(areaOptions, { KeepSelection = false, Silent = true })
+		AreaDropdown:Set(areaOptions[1])
+	end)
+end
+if #placeOptions > 0 then
+	pcall(function()
+		PlaceDropdown:SetOptions(placeOptions, { KeepSelection = false, Silent = true })
+		PlaceDropdown:Set(placeOptions[1])
+	end)
+end
+
+local collectAccumulator = 0
+local visualAccumulator = 0
+local weaponAccumulator = 0
+local worldAccumulator = 0
+local markerAccumulator = 0
+
+local renderConnection = RunService.RenderStepped:Connect(function()
+	if not running then
+		return
+	end
+	pcall(updateFovCircle)
+	pcall(stepAim)
+	pcall(updateFly)
+	pcall(enforceSpeed)
+end)
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	collectAccumulator = collectAccumulator + deltaTime
+	visualAccumulator = visualAccumulator + deltaTime
+	weaponAccumulator = weaponAccumulator + deltaTime
+	worldAccumulator = worldAccumulator + deltaTime
+	markerAccumulator = markerAccumulator + deltaTime
+
+	if collectAccumulator >= COLLECT_INTERVAL then
+		collectAccumulator = 0
+		pcall(collectTargets)
+	end
+
+	if visualAccumulator >= VISUAL_INTERVAL then
+		visualAccumulator = 0
+		for _, target in pairs(targets) do
+			pcall(updateTarget, target)
+		end
+		updateStats()
+	end
+
+	if weaponAccumulator >= WEAPON_INTERVAL then
+		weaponAccumulator = 0
+		pcall(refreshWeaponConfig)
+		pcall(applyNoHeat)
+	end
+
+	if worldAccumulator >= 0.2 then
+		worldAccumulator = 0
+		pcall(enforceMovement)
+		pcall(setCameraFov)
+		pcall(applyGraphicsToggles)
+		pcall(applyFullbright)
+	end
+
+	if markerAccumulator >= 1 then
+		markerAccumulator = 0
+		pcall(collectMarkers)
+	end
+end)
+
+local jumpConnection = UserInputService.JumpRequest:Connect(function()
+	if not running or not flag("InfiniteJump", false) then
+		return
+	end
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		pcall(function()
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end)
+	end
+end)
+
+local OFF_FLAGS = {
+	"EntityESP",
+	"PlayerESP",
+	"PickupESP",
+	"MarkerShops",
+	"MarkerDummies",
+	"MarkerBoss",
+	"AimAssist",
+	"SilentAim",
+	"RapidFire",
+	"NoRecoil",
+	"NoSpread",
+	"InstantReload",
+	"NoHeat",
+	"Fullbright",
+	"NoBobble",
+	"NoShake",
+	"NoVignette",
+	"NoVHS",
+	"NoDamageNumbers",
+	"SpeedEnabled",
+	"JumpEnabled",
+	"InfiniteJump",
+	"Noclip",
+	"Fly",
+}
+
+-- Panic turns every gameplay toggle off and restores what the script changed.
+local function panic()
+	for _, name in ipairs(OFF_FLAGS) do
+		setFlag(name, false)
+	end
+	clearAllTargets()
+	clearMarkers()
+	setFullbright(false)
+	setFly(false)
+	setNoclip(false)
+	restoreWeaponConfig()
+	applyGraphicsToggles()
+end
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(panic)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	pcall(function()
+		renderConnection:Disconnect()
+	end)
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		jumpConnection:Disconnect()
+	end)
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	uninstallSilentAim()
+	pcall(panic)
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptBWG then
+		getgenv().RobScriptBWG = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptBWG = {
+	Version = "1.0",
+	Actions = {
+		Refresh = collectTargets,
+		Clear = clearAllTargets,
+		Teleport = teleportTo,
+		Fullbright = setFullbright,
+		ApplyWeapon = refreshWeaponConfig,
+		InstallSilentAim = installSilentAim,
+		Destroy = destroy,
+	},
+	GetStats = function()
+		return { entities = stats.entities, players = stats.players, pickups = stats.pickups }
+	end,
+	GetTargets = function()
+		local list = {}
+		for model, target in pairs(targets) do
+			list[#list + 1] = {
+				name = (target.player and target.player.Name) or model.Name,
+				kind = target.kind,
+				visible = target.hasVisual,
+				chams = target.highlight ~= nil,
+			}
+		end
+		return list
+	end,
+	GetLevels = function()
+		return levelOptions, levelAnchors
+	end,
+	GetAimTarget = function()
+		return aimTarget
+	end,
+	GetSilentAimReady = function()
+		return silentAimInstalled
+	end,
+	ProbeAim = function()
+		local result = pickAimTarget(3)
+		if not result then
+			return nil
+		end
+		return { name = targetName(result.target), kind = result.target.kind, distance = result.distance }
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+-- Silent aim needs the namecall hook once; the toggle only switches the flag.
+pcall(installSilentAim)
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+Window:Notify({ Title = "Robscript Team", Content = "The Backrooms With Guns is ready", Type = "Success" })
+
+return getgenv().RobScriptBWG
