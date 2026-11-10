@@ -1,0 +1,1410 @@
+--[[
+    30 Floors Up - Robscript Team
+    Version 1.0 | Info, ESP, Scavenge, Survival
+
+    The game is server-authoritative: every interaction goes through the
+    Act RemoteFunction, and the server rejects anything further than about
+    nine studs away ("Too far away - step closer to it"). Auto loot
+    therefore moves the character next to the item first and only then asks
+    the server to pick it up. Hunger, thirst, stamina and the water stores
+    are read-only mirrors of the server state; nothing here writes them.
+]]
+
+local VERSION = "1.0"
+local HUB_NAME = "30 Floors Up"
+local CONFIG_FOLDER = "RobScript30Floors"
+
+--------------------------------------------------------------------------------
+-- Services
+--------------------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local lastError = nil
+
+local function reportError(where, err)
+	lastError = tostring(where) .. ": " .. tostring(err)
+	warn("[30 Floors Up] " .. lastError)
+end
+
+if not ReplicatedStorage:FindFirstChild("TFU") then
+	ReplicatedStorage:WaitForChild("TFU", 15)
+end
+
+--------------------------------------------------------------------------------
+-- Airflow UI
+--------------------------------------------------------------------------------
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[30 Floors Up] Airflow UI could not be loaded")
+end
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+local Window = Airflow:CreateWindow({
+	Name = HUB_NAME,
+	LoadingSubtitle = "info, esp, scavenge, survival",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = CONFIG_FOLDER },
+	Home = {
+		Title = HUB_NAME,
+		Welcome = "Welcome back,",
+		Tier = "v" .. VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+--------------------------------------------------------------------------------
+-- Game access
+--------------------------------------------------------------------------------
+
+local function tfuRoot()
+	return ReplicatedStorage:FindFirstChild("TFU")
+end
+
+local function remotesFolder()
+	local root = tfuRoot()
+	return root and root:FindFirstChild("Remotes")
+end
+
+local function stateFolder()
+	local root = tfuRoot()
+	return root and root:FindFirstChild("State")
+end
+
+local function remoteObject(name)
+	local remotes = remotesFolder()
+	if not remotes then
+		return nil
+	end
+	return remotes:FindFirstChild(name)
+end
+
+local function playerAttr(name, fallback)
+	local value = LocalPlayer:GetAttribute(name)
+	if value == nil then
+		return fallback
+	end
+	return value
+end
+
+local function stateAttr(name, fallback)
+	local folder = stateFolder()
+	if not folder then
+		return fallback
+	end
+	local value = folder:GetAttribute(name)
+	if value == nil then
+		return fallback
+	end
+	return value
+end
+
+local function characterPart()
+	local character = LocalPlayer.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function worldRoot()
+	return workspace:FindFirstChild("TFU")
+end
+
+local function itemsFolder()
+	local root = worldRoot()
+	return root and root:FindFirstChild("Items")
+end
+
+local function npcFolder()
+	local root = worldRoot()
+	return root and root:FindFirstChild("NPCs")
+end
+
+local function clockText(hour)
+	local value = tonumber(hour) or 0
+	local h = math.floor(value)
+	local m = math.floor((value - h) * 60)
+	return string.format("%02d:%02d", h % 24, m)
+end
+
+local function escapeRich(text)
+	local value = tostring(text or "")
+	value = value:gsub("&", "&amp;")
+	value = value:gsub("<", "&lt;")
+	value = value:gsub(">", "&gt;")
+	return value
+end
+
+local function stateSnapshot()
+	return {
+		day = tonumber(stateAttr("day", 0)) or 0,
+		hour = tonumber(stateAttr("hour", 0)) or 0,
+		phase = tostring(stateAttr("phase", "?")),
+		objective = tostring(stateAttr("Objective", "?")),
+		objectiveDetail = tostring(stateAttr("ObjectiveDetail", "")),
+		difficulty = tostring(stateAttr("Difficulty", "?")),
+		foodDays = stateAttr("FoodDays", 0),
+		waterDays = stateAttr("WaterDays", 0),
+		tank = tonumber(stateAttr("TankL", 0)) or 0,
+		riser = tonumber(stateAttr("RiserL", 0)) or 0,
+		cistern = tonumber(stateAttr("CisternL", 0)) or 0,
+		heater = tonumber(stateAttr("HeaterL", 0)) or 0,
+		cleanStock = tonumber(stateAttr("StockClean", 0)) or 0,
+		untreatedStock = tonumber(stateAttr("StockUntreated", 0)) or 0,
+		foodStock = tonumber(stateAttr("StockFood", 0)) or 0,
+		sleepAllowed = stateAttr("SleepAllowed", false) == true,
+		sleepWhy = tostring(stateAttr("SleepWhy", "")),
+		partySize = stateAttr("partySize", 1),
+		hostName = tostring(stateAttr("HostName", "")),
+	}
+end
+
+local function vitals()
+	return {
+		food = tonumber(playerAttr("Hunger", 100)) or 100,
+		thirst = tonumber(playerAttr("Thirst", 100)) or 100,
+		stamina = tonumber(playerAttr("Stamina", 100)) or 100,
+		fatigue = tonumber(playerAttr("Fatigue", 0)) or 0,
+		health = tonumber(playerAttr("Health", 100)) or 100,
+		held = tostring(playerAttr("Held", "")),
+		downed = playerAttr("Downed", false) == true,
+		dead = playerAttr("Dead", false) == true,
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Item knowledge
+--------------------------------------------------------------------------------
+
+local CATEGORY_ORDER = { "Food", "Water", "Medical", "Keys", "Weapons", "Tools", "Notes", "Gear", "Other" }
+
+local CATEGORY_COLORS = {
+	Food = Color3.fromRGB(255, 176, 96),
+	Water = Color3.fromRGB(96, 196, 255),
+	Medical = Color3.fromRGB(120, 230, 150),
+	Keys = Color3.fromRGB(255, 224, 110),
+	Weapons = Color3.fromRGB(255, 104, 120),
+	Tools = Color3.fromRGB(180, 176, 255),
+	Notes = Color3.fromRGB(255, 244, 220),
+	Gear = Color3.fromRGB(150, 150, 165),
+	Other = Color3.fromRGB(200, 200, 210),
+}
+
+local ITEM_CATEGORY = {}
+
+local function assignCategory(category, names)
+	for _, name in ipairs(names) do
+		ITEM_CATEGORY[name] = category
+	end
+end
+
+assignCategory("Food", {
+	"CanRed", "CanYellow", "CanGreen", "CanBlue", "Crackers", "RiceBag",
+	"Leftovers", "RawPigeon", "CookedPigeon", "Greens", "StewPot",
+})
+
+assignCategory("Water", {
+	"Bottle1L", "Bottle2L", "Bucket", "Jerrycan20L", "RainBarrel",
+})
+
+assignCategory("Medical", {
+	"Bandage", "PinPack", "Tablets", "Rags",
+})
+
+assignCategory("Keys", {
+	"ClinicKey", "DropKey", "Key3002", "Key3005", "Key3008P", "KeyBuckle",
+	"SmallKey", "StorageKey", "MaintKey", "MaintTag",
+})
+
+assignCategory("Weapons", {
+	"Bat", "Deadweight", "Knife", "Lucille", "RollingPin", "Spoon", "NoiseMaker",
+})
+
+assignCategory("Tools", {
+	"AntennaAmp", "BatteryPack", "Blanket", "Board", "BoltCutters", "BobbyPins",
+	"CanOpener", "CoaxReel", "CookPot", "Crowbar", "FryingPan", "FuelCan",
+	"GasStove", "Hammer", "HandCrank", "Hose", "Kite", "MeshRoll", "Nails",
+	"Pencil", "PenOil", "Planks", "Pliers", "Receiver", "Rope", "Screwdriver",
+	"Screws", "SeedPacket", "SleepingBag", "SleepingBagLaid", "StaticLine",
+	"Toolbox", "TrapKit", "Trolley", "Wedge", "WireSpool", "Wrench", "HiVis",
+})
+
+assignCategory("Notes", { "Note", "Rulebook" })
+
+assignCategory("Gear", {
+	"Batteries", "Candle", "CellPhone", "Flashlight", "Headlamp", "Lantern",
+	"Phone", "Radio", "Daypack", "HikingPack", "MilitaryPack", "ShoppingBag",
+	"HouseBag", "RopeBasket", "CardboardBox",
+})
+
+local FOOD_SET = {}
+for _, name in ipairs({ "CanRed", "CanYellow", "CanGreen", "CanBlue", "Crackers", "RiceBag", "Leftovers", "CookedPigeon", "Greens", "StewPot" }) do
+	FOOD_SET[name] = true
+end
+
+local function categoryOf(itemName)
+	if type(itemName) ~= "string" or itemName == "" then
+		return "Other"
+	end
+	return ITEM_CATEGORY[itemName] or "Other"
+end
+
+local function itemPosition(model)
+	local ok, position = pcall(function()
+		return model:GetPivot().Position
+	end)
+	if ok and typeof(position) == "Vector3" then
+		return position
+	end
+	local part = model:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function itemBounds(model)
+	local ok, position, size = pcall(function()
+		local cframe, bounds = model:GetBoundingBox()
+		return cframe.Position, bounds
+	end)
+	if ok and typeof(position) == "Vector3" and typeof(size) == "Vector3" then
+		return position, size
+	end
+	local part = model:FindFirstChildWhichIsA("BasePart", true)
+	if part then
+		return part.Position, part.Size
+	end
+	return nil, nil
+end
+
+--------------------------------------------------------------------------------
+-- Drawing (ESP)
+--------------------------------------------------------------------------------
+
+local function drawingLibrary()
+	return rawget(getgenv(), "Drawing") or rawget(getfenv(0), "Drawing")
+end
+
+local function drawingAvailable()
+	local library = drawingLibrary()
+	return type(library) == "table" and type(library.new) == "function"
+end
+
+local function newDrawing(kind)
+	local library = drawingLibrary()
+	if type(library) ~= "table" then
+		return nil
+	end
+	local ok, object = pcall(library.new, kind)
+	if ok then
+		return object
+	end
+	return nil
+end
+
+local function createVisual()
+	local box = newDrawing("Square")
+	local label = newDrawing("Text")
+	if box then
+		box.Thickness = 1
+		box.Filled = false
+		box.Visible = false
+	end
+	if label then
+		label.Size = 14
+		label.Center = false
+		label.Outline = true
+		label.Visible = false
+	end
+	return { box = box, label = label }
+end
+
+local function destroyVisual(visual)
+	if not visual then
+		return
+	end
+	if visual.box then
+		pcall(function()
+			visual.box:Remove()
+		end)
+	end
+	if visual.label then
+		pcall(function()
+			visual.label:Remove()
+		end)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- ESP
+--------------------------------------------------------------------------------
+
+local ESP = {
+	Enabled = false,
+	MaxDistance = 250,
+	ShowInfected = true,
+	ShowDistance = true,
+	Categories = { Food = true, Water = true, Medical = true, Keys = true, Weapons = true, Notes = true },
+	targets = {},
+	visuals = {},
+	scanAt = 0,
+	drawingOk = drawingAvailable(),
+}
+
+local INFECTED_COLOR = Color3.fromRGB(255, 70, 70)
+
+local function espCategoryEnabled(category)
+	if category == "Infected" then
+		return ESP.ShowInfected
+	end
+	if category == "Other" then
+		return ESP.Categories.Other == true
+	end
+	return ESP.Categories[category] == true
+end
+
+local function scanTargets()
+	local list = {}
+	local origin = characterPart()
+	if not origin then
+		return list
+	end
+	local originPos = origin.Position
+
+	local items = itemsFolder()
+	if items then
+		for _, model in ipairs(items:GetChildren()) do
+			if model:IsA("Model") then
+				local itemName = model:GetAttribute("Item")
+				local uid = model:GetAttribute("Uid")
+				if itemName and uid and model:GetAttribute("NoTake") ~= true then
+					local category = categoryOf(itemName)
+					if espCategoryEnabled(category) then
+						local position, size = itemBounds(model)
+						if position and (position - originPos).Magnitude <= ESP.MaxDistance then
+							list[#list + 1] = {
+								object = model,
+								position = position,
+								size = size or Vector3.new(2, 2, 2),
+								category = category,
+								label = itemName,
+								live = false,
+							}
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local npcs = npcFolder()
+	if npcs and ESP.ShowInfected then
+		for _, model in ipairs(npcs:GetChildren()) do
+			if model:IsA("Model") and model:GetAttribute("Infected") == true then
+				local position = itemPosition(model)
+				if position and (position - originPos).Magnitude <= ESP.MaxDistance then
+					list[#list + 1] = {
+						object = model,
+						position = position,
+						size = Vector3.new(3, 5.5, 3),
+						category = "Infected",
+						label = string.format("%s [%s]", tostring(model:GetAttribute("DisplayName") or model.Name), tostring(model:GetAttribute("InfKind") or "Infected")),
+						live = true,
+					}
+				end
+			end
+		end
+	end
+
+	return list
+end
+
+local function projectBounds(camera, position, size)
+	local half = size * 0.5
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+	local visible = false
+	for _, x in ipairs({ -1, 1 }) do
+		for _, y in ipairs({ -1, 1 }) do
+			for _, z in ipairs({ -1, 1 }) do
+				local world = position + Vector3.new(half.X * x, half.Y * y, half.Z * z)
+				local screen, onScreen = camera:WorldToViewportPoint(world)
+				if screen.Z > 0 and onScreen then
+					visible = true
+					minX = math.min(minX, screen.X)
+					minY = math.min(minY, screen.Y)
+					maxX = math.max(maxX, screen.X)
+					maxY = math.max(maxY, screen.Y)
+				end
+			end
+		end
+	end
+	if not visible or maxX <= minX or maxY <= minY then
+		return nil
+	end
+	return minX, minY, maxX, maxY
+end
+
+local function updateVisuals()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local origin = characterPart()
+	local originPos = origin and origin.Position or Vector3.zero
+	local seen = {}
+
+	for _, entry in ipairs(ESP.targets) do
+		local visual = ESP.visuals[entry.object]
+		if not visual then
+			visual = createVisual()
+			ESP.visuals[entry.object] = visual
+		end
+
+		local position = entry.position
+		if entry.live then
+			local live = itemPosition(entry.object)
+			if live then
+				position = live
+				entry.position = live
+			end
+		end
+
+		local distance = (position - originPos).Magnitude
+		local minX, minY, maxX, maxY = nil, nil, nil, nil
+		if distance <= ESP.MaxDistance then
+			minX, minY, maxX, maxY = projectBounds(camera, position, entry.size)
+		end
+
+		if minX and visual.box and visual.label then
+			local color = entry.category == "Infected" and INFECTED_COLOR or CATEGORY_COLORS[entry.category] or CATEGORY_COLORS.Other
+
+			visual.box.Color = color
+			visual.box.Position = Vector2.new(minX, minY)
+			visual.box.Size = Vector2.new(maxX - minX, maxY - minY)
+			visual.box.Visible = true
+
+			visual.label.Text = ESP.ShowDistance and string.format("%s  %.0f", entry.label, distance) or entry.label
+			visual.label.Color = color
+			visual.label.Position = Vector2.new(minX, minY - 16)
+			visual.label.Visible = true
+
+			seen[entry.object] = true
+		end
+	end
+
+	for object, visual in pairs(ESP.visuals) do
+		if not seen[object] then
+			if visual.box then
+				visual.box.Visible = false
+			end
+			if visual.label then
+				visual.label.Visible = false
+			end
+		end
+	end
+end
+
+local function clearVisuals()
+	for object, visual in pairs(ESP.visuals) do
+		destroyVisual(visual)
+		ESP.visuals[object] = nil
+	end
+	ESP.targets = {}
+end
+
+--------------------------------------------------------------------------------
+-- Act bridge
+--------------------------------------------------------------------------------
+
+local function callAct(payload)
+	local act = remoteObject("Act")
+	if not act then
+		return { ok = false, msg = "Act remote missing" }
+	end
+	local ok, result = pcall(function()
+		return act:InvokeServer(payload)
+	end)
+	if not ok then
+		return { ok = false, msg = tostring(result) }
+	end
+	if type(result) ~= "table" then
+		return { ok = false, msg = "no answer" }
+	end
+	return result
+end
+
+--------------------------------------------------------------------------------
+-- Auto loot
+--------------------------------------------------------------------------------
+
+local Loot = {
+	Running = false,
+	Radius = 220,
+	Delay = 0.35,
+	Categories = { Food = true, Water = true, Medical = true, Keys = true, Tools = true, Weapons = true, Notes = true, Gear = true },
+	Picked = 0,
+	Failed = 0,
+	Blacklist = {},
+	lastMessage = "",
+}
+
+local function lootCategoryEnabled(category)
+	if category == "Other" then
+		return Loot.Categories.Other == true
+	end
+	return Loot.Categories[category] == true
+end
+
+local function isBlacklisted(uid)
+	local untilTime = Loot.Blacklist[uid]
+	if not untilTime then
+		return false
+	end
+	if os.clock() >= untilTime then
+		Loot.Blacklist[uid] = nil
+		return false
+	end
+	return true
+end
+
+local function blacklist(uid, seconds)
+	Loot.Blacklist[uid] = os.clock() + (seconds or 90)
+end
+
+local function chooseLootTarget()
+	local folder = itemsFolder()
+	local origin = characterPart()
+	if not (folder and origin) then
+		return nil
+	end
+	local originPos = origin.Position
+	local best, bestDistance = nil, math.huge
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") then
+			local itemName = model:GetAttribute("Item")
+			local uid = model:GetAttribute("Uid")
+			if itemName and uid and model:GetAttribute("NoTake") ~= true and not model:GetAttribute("LatchedIn") then
+				if not isBlacklisted(uid) and lootCategoryEnabled(categoryOf(itemName)) then
+					local position = itemPosition(model)
+					if position then
+						local distance = (position - originPos).Magnitude
+						if distance <= Loot.Radius and distance < bestDistance then
+							best = { model = model, uid = uid, position = position, itemName = itemName }
+							bestDistance = distance
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function teleportNextTo(position)
+	local root = characterPart()
+	if not root then
+		return false
+	end
+	local current = root.Position
+	local horizontal = Vector3.new(current.X - position.X, 0, current.Z - position.Z)
+	if horizontal.Magnitude < 0.5 then
+		horizontal = Vector3.new(0, 0, 1)
+	end
+	horizontal = horizontal.Unit
+	local stand = position + horizontal * 2.4
+	local y = position.Y + 2.6
+	if math.abs(current.Y - position.Y) < 5 then
+		y = current.Y
+	end
+	pcall(function()
+		root.CFrame = CFrame.new(Vector3.new(stand.X, y, stand.Z))
+		root.AssemblyLinearVelocity = Vector3.zero
+	end)
+	task.wait(0.12)
+	return true
+end
+
+local function requestPickup(uid)
+	local root = characterPart()
+	if not root then
+		return { ok = false, msg = "no character" }
+	end
+	return callAct({
+		kind = "item",
+		action = "pickup",
+		uid = uid,
+		from = root.Position,
+	})
+end
+
+local function pickupItem(target)
+	local result = requestPickup(target.uid)
+	if result and result.ok == true then
+		Loot.Picked = Loot.Picked + 1
+		Loot.lastMessage = "took " .. tostring(target.itemName)
+		return true
+	end
+
+	local message = result and tostring(result.msg or "") or "no answer"
+	if message:find("Too far", 1, true) then
+		teleportNextTo(target.position)
+		local retry = requestPickup(target.uid)
+		if retry and retry.ok == true then
+			Loot.Picked = Loot.Picked + 1
+			Loot.lastMessage = "took " .. tostring(target.itemName)
+			return true
+		end
+		message = retry and tostring(retry.msg or message) or message
+	end
+
+	Loot.Failed = Loot.Failed + 1
+	Loot.lastMessage = message
+	blacklist(target.uid, 90)
+	return false
+end
+
+local lootThread = nil
+
+local function startLoot()
+	if Loot.Running then
+		return
+	end
+	Loot.Running = true
+	lootThread = task.spawn(function()
+		while Loot.Running do
+			local ok, err = pcall(function()
+				local target = chooseLootTarget()
+				if not target then
+					task.wait(0.8)
+					return
+				end
+				teleportNextTo(target.position)
+				if Loot.Running then
+					pickupItem(target)
+				end
+			end)
+			if not ok then
+				reportError("auto loot", err)
+				task.wait(1)
+			end
+			task.wait(Loot.Delay)
+		end
+	end)
+end
+
+local function stopLoot()
+	Loot.Running = false
+end
+
+--------------------------------------------------------------------------------
+-- Survival
+--------------------------------------------------------------------------------
+
+local Survival = {
+	WarnFood = 35,
+	WarnThirst = 35,
+	WarnStamina = 15,
+	AutoEat = false,
+	AutoDrink = false,
+	lastEat = 0,
+	lastDrink = 0,
+	lastWarning = 0,
+}
+
+local function consumeHeld(action)
+	local root = characterPart()
+	if not root then
+		return false
+	end
+	local result = callAct({
+		kind = "none",
+		action = action,
+		from = root.Position,
+	})
+	if result and result.ok == true then
+		return true
+	end
+	if result and result.msg and tostring(result.msg) ~= "" then
+		Loot.lastMessage = tostring(result.msg)
+	end
+	return false
+end
+
+local function threatText()
+	local snapshot = stateSnapshot()
+	local day = snapshot.day
+	local hour = snapshot.hour
+	local parts = { "Raid on day 3 at 11:00", "Rain on day 6", "Migration on day 15 at 19:00" }
+
+	if day == 3 and hour >= 11 and hour <= 15.5 then
+		return "<Error>Raid is running right now</Error>"
+	end
+	if day == 15 and hour >= 19 and hour <= 23.5 then
+		return "<Error>Migration is running right now</Error>"
+	end
+	if day < 3 then
+		parts[1] = string.format("Raid in %d day(s)", 3 - day)
+	end
+	return table.concat(parts, "  |  ")
+end
+
+--------------------------------------------------------------------------------
+-- UI
+--------------------------------------------------------------------------------
+
+local Log = nil
+
+local function pushLog(text)
+	if Log then
+		pcall(function()
+			Log:Push(text)
+		end)
+	end
+end
+
+local InfoTab = Window:CreateTab({ Name = "Info", Icon = "activity" })
+local InfoLeft = InfoTab:CreateGroupbox({ Name = "Run", Side = "Left" })
+local InfoRight = InfoTab:CreateGroupbox({ Name = "Stores", Side = "Right" })
+
+InfoLeft:CreateStatus({
+	Name = "Day",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local snapshot = stateSnapshot()
+		return string.format("Day %d  |  %s  |  %s", snapshot.day, clockText(snapshot.hour), snapshot.phase)
+	end,
+})
+
+InfoLeft:CreateStatus({
+	Name = "Vitals",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local v = vitals()
+		local food = v.food < Survival.WarnFood and "<Error>" .. math.floor(v.food) .. "</Error>" or math.floor(v.food)
+		local thirst = v.thirst < Survival.WarnThirst and "<Error>" .. math.floor(v.thirst) .. "</Error>" or math.floor(v.thirst)
+		local stamina = v.stamina < Survival.WarnStamina and "<Warning>" .. math.floor(v.stamina) .. "</Warning>" or math.floor(v.stamina)
+		return string.format("Food %s  |  Water %s  |  Stamina %s  |  Fatigue %.0f", food, thirst, stamina, v.fatigue)
+	end,
+})
+
+InfoLeft:CreateLabel({
+	Name = "Objective",
+	UpdateRate = 1,
+	Update = function()
+		local snapshot = stateSnapshot()
+		return "<Muted>Objective</Muted> " .. escapeRich(snapshot.objective)
+	end,
+})
+
+InfoLeft:CreateLabel({
+	Name = "Events",
+	UpdateRate = 2,
+	Update = function()
+		return threatText()
+	end,
+})
+
+InfoRight:CreateStatusList({
+	Name = "Water",
+	MaxRows = 6,
+	UpdateRate = 1,
+	Update = function()
+		local snapshot = stateSnapshot()
+		return {
+			string.format("Roof tank   %.0f L", snapshot.tank),
+			string.format("Riser       %.0f L", snapshot.riser),
+			string.format("Cistern     %.0f L", snapshot.cistern),
+			string.format("Heater      %.0f L", snapshot.heater),
+			string.format("Clean       %.0f L", snapshot.cleanStock),
+			string.format("Untreated   %.0f L", snapshot.untreatedStock),
+		}
+	end,
+})
+
+InfoRight:CreateStatusList({
+	Name = "Food",
+	MaxRows = 4,
+	UpdateRate = 1,
+	Update = function()
+		local snapshot = stateSnapshot()
+		return {
+			string.format("Stored      %.0f portions", snapshot.foodStock),
+			string.format("Food days   %s", tostring(snapshot.foodDays)),
+			string.format("Water days  %s", tostring(snapshot.waterDays)),
+			string.format("Sleep       %s", snapshot.sleepAllowed and "<Success>allowed</Success>" or "<Muted>blocked</Muted>"),
+		}
+	end,
+})
+
+InfoRight:CreateLabel({
+	Name = "Party",
+	UpdateRate = 2,
+	Update = function()
+		local snapshot = stateSnapshot()
+		return string.format("<Muted>Party</Muted> %s  |  <Muted>Difficulty</Muted> %s  |  %s", tostring(snapshot.partySize), snapshot.difficulty, escapeRich(snapshot.hostName))
+	end,
+})
+
+--------------------------------------------------------------------------------
+-- ESP tab
+--------------------------------------------------------------------------------
+
+local ESPTab = Window:CreateTab({ Name = "ESP", Icon = "eye" })
+local ESPLeft = ESPTab:CreateGroupbox({ Name = "Targets", Side = "Left" })
+local ESPRight = ESPTab:CreateGroupbox({ Name = "Look", Side = "Right" })
+
+local ESPToggle
+
+ESPToggle = ESPLeft:CreateToggle({
+	Name = "Enable ESP",
+	Desc = "Boxes and names for loot and infected",
+	Flag = "EspEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		ESP.Enabled = on
+		if not on then
+			clearVisuals()
+		end
+		pushLog(on and "<Success>ESP on</Success>" or "<Muted>ESP off</Muted>")
+	end,
+})
+
+ESPRight:CreateDropdown({
+	Name = "Loot categories",
+	Desc = "Which item kinds get a box",
+	Options = CATEGORY_ORDER,
+	MultipleOptions = true,
+	CurrentOption = { "Food", "Water", "Medical", "Keys", "Weapons", "Notes" },
+	Flag = "EspCategories",
+	Callback = function(list)
+		ESP.Categories = {}
+		for _, name in ipairs(list or {}) do
+			ESP.Categories[name] = true
+		end
+	end,
+})
+
+ESPRight:CreateSlider({
+	Name = "Max distance",
+	Range = { 25, 800 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 250,
+	Flag = "EspDistance",
+	Callback = function(value)
+		ESP.MaxDistance = value
+	end,
+})
+
+ESPRight:CreateToggle({
+	Name = "Infected",
+	Desc = "Shamblers and heavies",
+	Flag = "EspInfected",
+	CurrentValue = true,
+	Callback = function(on)
+		ESP.ShowInfected = on
+	end,
+})
+
+ESPRight:CreateToggle({
+	Name = "Distance in label",
+	Flag = "EspLabels",
+	CurrentValue = true,
+	Callback = function(on)
+		ESP.ShowDistance = on
+	end,
+})
+
+ESPRight:CreateStatus({
+	Name = "Drawing",
+	Style = "Plain",
+	UpdateRate = 2,
+	Update = function()
+		if not ESP.drawingOk then
+			return "<Error>Drawing API unavailable</Error>"
+		end
+		return string.format("<Success>%d targets</Success>", #ESP.targets)
+	end,
+})
+
+--------------------------------------------------------------------------------
+-- Scavenge tab
+--------------------------------------------------------------------------------
+
+local ScavengeTab = Window:CreateTab({ Name = "Scavenge", Icon = "package" })
+local ScavengeLeft = ScavengeTab:CreateGroupbox({ Name = "Auto loot", Side = "Left" })
+local ScavengeRight = ScavengeTab:CreateGroupbox({ Name = "Activity", Side = "Right" })
+
+Log = ScavengeRight:CreateLog({
+	Name = "Activity",
+	MaxEntries = 200,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+local LootToggle
+
+LootToggle = ScavengeLeft:CreateToggle({
+	Name = "Auto loot",
+	Desc = "Steps to an item, then asks the server for it",
+	Flag = "LootEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		if on then
+			startLoot()
+			pushLog("<Success>Auto loot started</Success>")
+		else
+			stopLoot()
+			pushLog("<Muted>Auto loot stopped</Muted>")
+		end
+	end,
+})
+
+ScavengeLeft:CreateSlider({
+	Name = "Search radius",
+	Range = { 20, 800 },
+	Increment = 20,
+	Suffix = " studs",
+	CurrentValue = 220,
+	Flag = "LootRadius",
+	Callback = function(value)
+		Loot.Radius = value
+	end,
+})
+
+ScavengeLeft:CreateSlider({
+	Name = "Delay",
+	Range = { 0.2, 3 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.35,
+	Flag = "LootDelay",
+	Callback = function(value)
+		Loot.Delay = value
+	end,
+})
+
+ScavengeLeft:CreateDropdown({
+	Name = "Take",
+	Desc = "Item kinds the loop may take",
+	Options = CATEGORY_ORDER,
+	MultipleOptions = true,
+	CurrentOption = { "Food", "Water", "Medical", "Keys", "Tools", "Weapons", "Notes", "Gear" },
+	Flag = "LootCategories",
+	Callback = function(list)
+		Loot.Categories = {}
+		for _, name in ipairs(list or {}) do
+			Loot.Categories[name] = true
+		end
+	end,
+})
+
+ScavengeLeft:CreateStatus({
+	Name = "Picked",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Success>%d</Success> taken  |  <Error>%d</Error> failed  |  %s", Loot.Picked, Loot.Failed, escapeRich(Loot.lastMessage ~= "" and Loot.lastMessage or "idle"))
+	end,
+})
+
+ScavengeRight:CreateButton({
+	Name = "Clear activity",
+	Callback = function()
+		pcall(function()
+			Log:Clear()
+		end)
+	end,
+})
+
+--------------------------------------------------------------------------------
+-- Survival tab
+--------------------------------------------------------------------------------
+
+local SurvivalTab = Window:CreateTab({ Name = "Survival", Icon = "heart-pulse" })
+local SurvivalLeft = SurvivalTab:CreateGroupbox({ Name = "Warnings", Side = "Left" })
+local SurvivalRight = SurvivalTab:CreateGroupbox({ Name = "Held item", Side = "Right" })
+
+SurvivalLeft:CreateSlider({
+	Name = "Warn below food",
+	Range = { 5, 80 },
+	Increment = 5,
+	CurrentValue = 35,
+	Flag = "WarnFood",
+	Callback = function(value)
+		Survival.WarnFood = value
+	end,
+})
+
+SurvivalLeft:CreateSlider({
+	Name = "Warn below water",
+	Range = { 5, 80 },
+	Increment = 5,
+	CurrentValue = 35,
+	Flag = "WarnThirst",
+	Callback = function(value)
+		Survival.WarnThirst = value
+	end,
+})
+
+SurvivalLeft:CreateSlider({
+	Name = "Warn below stamina",
+	Range = { 5, 60 },
+	Increment = 5,
+	CurrentValue = 15,
+	Flag = "WarnStamina",
+	Callback = function(value)
+		Survival.WarnStamina = value
+	end,
+})
+
+SurvivalLeft:CreateStatus({
+	Name = "Status",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local v = vitals()
+		local parts = {}
+		if v.food < Survival.WarnFood then
+			parts[#parts + 1] = "<Error>eat</Error>"
+		end
+		if v.thirst < Survival.WarnThirst then
+			parts[#parts + 1] = "<Error>drink</Error>"
+		end
+		if v.stamina < Survival.WarnStamina then
+			parts[#parts + 1] = "<Warning>rest</Warning>"
+		end
+		if #parts == 0 then
+			return "<Success>All good</Success>"
+		end
+		return "Needs: " .. table.concat(parts, ", ")
+	end,
+})
+
+SurvivalRight:CreateLabel({
+	Name = "Held",
+	UpdateRate = 0.5,
+	Update = function()
+		local held = vitals().held
+		if held == "" then
+			return "Held: <Muted>nothing</Muted>"
+		end
+		return string.format("Held: %s (%s)", escapeRich(held), categoryOf(held))
+	end,
+})
+
+SurvivalRight:CreateToggle({
+	Name = "Eat when hungry",
+	Desc = "Only works while a food item is in hand",
+	Flag = "AutoEat",
+	CurrentValue = false,
+	Callback = function(on)
+		Survival.AutoEat = on
+	end,
+})
+
+SurvivalRight:CreateToggle({
+	Name = "Drink when thirsty",
+	Desc = "Only works while a filled container is in hand",
+	Flag = "AutoDrink",
+	CurrentValue = false,
+	Callback = function(on)
+		Survival.AutoDrink = on
+	end,
+})
+
+SurvivalRight:CreateParagraph({
+	Title = "Held only",
+	Content = "Equipping from the backpack is a separate server call, so this uses only what is already in your hands. Keep a can or a bottle in hand and it will be used when the meter drops.",
+})
+
+--------------------------------------------------------------------------------
+-- Settings tab
+--------------------------------------------------------------------------------
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+SettingsTab:CreateButton({
+	Name = "Unload hub",
+	Desc = "Removes the UI, ESP and every loop",
+	Confirm = true,
+	Callback = function()
+		local api = getgenv().RobScript30Floors
+		if api and api.Destroy then
+			api.Destroy()
+		end
+	end,
+})
+
+SettingsTab:CreateParagraph({
+	Title = "How it works",
+	Content = "Loot is a server interaction: the hub stands next to the item and calls Act/pickup. When the server answers 'Too far away' the item is skipped for 90 seconds. Meters and stores are read-only mirrors.",
+})
+
+--------------------------------------------------------------------------------
+-- Loops
+--------------------------------------------------------------------------------
+
+local frameAccumulator = 0
+local scanAccumulator = 0
+local heartbeat = nil
+
+heartbeat = RunService.Heartbeat:Connect(function(dt)
+	frameAccumulator = frameAccumulator + dt
+	scanAccumulator = scanAccumulator + dt
+
+	if scanAccumulator >= 1 then
+		scanAccumulator = 0
+		if ESP.Enabled and ESP.drawingOk then
+			local ok, err = pcall(function()
+				ESP.targets = scanTargets()
+			end)
+			if not ok then
+				reportError("esp scan", err)
+			end
+		end
+	end
+
+	if frameAccumulator >= 0.05 then
+		frameAccumulator = 0
+		if ESP.Enabled and ESP.drawingOk then
+			local ok, err = pcall(updateVisuals)
+			if not ok then
+				reportError("esp draw", err)
+			end
+		end
+
+		local ok, err = pcall(function()
+			local v = vitals()
+			local now = os.clock()
+
+			if Survival.AutoEat and v.food < Survival.WarnFood and now - Survival.lastEat > 3 then
+				if FOOD_SET[v.held] then
+					Survival.lastEat = now
+					if consumeHeld("eat") then
+						pushLog("<Success>Ate " .. escapeRich(v.held) .. "</Success>")
+					end
+				end
+			end
+
+			if Survival.AutoDrink and v.thirst < Survival.WarnThirst and now - Survival.lastDrink > 3 then
+				if v.held ~= "" and categoryOf(v.held) == "Water" then
+					Survival.lastDrink = now
+					if consumeHeld("drink") then
+						pushLog("<Success>Drank from " .. escapeRich(v.held) .. "</Success>")
+					end
+				end
+			end
+
+			if now - Survival.lastWarning > 25 then
+				local warnings = {}
+				if v.food < Survival.WarnFood then
+					warnings[#warnings + 1] = "food"
+				end
+				if v.thirst < Survival.WarnThirst then
+					warnings[#warnings + 1] = "water"
+				end
+				if #warnings > 0 then
+					Survival.lastWarning = now
+					Window:Notify({
+						Title = "Survival",
+						Content = "Low " .. table.concat(warnings, " and "),
+						Type = "Warning",
+					})
+				end
+			end
+		end)
+		if not ok then
+			reportError("survival", err)
+		end
+	end
+end)
+
+--------------------------------------------------------------------------------
+-- Public API
+--------------------------------------------------------------------------------
+
+local function destroy()
+	stopLoot()
+	if heartbeat then
+		heartbeat:Disconnect()
+		heartbeat = nil
+	end
+	clearVisuals()
+	pcall(function()
+		Window:Destroy()
+	end)
+	getgenv().RobScript30Floors = nil
+end
+
+local api = {}
+
+api.Version = VERSION
+
+api.StartLoot = function()
+	if LootToggle and LootToggle.Set then
+		LootToggle:Set(true)
+	else
+		startLoot()
+	end
+end
+
+api.StopLoot = function()
+	if LootToggle and LootToggle.Set then
+		LootToggle:Set(false)
+	else
+		stopLoot()
+	end
+end
+
+api.ToggleLoot = function()
+	if Loot.Running then
+		api.StopLoot()
+	else
+		api.StartLoot()
+	end
+end
+
+api.SetESP = function(on)
+	if ESPToggle and ESPToggle.Set then
+		ESPToggle:Set(on and true or false)
+	else
+		ESP.Enabled = on and true or false
+	end
+end
+
+api.SelectTab = function(name)
+	local tabs = {
+		Info = InfoTab,
+		ESP = ESPTab,
+		Scavenge = ScavengeTab,
+		Survival = SurvivalTab,
+		Settings = SettingsTab,
+	}
+	local tab = tabs[name]
+	if not tab then
+		return
+	end
+	pcall(function()
+		if Window.Minimized then
+			Window:Restore()
+		end
+		Window:SelectTab(tab)
+		if Window.Open ~= true then
+			Window:Toggle(true)
+		end
+	end)
+end
+
+api.OpenUI = function()
+	pcall(function()
+		if Window.Minimized then
+			Window:Restore()
+		end
+		if Window.Open ~= true then
+			Window:Toggle(true)
+		end
+	end)
+end
+
+api.GetWindow = function()
+	return Window
+end
+
+api.CloseUI = function()
+	pcall(function()
+		if Window.Open == true then
+			Window:Toggle(false)
+		end
+	end)
+end
+
+api.GetState = stateSnapshot
+api.GetVitals = vitals
+
+api.GetLootStats = function()
+	return { picked = Loot.Picked, failed = Loot.Failed, last = Loot.lastMessage }
+end
+
+api.GetLastError = function()
+	return lastError
+end
+
+api.Destroy = destroy
+
+getgenv().RobScript30Floors = api
+
+Window:LoadAutoload()
+
+-- The window plays a short intro and ignores Toggle until it finishes.
+task.delay(1.2, function()
+	pcall(function()
+		if Window.Open ~= true then
+			Window:Toggle(true)
+		end
+	end)
+end)
+
+Window:Notify({
+	Title = HUB_NAME,
+	Content = "v" .. VERSION .. " loaded - RightControl toggles the menu",
+	Type = "Success",
+})
+
+pushLog("<Accent>" .. HUB_NAME .. " v" .. VERSION .. " ready</Accent>")
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		destroy()
+	end
+end)
+
+print(string.format("[%s] v%s loaded | drawing=%s | error=%s", HUB_NAME, VERSION, tostring(ESP.drawingOk), tostring(lastError)))
