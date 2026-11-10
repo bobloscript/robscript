@@ -1,0 +1,2681 @@
+-- Robscript Team - PURGATORIO
+-- Version 1.0 (Visuals + Info)
+-- Game: PURGATORIO [UPDATE 2.5] | universe 7300616172 | place 113641553950984
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptPurgatorio
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy first so its loops, highlights and drawings die first.
+do
+	local previous = getgenv().RobScriptPurgatorio
+	if type(previous) == "table" and type(previous.Destroy) == "function" then
+		pcall(previous.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript Purgatorio] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromRGB(141, 141, 153),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local COLLECT_INTERVAL = 0.5
+local VISUAL_INTERVAL = 0.033
+local LIST_INTERVAL = 0.5
+local EFFECTS_INTERVAL = 1
+
+local COLOR_ENEMY = Color3.fromRGB(255, 86, 110)
+local COLOR_ELITE = Color3.fromRGB(255, 196, 64)
+local COLOR_NPC = Color3.fromRGB(96, 214, 255)
+local COLOR_ALLY = Color3.fromRGB(126, 255, 154)
+local COLOR_GATHERING = Color3.fromRGB(198, 156, 255)
+local COLOR_HITBOX = Color3.fromRGB(255, 60, 200)
+
+-- Grades in this game run from 1 (top) to 9 (bottom), so 5 and lower is elite.
+local ELITE_GRADE = 5
+
+----- Drawing -----
+
+local DrawingLib = nil
+if type(Drawing) == "table" and type(Drawing.new) == "function" then
+	DrawingLib = Drawing
+end
+
+local function newLine()
+	if not DrawingLib then
+		return nil
+	end
+	local ok, line = pcall(DrawingLib.new, "Line")
+	if ok and line then
+		line.Visible = false
+		return line
+	end
+	return nil
+end
+
+----- Flags -----
+
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local function colorToHex(color)
+	local red = math.floor(math.clamp(color.R, 0, 1) * 255 + 0.5)
+	local green = math.floor(math.clamp(color.G, 0, 1) * 255 + 0.5)
+	local blue = math.floor(math.clamp(color.B, 0, 1) * 255 + 0.5)
+	return string.format("#%02X%02X%02X", red, green, blue)
+end
+
+local function escapeRich(text)
+	text = tostring(text)
+	text = text:gsub("&", "&amp;")
+	text = text:gsub("<", "&lt;")
+	text = text:gsub(">", "&gt;")
+	return text
+end
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function hiddenParent()
+	local ok, gui = pcall(function()
+		return gethui()
+	end)
+	if ok and gui then
+		return gui
+	end
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	return playerGui or game:GetService("CoreGui")
+end
+
+local function distanceOrigin()
+	local character = LocalPlayer.Character
+	if character then
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if root then
+			return root.Position
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		return camera.CFrame.Position
+	end
+	return Vector3.new(0, 0, 0)
+end
+
+local function displayName(raw)
+	local text = tostring(raw or "")
+	text = text:gsub("%d+$", "")
+	text = text:gsub("^%s+", "")
+	text = text:gsub("%s+$", "")
+	if text == "" then
+		return "Enemy"
+	end
+	return text:sub(1, 1):upper() .. text:sub(2)
+end
+
+----- Game data -----
+
+local function assets()
+	local folder = ReplicatedStorage:FindFirstChild("RSAssets")
+	return folder
+end
+
+local function asset(name)
+	local folder = assets()
+	if not folder then
+		return nil
+	end
+	return folder:FindFirstChild(name)
+end
+
+local function playerData()
+	return LocalPlayer:FindFirstChild("Data")
+end
+
+local function settingsFolder()
+	local data = playerData()
+	if not data then
+		return nil
+	end
+	return data:FindFirstChild("PlayerSettings")
+end
+
+local function dataNumber(name)
+	local data = playerData()
+	if not data then
+		return nil
+	end
+	local value = data:FindFirstChild(name)
+	if value and value:IsA("ValueBase") then
+		return value.Value
+	end
+	return nil
+end
+
+local function dataString(name)
+	local data = playerData()
+	if not data then
+		return nil
+	end
+	local value = data:FindFirstChild(name)
+	if value and value:IsA("ValueBase") then
+		return tostring(value.Value)
+	end
+	return nil
+end
+
+local function characterValue(name)
+	local character = LocalPlayer.Character
+	if not character then
+		return nil
+	end
+	local value = character:FindFirstChild(name)
+	if value and value:IsA("ValueBase") then
+		return value.Value
+	end
+	return nil
+end
+
+local function teamOf(model)
+	local team = model:FindFirstChild("Team")
+	if team and team:IsA("StringValue") then
+		return team.Value
+	end
+	return nil
+end
+
+local function isPlayerCharacter(model)
+	if Players:GetPlayerFromCharacter(model) then
+		return true
+	end
+	return false
+end
+
+local function enemyInfo(model)
+	if not model:IsA("Model") then
+		return nil
+	end
+	if model == LocalPlayer.Character or isPlayerCharacter(model) then
+		return nil
+	end
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return nil
+	end
+	local enemyName = model:GetAttribute("EnemyName")
+	local team = teamOf(model)
+	if not enemyName and team ~= "Enemy" then
+		return nil
+	end
+	local grade = model:GetAttribute("Grade")
+	local info = {
+		display = displayName(enemyName or model.Name),
+		grade = type(grade) == "number" and grade or nil,
+		level = model:GetAttribute("Level"),
+		faction = model:GetAttribute("Faction"),
+		xp = model:GetAttribute("XP"),
+		health = humanoid.Health,
+		maxHealth = humanoid.MaxHealth,
+	}
+	return info, humanoid
+end
+
+local function npcInfo(model)
+	if not model:IsA("Model") then
+		return nil
+	end
+	if model == LocalPlayer.Character or isPlayerCharacter(model) then
+		return nil
+	end
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return nil
+	end
+	local dialogueType = model:GetAttribute("DialogueType")
+	local inCitizens = model.Parent ~= nil and model.Parent.Name == "Citizens"
+	if not dialogueType and not inCitizens then
+		return nil
+	end
+	return {
+		display = dialogueType and displayName(dialogueType) or displayName(model.Name),
+		health = humanoid.Health,
+		maxHealth = humanoid.MaxHealth,
+	}, humanoid
+end
+
+local function gatheringParts()
+	local map = workspace:FindFirstChild("Map")
+	if not map then
+		return {}
+	end
+	local folder = map:FindFirstChild("GeneratedGatheringSpots")
+	if not folder then
+		return {}
+	end
+	local parts = {}
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("BasePart") then
+			table.insert(parts, child)
+		elseif child:IsA("Model") then
+			local part = child.PrimaryPart
+			if not part then
+				for _, descendant in ipairs(child:GetDescendants()) do
+					if descendant:IsA("BasePart") then
+						part = descendant
+						break
+					end
+				end
+			end
+			if part then
+				table.insert(parts, part)
+			end
+		end
+	end
+	return parts
+end
+
+----- Target registry -----
+
+local targets = {}
+local stats = { enemies = 0, npcs = 0, allies = 0, gathering = 0, fps = 0 }
+
+local function buildBillboard(part, offsetY, width)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "RSP_Billboard"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(width or 220, 54)
+	billboard.StudsOffset = Vector3.new(0, offsetY or 3, 0)
+	billboard.Enabled = false
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Info"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, 0, 0.66, 0)
+	label.Font = Enum.Font.GothamSemibold
+	label.TextSize = 13
+	label.RichText = true
+	label.TextWrapped = true
+	label.TextStrokeTransparency = 0.35
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Bottom
+	label.Text = ""
+	label.Parent = billboard
+
+	local barBack = Instance.new("Frame")
+	barBack.Name = "BarBack"
+	barBack.AnchorPoint = Vector2.new(0.5, 0)
+	barBack.Position = UDim2.fromScale(0.5, 0.74)
+	barBack.Size = UDim2.fromOffset(150, 5)
+	barBack.BackgroundColor3 = Color3.fromRGB(12, 12, 15)
+	barBack.BackgroundTransparency = 0.2
+	barBack.BorderSizePixel = 0
+	barBack.Visible = false
+	barBack.Parent = billboard
+
+	local barFill = Instance.new("Frame")
+	barFill.Name = "BarFill"
+	barFill.Size = UDim2.fromScale(1, 1)
+	barFill.BackgroundColor3 = COLOR_ENEMY
+	barFill.BorderSizePixel = 0
+	barFill.Parent = barBack
+
+	if barBack:FindFirstChildOfClass("UICorner") == nil then
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 2)
+		corner.Parent = barBack
+	end
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard, label, barBack, barFill
+end
+
+local function buildHighlight(model)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "RSP_Chams"
+	highlight.Adornee = model
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillTransparency = 0.7
+	highlight.OutlineTransparency = 0.1
+	highlight.Parent = model
+	return highlight
+end
+
+local function releaseVisuals(target)
+	if target.billboard then
+		pcall(function()
+			target.billboard:Destroy()
+		end)
+		target.billboard = nil
+	end
+	if target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+	if target.lines then
+		for _, line in ipairs(target.lines) do
+			if line then
+				pcall(function()
+					line:Remove()
+				end)
+			end
+		end
+		target.lines = nil
+	end
+	if target.tracer then
+		pcall(function()
+			target.tracer:Remove()
+		end)
+		target.tracer = nil
+	end
+	target.hasVisual = false
+end
+
+local function resolveParts(target)
+	local model = target.model
+	if not model or not model.Parent then
+		return false
+	end
+	if target.kind == "gathering" then
+		target.part = model
+		target.focusPart = model
+		target.root = model
+		target.humanoid = nil
+		return true
+	end
+	target.root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	target.hurtbox = model:FindFirstChild("Hurtbox")
+	target.focusPart = model:FindFirstChild("Head") or target.hurtbox or target.root
+	target.humanoid = model:FindFirstChildOfClass("Humanoid")
+	return target.root ~= nil and target.focusPart ~= nil
+end
+
+local function createTarget(kind, model)
+	local target = {
+		kind = kind,
+		model = model,
+		hasVisual = false,
+	}
+	if not resolveParts(target) then
+		return nil
+	end
+	return target
+end
+
+local function dropTarget(model)
+	local target = targets[model]
+	if not target then
+		return
+	end
+	releaseVisuals(target)
+	targets[model] = nil
+end
+
+local function clearAllTargets()
+	for model in pairs(targets) do
+		dropTarget(model)
+	end
+	stats.enemies = 0
+	stats.npcs = 0
+	stats.allies = 0
+	stats.gathering = 0
+end
+
+----- Collection -----
+
+local function ensureTarget(kind, model)
+	local target = targets[model]
+	if target then
+		if target.kind ~= kind then
+			releaseVisuals(target)
+			targets[model] = nil
+			target = nil
+		else
+			return target
+		end
+	end
+	target = createTarget(kind, model)
+	if target then
+		targets[model] = target
+	end
+	return target
+end
+
+local function collectEnemyModels()
+	local models = {}
+	local seen = {}
+	for _, model in ipairs(workspace:GetChildren()) do
+		if model:IsA("Model") then
+			models[#models + 1] = model
+			seen[model] = true
+		end
+	end
+	-- Enemies normally sit in Workspace, but a spawn folder would still be indexed
+	-- by name in Workspace.EnemyList, so fall back to the name lookup.
+	local list = workspace:FindFirstChild("EnemyList")
+	if list then
+		for _, entry in ipairs(list:GetChildren()) do
+			if not workspace:FindFirstChild(entry.Name) then
+				local model = workspace:FindFirstChild(entry.Name, true)
+				if model and model:IsA("Model") and not seen[model] then
+					models[#models + 1] = model
+					seen[model] = true
+				end
+			end
+		end
+	end
+	return models
+end
+
+local function collectNpcModels()
+	local models = {}
+	local seen = {}
+	for _, model in ipairs(workspace:GetChildren()) do
+		if model:IsA("Model") then
+			models[#models + 1] = model
+			seen[model] = true
+		end
+	end
+	-- Citizens live inside Workspace.Citizens, not at the root.
+	local citizens = workspace:FindFirstChild("Citizens")
+	if citizens then
+		for _, model in ipairs(citizens:GetChildren()) do
+			if model:IsA("Model") and not seen[model] then
+				models[#models + 1] = model
+				seen[model] = true
+			end
+		end
+	end
+	local office = workspace:FindFirstChild("Office")
+	if office then
+		local npcs = office:FindFirstChild("NPCS")
+		if npcs then
+			for _, descendant in ipairs(npcs:GetDescendants()) do
+				if descendant:IsA("Model") and descendant:FindFirstChildOfClass("Humanoid") and not seen[descendant] then
+					models[#models + 1] = descendant
+					seen[descendant] = true
+				end
+			end
+		end
+	end
+	return models
+end
+
+local function collectTargets()
+	local seen = {}
+
+	local combatEnabled = flag("LockOn", false)
+	if flag("EnemyESP", true) or combatEnabled then
+		for _, model in ipairs(collectEnemyModels()) do
+			local info, humanoid = enemyInfo(model)
+			if info then
+				local target = ensureTarget("enemy", model)
+				if target then
+					target.info = info
+					target.humanoid = humanoid
+					seen[model] = true
+				end
+			end
+		end
+	end
+
+	if flag("NPCESP", false) then
+		for _, model in ipairs(collectNpcModels()) do
+			local info = npcInfo(model)
+			if info then
+				local target = ensureTarget("npc", model)
+				if target then
+					target.info = info
+					seen[model] = true
+				end
+			end
+		end
+	end
+
+	if flag("AllyESP", false) then
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer then
+				local character = player.Character
+				if character and character.Parent then
+					local target = ensureTarget("ally", character)
+					if target then
+						target.player = player
+						seen[character] = true
+					end
+				end
+			end
+		end
+	end
+
+	if flag("GatheringESP", false) then
+		for _, part in ipairs(gatheringParts()) do
+			local target = ensureTarget("gathering", part)
+			if target then
+				seen[part] = true
+			end
+		end
+	end
+
+	for model, target in pairs(targets) do
+		if not seen[model] or not target.model or not target.model.Parent then
+			dropTarget(model)
+		end
+	end
+end
+
+----- Rendering -----
+
+local function healthColor(ratio)
+	if ratio > 0.6 then
+		return Color3.fromRGB(120, 255, 150)
+	end
+	if ratio > 0.3 then
+		return Color3.fromRGB(255, 210, 90)
+	end
+	return Color3.fromRGB(255, 90, 110)
+end
+
+local function projectBox(center, size)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local half = size * 0.5
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+	local depthHits = 0
+	for x = -1, 1, 2 do
+		for y = -1, 1, 2 do
+			for z = -1, 1, 2 do
+				local world = center + Vector3.new(half.X * x, half.Y * y, half.Z * z)
+				local screen = camera:WorldToViewportPoint(world)
+				if screen.Z > 0 then
+					depthHits = depthHits + 1
+					minX = math.min(minX, screen.X)
+					minY = math.min(minY, screen.Y)
+					maxX = math.max(maxX, screen.X)
+					maxY = math.max(maxY, screen.Y)
+				end
+			end
+		end
+	end
+	if depthHits < 2 then
+		return nil
+	end
+	return minX, minY, maxX, maxY
+end
+
+local function hideLines(target)
+	if target.lines then
+		for _, line in ipairs(target.lines) do
+			if line and line.Visible then
+				line.Visible = false
+			end
+		end
+	end
+	if target.tracer and target.tracer.Visible then
+		target.tracer.Visible = false
+	end
+end
+
+local function updateBox(target, color, visible, center, size)
+	local enabled = visible and flag("EnemyBox", false)
+	if not enabled or not center or not size then
+		hideLines(target)
+		if target.tracer and target.tracer.Visible then
+			target.tracer.Visible = false
+		end
+		return
+	end
+
+	local minX, minY, maxX, maxY = projectBox(center, size)
+	if not minX then
+		hideLines(target)
+		return
+	end
+
+	if not target.lines then
+		target.lines = { newLine(), newLine(), newLine(), newLine() }
+	end
+	local lines = target.lines
+	if not lines[1] then
+		return
+	end
+
+	local topLeft = Vector2.new(minX, minY)
+	local topRight = Vector2.new(maxX, minY)
+	local bottomLeft = Vector2.new(minX, maxY)
+	local bottomRight = Vector2.new(maxX, maxY)
+	local segments = {
+		{ topLeft, topRight },
+		{ topRight, bottomRight },
+		{ bottomRight, bottomLeft },
+		{ bottomLeft, topLeft },
+	}
+	for index = 1, 4 do
+		local line = lines[index]
+		local segment = segments[index]
+		if line and segment then
+			line.From = segment[1]
+			line.To = segment[2]
+			line.Color = color
+			line.Thickness = 1
+			line.Visible = true
+		end
+	end
+end
+
+local function updateTracer(target, color, visible)
+	local enabled = visible and flag("EnemyTracer", false) and target.kind == "enemy"
+	if not enabled then
+		if target.tracer and target.tracer.Visible then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if not camera or not target.focusPart then
+		return
+	end
+	local viewport = camera.ViewportSize
+	local screen = camera:WorldToViewportPoint(target.focusPart.Position)
+	if screen.Z <= 0 then
+		if target.tracer and target.tracer.Visible then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	if not target.tracer then
+		target.tracer = newLine()
+	end
+	if not target.tracer then
+		return
+	end
+	target.tracer.From = Vector2.new(viewport.X * 0.5, viewport.Y)
+	target.tracer.To = Vector2.new(screen.X, screen.Y)
+	target.tracer.Color = color
+	target.tracer.Thickness = 1
+	target.tracer.Visible = true
+end
+
+local function updateEnemy(target, distance, visible)
+	local info = target.info or {}
+	local humanoid = target.humanoid
+	local maxHealth = humanoid and humanoid.MaxHealth or 0
+	local health = humanoid and humanoid.Health or 0
+	local ratio = 0
+	if maxHealth > 0 then
+		ratio = math.clamp(health / maxHealth, 0, 1)
+	end
+
+	local elite = info.grade ~= nil and info.grade <= ELITE_GRADE
+	local color = elite and flag("EliteColor", COLOR_ELITE) or flag("EnemyColor", COLOR_ENEMY)
+
+	local firstLine = ""
+	if flag("EnemyName", true) then
+		firstLine = escapeRich(info.display or target.model.Name)
+	end
+	if flag("EnemyGrade", true) and info.grade ~= nil then
+		if firstLine ~= "" then
+			firstLine = firstLine .. "  "
+		end
+		firstLine = firstLine .. "G" .. tostring(info.grade)
+	end
+
+	local secondLine = {}
+	if flag("EnemyHealth", true) then
+		table.insert(secondLine, string.format("%d/%d", math.floor(health + 0.5), math.floor(maxHealth + 0.5)))
+	end
+	if flag("EnemyLevel", true) and info.level ~= nil then
+		table.insert(secondLine, "Lv" .. tostring(info.level))
+	end
+	if flag("EnemyFaction", false) and info.faction then
+		table.insert(secondLine, escapeRich(info.faction))
+	end
+	if flag("EnemyDistance", true) then
+		table.insert(secondLine, formatDistance(distance))
+	end
+
+	local showBillboard = visible and (firstLine ~= "" or #secondLine > 0)
+	if showBillboard then
+		if not target.billboard then
+			target.billboard, target.label, target.barBack, target.barFill = buildBillboard(target.focusPart, 3.2, 220)
+		end
+		if target.billboard then
+			target.billboard.Enabled = true
+			if target.label then
+				target.label.TextColor3 = color
+				local text = firstLine
+				if #secondLine > 0 then
+					if text ~= "" then
+						text = text .. "\n"
+					end
+					text = text .. table.concat(secondLine, " · ")
+				end
+				target.label.Text = text
+			end
+			if target.barBack and target.barFill then
+				local showBar = flag("EnemyHealth", true) and maxHealth > 0
+				target.barBack.Visible = showBar
+				if showBar then
+					target.barFill.Size = UDim2.fromScale(ratio, 1)
+					target.barFill.BackgroundColor3 = healthColor(ratio)
+				end
+			end
+		end
+	elseif target.billboard then
+		target.billboard.Enabled = false
+	end
+
+	local chams = visible and flag("EnemyChams", true)
+	if chams then
+		if not target.highlight then
+			target.highlight = buildHighlight(target.model)
+		end
+		if target.highlight then
+			target.highlight.FillColor = color
+			target.highlight.OutlineColor = color
+		end
+	elseif target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+
+	local boxCenter, boxSize
+	if flag("EnemyHitbox", false) and target.hurtbox then
+		boxCenter = target.hurtbox.Position
+		boxSize = target.hurtbox.Size
+	else
+		local ok, center, size = pcall(function()
+			return target.model:GetBoundingBox()
+		end)
+		if ok and center then
+			boxCenter = center.Position
+			boxSize = size
+		end
+	end
+	updateBox(target, color, visible, boxCenter, boxSize)
+	updateTracer(target, color, visible)
+end
+
+local function updateSimple(target, distance, visible, color, valueText, nameFlag)
+	local display = target.info and target.info.display or nil
+	if target.kind == "ally" then
+		if target.player then
+			display = target.player.DisplayName
+			if display == "" then
+				display = target.player.Name
+			end
+		else
+			display = target.model.Name
+		end
+	elseif target.kind == "gathering" then
+		display = "Gathering spot"
+	elseif not display then
+		display = displayName(target.model.Name)
+	end
+
+	local text = ""
+	if flag(nameFlag, true) then
+		text = escapeRich(display)
+	end
+	if valueText ~= nil and valueText ~= "" then
+		if text ~= "" then
+			text = text .. "\n"
+		end
+		text = text .. valueText
+	end
+
+	local show = visible and text ~= ""
+	if show then
+		if not target.billboard then
+			target.billboard, target.label = buildBillboard(target.focusPart, 3.2, 200)
+		end
+		if target.billboard and target.label then
+			target.billboard.Enabled = true
+			target.label.TextColor3 = color
+			target.label.Text = text
+		end
+	elseif target.billboard then
+		target.billboard.Enabled = false
+	end
+
+	local chamsFlag = "AllyChams"
+	if target.kind == "npc" then
+		chamsFlag = "NPCChams"
+	elseif target.kind == "gathering" then
+		chamsFlag = "GatheringChams"
+	end
+	if visible and flag(chamsFlag, true) then
+		if not target.highlight then
+			target.highlight = buildHighlight(target.model)
+		end
+		if target.highlight then
+			target.highlight.FillColor = color
+			target.highlight.OutlineColor = color
+		end
+	elseif target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+end
+
+local function updateTarget(target)
+	if not target.model or not target.model.Parent then
+		releaseVisuals(target)
+		return
+	end
+	if not target.focusPart or not target.focusPart.Parent then
+		if not resolveParts(target) then
+			releaseVisuals(target)
+			return
+		end
+	end
+
+	local origin = distanceOrigin()
+	local distance = (target.focusPart.Position - origin).Magnitude
+	local renderDistance = flag("RenderDistance", 2500)
+	local visible = distance <= renderDistance
+
+	if target.kind == "enemy" then
+		if not flag("EnemyESP", true) then
+			visible = false
+		end
+		updateEnemy(target, distance, visible)
+	elseif target.kind == "npc" then
+		if not flag("NPCESP", false) then
+			visible = false
+		end
+		updateSimple(target, distance, visible, flag("NpcColor", COLOR_NPC), formatDistance(distance), "NPCName")
+	elseif target.kind == "ally" then
+		if not flag("AllyESP", false) then
+			visible = false
+		end
+		local character = target.model
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local hud = ""
+		if humanoid then
+			hud = string.format("%d/%d", math.floor(humanoid.Health + 0.5), math.floor(humanoid.MaxHealth + 0.5))
+		end
+		updateSimple(target, distance, visible, flag("AllyColor", COLOR_ALLY), hud .. " · " .. formatDistance(distance), "AllyName")
+	elseif target.kind == "gathering" then
+		if not flag("GatheringESP", false) then
+			visible = false
+		end
+		updateSimple(target, distance, visible, flag("GatheringColor", COLOR_GATHERING), formatDistance(distance), "GatheringName")
+	end
+	target.hasVisual = visible
+end
+
+local function updateStats()
+	local counts = { enemies = 0, npcs = 0, allies = 0, gathering = 0 }
+	local byKind = { enemy = "enemies", npc = "npcs", ally = "allies", gathering = "gathering" }
+	for _, target in pairs(targets) do
+		local key = byKind[target.kind]
+		if target.hasVisual and key then
+			counts[key] = counts[key] + 1
+		end
+	end
+	stats.enemies = counts.enemies
+	stats.npcs = counts.npcs
+	stats.allies = counts.allies
+	stats.gathering = counts.gathering
+end
+
+----- Effects -----
+
+local lightingBackup = nil
+local atmosphereBackup = nil
+
+local function setFullbright(enabled)
+	if enabled then
+		if lightingBackup then
+			return
+		end
+		lightingBackup = {
+			ClockTime = Lighting.ClockTime,
+			Brightness = Lighting.Brightness,
+			Ambient = Lighting.Ambient,
+			OutdoorAmbient = Lighting.OutdoorAmbient,
+			FogEnd = Lighting.FogEnd,
+			FogStart = Lighting.FogStart,
+			GlobalShadows = Lighting.GlobalShadows,
+		}
+		Lighting.ClockTime = 13
+		Lighting.Brightness = 2
+		Lighting.Ambient = Color3.fromRGB(96, 96, 104)
+		Lighting.OutdoorAmbient = Color3.fromRGB(96, 96, 104)
+		Lighting.FogEnd = 100000
+		Lighting.FogStart = 0
+		Lighting.GlobalShadows = false
+
+		local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+		if atmosphere then
+			atmosphereBackup = { Density = atmosphere.Density, Haze = atmosphere.Haze }
+			atmosphere.Density = 0
+			atmosphere.Haze = 0
+		end
+	else
+		if not lightingBackup then
+			return
+		end
+		for key, value in pairs(lightingBackup) do
+			pcall(function()
+				Lighting[key] = value
+			end)
+		end
+		lightingBackup = nil
+		if atmosphereBackup then
+			local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+			if atmosphere then
+				pcall(function()
+					atmosphere.Density = atmosphereBackup.Density
+					atmosphere.Haze = atmosphereBackup.Haze
+				end)
+			end
+			atmosphereBackup = nil
+		end
+	end
+end
+
+local function refreshFullbright()
+	if not lightingBackup then
+		return
+	end
+	pcall(function()
+		if Lighting.ClockTime ~= 13 then
+			Lighting.ClockTime = 13
+		end
+		if Lighting.FogEnd ~= 100000 then
+			Lighting.FogEnd = 100000
+		end
+	end)
+end
+
+local function applyGameSetting(name, value)
+	local settings = settingsFolder()
+	if not settings then
+		return false
+	end
+	local entry = settings:FindFirstChild(name)
+	if entry and entry:IsA("BoolValue") then
+		entry.Value = value
+		return true
+	end
+	return false
+end
+
+local function setWeatherOff(enabled)
+	local map = workspace:FindFirstChild("Map")
+	if not map then
+		return
+	end
+	for _, name in ipairs({ "RainActive", "ThunderActive" }) do
+		local value = map:FindFirstChild(name)
+		if value and value:IsA("BoolValue") then
+			value.Value = not enabled
+		end
+	end
+end
+
+local function refreshFov()
+	if not flag("FovLock", false) then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		camera.FieldOfView = flag("FovValue", 70)
+	end
+end
+
+----- Combat -----
+
+----- Lock-on -----
+
+-- Souls-like target lock: the enemy nearest to the crosshair is held until the
+-- player releases it, kills it, or walks out of range.
+local lockState = { target = nil, active = false, indicator = nil }
+
+local LOCK_KEYS = {
+	["Middle mouse"] = Enum.UserInputType.MouseButton3,
+	["Q"] = Enum.KeyCode.Q,
+	["Tab"] = Enum.KeyCode.Tab,
+	["F"] = Enum.KeyCode.F,
+	["G"] = Enum.KeyCode.G,
+}
+
+local function lockRange()
+	return tonumber(flag("LockRange", 150)) or 150
+end
+
+local function localRoot()
+	local character = LocalPlayer.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function targetPosition(target)
+	if not target or not target.focusPart or not target.focusPart.Parent then
+		return nil
+	end
+	return target.focusPart.Position
+end
+
+local function lockTargetAlive(target)
+	if not target or not target.model or not target.model.Parent then
+		return false
+	end
+	if target.humanoid and target.humanoid.Health <= 0 then
+		return false
+	end
+	return targetPosition(target) ~= nil
+end
+
+local function aimedAngle(position)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local offset = position - camera.CFrame.Position
+	if offset.Magnitude < 0.5 then
+		return nil
+	end
+	return math.deg(math.acos(math.clamp(camera.CFrame.LookVector:Dot(offset.Unit), -1, 1)))
+end
+
+local function lockCandidates()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return {}
+	end
+	local origin = camera.CFrame.Position
+	local maxDistance = lockRange()
+	local list = {}
+	for _, target in pairs(targets) do
+		if target.kind == "enemy" and lockTargetAlive(target) then
+			local position = targetPosition(target)
+			local distance = (position - origin).Magnitude
+			if distance <= maxDistance then
+				local angle = aimedAngle(position)
+				if angle then
+					table.insert(list, { target = target, angle = angle, distance = distance })
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.angle < b.angle
+	end)
+	return list
+end
+
+local function destroyLockIndicator()
+	if lockState.indicator then
+		pcall(function()
+			lockState.indicator:Destroy()
+		end)
+		lockState.indicator = nil
+	end
+end
+
+local function buildLockIndicator(part)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "RSP_Lock"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(56, 56)
+	billboard.StudsOffset = Vector3.new(0, 4.6, 0)
+
+	local ring = Instance.new("Frame")
+	ring.Name = "Ring"
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Position = UDim2.fromScale(0.5, 0.5)
+	ring.Size = UDim2.fromOffset(34, 34)
+	ring.BackgroundTransparency = 1
+	ring.Parent = billboard
+
+	local ringCorner = Instance.new("UICorner")
+	ringCorner.CornerRadius = UDim.new(1, 0)
+	ringCorner.Parent = ring
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 59, 127)
+	stroke.Thickness = 2.5
+	stroke.Transparency = 0.05
+	stroke.Parent = ring
+
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromScale(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(5, 5)
+	dot.BackgroundColor3 = Color3.fromRGB(255, 59, 127)
+	dot.BorderSizePixel = 0
+	dot.Parent = billboard
+
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = dot
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard
+end
+
+local function releaseLock()
+	lockState.active = false
+	lockState.target = nil
+	destroyLockIndicator()
+	local root = localRoot()
+	if root then
+		local orient = root:FindFirstChild("AimAssistOrientation")
+		if orient then
+			pcall(function()
+				orient.Enabled = false
+			end)
+		end
+	end
+end
+
+local function engageLock()
+	lockState.target = nil
+	local list = lockCandidates()
+	if #list == 0 then
+		releaseLock()
+		return false
+	end
+	lockState.target = list[1].target
+	lockState.active = true
+	return true
+end
+
+local function toggleLock()
+	if lockState.active then
+		releaseLock()
+		return false
+	end
+	return engageLock()
+end
+
+local function cycleLock(direction)
+	local list = lockCandidates()
+	if #list == 0 then
+		releaseLock()
+		return
+	end
+	local index = nil
+	for i, entry in ipairs(list) do
+		if entry.target == lockState.target then
+			index = i
+			break
+		end
+	end
+	if not index then
+		lockState.target = list[1].target
+		lockState.active = true
+		return
+	end
+	index = index + (direction or 1)
+	if index > #list then
+		index = 1
+	end
+	if index < 1 then
+		index = #list
+	end
+	lockState.target = list[index].target
+	lockState.active = true
+end
+
+local function updateLock(deltaTime)
+	if not lockState.active then
+		return
+	end
+	local target = lockState.target
+	if not lockTargetAlive(target) then
+		releaseLock()
+		return
+	end
+	local position = targetPosition(target)
+	local camera = workspace.CurrentCamera
+	local root = localRoot()
+	if not position or not camera or not root then
+		releaseLock()
+		return
+	end
+	local distance = (position - camera.CFrame.Position).Magnitude
+	if distance > lockRange() * 1.4 then
+		releaseLock()
+		return
+	end
+
+	if flag("LockTurnCharacter", true) then
+		local orient = root:FindFirstChild("AimAssistOrientation")
+		if orient then
+			pcall(function()
+				orient.Responsiveness = tonumber(flag("LockTurnSpeed", 60)) or 60
+				orient.CFrame = CFrame.lookAt(root.Position, Vector3.new(position.X, root.Position.Y, position.Z))
+				orient.Enabled = true
+			end)
+		end
+	end
+
+	if flag("LockCamera", true) then
+		local desired = CFrame.lookAt(camera.CFrame.Position, position)
+		local speed = tonumber(flag("LockCameraSpeed", 14)) or 14
+		local alpha = 1 - math.exp(-(deltaTime or 0.016) * speed)
+		camera.CFrame = camera.CFrame:Lerp(desired, alpha)
+	end
+
+	if flag("LockIndicator", true) then
+		local indicator = lockState.indicator
+		if not indicator or indicator.Adornee ~= target.focusPart or not indicator.Parent then
+			destroyLockIndicator()
+			lockState.indicator = buildLockIndicator(target.focusPart)
+		end
+	else
+		destroyLockIndicator()
+	end
+end
+
+----- Mobile controls -----
+
+-- Airflow already gives touch devices its own toggle and open buttons, so the
+-- only missing piece is a way to press the lock without a keyboard.
+local mobileState = {
+	gui = nil,
+	container = nil,
+	button = nil,
+	cycle = nil,
+	force = false,
+	dragging = false,
+	dragStart = nil,
+	startPosition = nil,
+	cleanup = nil,
+}
+
+local function mobileSize()
+	return tonumber(flag("LockMobileSize", 64)) or 64
+end
+
+local function paintMobileLock()
+	local button = mobileState.button
+	if not button then
+		return
+	end
+	local locked = lockState.active
+	button.BackgroundColor3 = locked and Color3.fromRGB(255, 59, 127) or Color3.fromRGB(16, 16, 20)
+	button.BackgroundTransparency = locked and 0.15 or 0.4
+	local stroke = button:FindFirstChildOfClass("UIStroke")
+	if stroke then
+		stroke.Transparency = locked and 0.05 or 0.4
+	end
+end
+
+local function buildMobileLock()
+	if mobileState.gui then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+	local size = mobileSize()
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RSP_MobileLock"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 20
+	gui.Parent = hiddenParent()
+
+	local container = Instance.new("Frame")
+	container.Name = "Dock"
+	container.BackgroundTransparency = 1
+	container.Size = UDim2.fromOffset(size, size + math.floor(size * 0.8))
+	container.Position = UDim2.fromOffset(viewport.X - size - 24, math.floor(viewport.Y * 0.55))
+	container.Parent = gui
+
+	local button = Instance.new("TextButton")
+	button.Name = "LockButton"
+	button.AnchorPoint = Vector2.new(0, 1)
+	button.Position = UDim2.new(0, 0, 1, 0)
+	button.Size = UDim2.fromOffset(size, size)
+	button.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+	button.BackgroundTransparency = 0.4
+	button.Text = ""
+	button.AutoButtonColor = false
+	button.BorderSizePixel = 0
+	button.Parent = container
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = button
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 59, 127)
+	stroke.Thickness = 2
+	stroke.Transparency = 0.4
+	stroke.Parent = button
+
+	local ring = Instance.new("Frame")
+	ring.Name = "Ring"
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Position = UDim2.fromScale(0.5, 0.5)
+	ring.Size = UDim2.fromScale(0.5, 0.5)
+	ring.BackgroundTransparency = 1
+	ring.Parent = button
+
+	local ringCorner = Instance.new("UICorner")
+	ringCorner.CornerRadius = UDim.new(1, 0)
+	ringCorner.Parent = ring
+
+	local ringStroke = Instance.new("UIStroke")
+	ringStroke.Color = Color3.fromRGB(255, 59, 127)
+	ringStroke.Thickness = 2
+	ringStroke.Parent = ring
+
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromScale(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(5, 5)
+	dot.BackgroundColor3 = Color3.fromRGB(255, 59, 127)
+	dot.BorderSizePixel = 0
+	dot.Parent = button
+
+	local cycle = Instance.new("TextButton")
+	cycle.Name = "NextButton"
+	cycle.AnchorPoint = Vector2.new(0.5, 0)
+	cycle.Position = UDim2.new(0.5, 0, 0, 0)
+	cycle.Size = UDim2.fromOffset(math.floor(size * 0.6), math.floor(size * 0.6))
+	cycle.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+	cycle.BackgroundTransparency = 0.45
+	cycle.Text = ">"
+	cycle.TextColor3 = Color3.fromRGB(245, 245, 247)
+	cycle.TextSize = math.floor(size * 0.3)
+	cycle.Font = Enum.Font.GothamBold
+	cycle.AutoButtonColor = false
+	cycle.BorderSizePixel = 0
+	cycle.Parent = container
+
+	local cycleCorner = Instance.new("UICorner")
+	cycleCorner.CornerRadius = UDim.new(1, 0)
+	cycleCorner.Parent = cycle
+
+	local cycleStroke = Instance.new("UIStroke")
+	cycleStroke.Color = Color3.fromRGB(255, 59, 127)
+	cycleStroke.Thickness = 1.5
+	cycleStroke.Transparency = 0.5
+	cycleStroke.Parent = cycle
+
+	mobileState.gui = gui
+	mobileState.container = container
+	mobileState.button = button
+	mobileState.cycle = cycle
+
+	local moveConnection = UserInputService.InputChanged:Connect(function(input)
+		if not mobileState.dragStart then
+			return
+		end
+		if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		local delta = Vector2.new(input.Position.X, input.Position.Y) - mobileState.dragStart
+		if delta.Magnitude > 10 then
+			mobileState.dragging = true
+		end
+		if mobileState.dragging and mobileState.startPosition then
+			container.Position = UDim2.new(
+				mobileState.startPosition.X.Scale,
+				mobileState.startPosition.X.Offset + delta.X,
+				mobileState.startPosition.Y.Scale,
+				mobileState.startPosition.Y.Offset + delta.Y
+			)
+		end
+	end)
+
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			mobileState.dragStart = Vector2.new(input.Position.X, input.Position.Y)
+			mobileState.startPosition = container.Position
+			mobileState.dragging = false
+		end
+	end)
+
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		local moved = mobileState.dragging
+		mobileState.dragStart = nil
+		mobileState.dragging = false
+		if not moved then
+			pcall(toggleLock)
+			paintMobileLock()
+		end
+	end)
+
+	cycle.Activated:Connect(function()
+		pcall(function()
+			if lockState.active then
+				cycleLock(1)
+			else
+				toggleLock()
+			end
+		end)
+		paintMobileLock()
+	end)
+
+	mobileState.cleanup = function()
+		pcall(function()
+			moveConnection:Disconnect()
+		end)
+	end
+end
+
+local function destroyMobileLock()
+	if mobileState.cleanup then
+		pcall(mobileState.cleanup)
+		mobileState.cleanup = nil
+	end
+	if mobileState.gui then
+		pcall(function()
+			mobileState.gui:Destroy()
+		end)
+	end
+	mobileState.gui = nil
+	mobileState.container = nil
+	mobileState.button = nil
+	mobileState.cycle = nil
+end
+
+local function updateMobileLock()
+	local wanted = (UserInputService.TouchEnabled or mobileState.force) and flag("LockOn", false) and flag("LockMobile", true)
+	if wanted and not mobileState.gui then
+		buildMobileLock()
+	end
+	if mobileState.gui then
+		mobileState.gui.Enabled = wanted
+		paintMobileLock()
+	end
+end
+
+----- Overlay -----
+
+local overlay = { gui = nil, frame = nil, label = nil }
+
+local function destroyOverlay()
+	if overlay.gui then
+		pcall(function()
+			overlay.gui:Destroy()
+		end)
+	end
+	overlay.gui = nil
+	overlay.frame = nil
+	overlay.label = nil
+end
+
+local function buildOverlay()
+	if overlay.gui then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RSP_Purgatorio_Overlay"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.AnchorPoint = Vector2.new(0, 0.5)
+	frame.Position = UDim2.new(0, 16, 0.5, 0)
+	frame.Size = UDim2.fromOffset(260, 92)
+	frame.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+	frame.BackgroundTransparency = 0.25
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 59, 127)
+	stroke.Transparency = 0.55
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Position = UDim2.fromOffset(12, 8)
+	label.Size = UDim2.new(1, -24, 1, -16)
+	label.Font = Enum.Font.Gotham
+	label.TextSize = 13
+	label.RichText = true
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.TextColor3 = Color3.fromRGB(245, 245, 247)
+	label.Text = ""
+	label.Parent = frame
+
+	overlay.gui, overlay.frame, overlay.label = gui, frame, label
+	gui.Parent = hiddenParent()
+end
+
+local function jobInfo()
+	local folder = workspace:FindFirstChild("GameInfo")
+	if not folder then
+		return nil
+	end
+	return folder:FindFirstChild("JobInfo")
+end
+
+local function updateOverlay()
+	if not flag("JobHud", false) then
+		if overlay.gui then
+			destroyOverlay()
+		end
+		return
+	end
+	if not overlay.gui then
+		buildOverlay()
+	end
+	if not overlay.label then
+		return
+	end
+
+	local lines = {}
+	local info = jobInfo()
+	local jobType = "idle"
+	local progress = 0
+	local packageIntegrity = 0
+	if info then
+		local typeValue = info:FindFirstChild("Type")
+		if typeValue and typeValue:IsA("ValueBase") then
+			jobType = tostring(typeValue.Value)
+		end
+		local progressValue = info:FindFirstChild("Progress")
+		if progressValue and progressValue:IsA("ValueBase") then
+			progress = tonumber(progressValue.Value) or 0
+		end
+		local packageValue = info:FindFirstChild("PackageIntegrity")
+		if packageValue and packageValue:IsA("ValueBase") then
+			packageIntegrity = tonumber(packageValue.Value) or 0
+		end
+	end
+	table.insert(lines, string.format("<b>JOB</b>  %s", escapeRich(jobType)))
+	table.insert(lines, string.format("Progress %d%%  ·  Package %d%%", math.floor(progress + 0.5), math.floor(packageIntegrity + 0.5)))
+
+	local sanity = characterValue("Sanity")
+	local shield = characterValue("Shield")
+	local stagger = characterValue("Stagger")
+	local maxStagger = characterValue("MaxStagger")
+	local statsLine = {}
+	if sanity ~= nil then
+		table.insert(statsLine, string.format("Sanity %d", math.floor((tonumber(sanity) or 0) + 0.5)))
+	end
+	if shield ~= nil then
+		table.insert(statsLine, string.format("Shield %d", math.floor((tonumber(shield) or 0) + 0.5)))
+	end
+	if stagger ~= nil and maxStagger ~= nil then
+		table.insert(statsLine, string.format("Stagger %d/%d", math.floor((tonumber(stagger) or 0) + 0.5), math.floor((tonumber(maxStagger) or 0) + 0.5)))
+	end
+	table.insert(lines, table.concat(statsLine, "  ·  "))
+	table.insert(lines, string.format("Enemies %d  ·  FPS %d", stats.enemies, stats.fps))
+
+	overlay.label.Text = table.concat(lines, "\n")
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "purgatorio - visuals and info",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptPurgatorio" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- Visuals tab -----
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local EnemiesBox = VisualsTab:CreateGroupbox({ Name = "Enemies", Side = "Left" })
+local TargetsBox = VisualsTab:CreateGroupbox({ Name = "Targets", Side = "Right" })
+
+EnemiesBox:CreateToggle({
+	Name = "Enemy ESP",
+	Desc = "Track every hostile in the map",
+	Flag = "EnemyESP",
+	CurrentValue = true,
+})
+EnemiesBox:CreateToggle({ Name = "Name", Flag = "EnemyName", CurrentValue = true, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Grade", Flag = "EnemyGrade", CurrentValue = true, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Health bar", Flag = "EnemyHealth", CurrentValue = true, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Level", Flag = "EnemyLevel", CurrentValue = false, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Faction", Flag = "EnemyFaction", CurrentValue = false, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Distance", Flag = "EnemyDistance", CurrentValue = true, DependsOn = "EnemyESP" })
+EnemiesBox:CreateDivider()
+EnemiesBox:CreateToggle({ Name = "Chams", Flag = "EnemyChams", CurrentValue = true, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Box", Flag = "EnemyBox", CurrentValue = false, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({ Name = "Tracer", Flag = "EnemyTracer", CurrentValue = false, DependsOn = "EnemyESP" })
+EnemiesBox:CreateToggle({
+	Name = "Hurtbox",
+	Desc = "Draw the hitbox the game uses for damage",
+	Flag = "EnemyHitbox",
+	CurrentValue = false,
+	DependsOn = "EnemyESP",
+})
+EnemiesBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>enemies</Muted>", stats.enemies)
+	end,
+})
+
+TargetsBox:CreateToggle({
+	Name = "NPC ESP",
+	Desc = "Citizens and shopkeepers",
+	Flag = "NPCESP",
+	CurrentValue = false,
+})
+TargetsBox:CreateToggle({ Name = "Name", Flag = "NPCName", CurrentValue = true, DependsOn = "NPCESP" })
+TargetsBox:CreateToggle({ Name = "Chams", Flag = "NPCChams", CurrentValue = true, DependsOn = "NPCESP" })
+TargetsBox:CreateDivider()
+TargetsBox:CreateToggle({
+	Name = "Ally ESP",
+	Desc = "Other fixers in the office",
+	Flag = "AllyESP",
+	CurrentValue = false,
+})
+TargetsBox:CreateToggle({ Name = "Name", Flag = "AllyName", CurrentValue = true, DependsOn = "AllyESP" })
+TargetsBox:CreateToggle({ Name = "Chams", Flag = "AllyChams", CurrentValue = true, DependsOn = "AllyESP" })
+TargetsBox:CreateDivider()
+TargetsBox:CreateToggle({
+	Name = "Gathering spots",
+	Desc = "Loot nodes generated for the current map",
+	Flag = "GatheringESP",
+	CurrentValue = false,
+})
+TargetsBox:CreateDivider()
+
+----- World tab -----
+
+local WorldTab = Window:CreateTab({ Name = "World", Icon = "sun" })
+local LightingBox = WorldTab:CreateGroupbox({ Name = "Lighting", Side = "Left" })
+local CameraBox = WorldTab:CreateGroupbox({ Name = "Camera and HUD", Side = "Right" })
+
+LightingBox:CreateToggle({
+	Name = "Fullbright",
+	Desc = "Lift the night lighting and fog",
+	Flag = "Fullbright",
+	CurrentValue = false,
+	Callback = function(on)
+		setFullbright(on)
+	end,
+})
+LightingBox:CreateToggle({
+	Name = "Weather off",
+	Desc = "Stop rain and thunder on the client",
+	Flag = "WeatherOff",
+	CurrentValue = false,
+	Callback = function(on)
+		setWeatherOff(on)
+	end,
+})
+CameraBox:CreateToggle({
+	Name = "Screen shake off",
+	Desc = "The game's own camera shake setting",
+	Flag = "ShakeOff",
+	CurrentValue = false,
+	Callback = function(on)
+		applyGameSetting("ScreenShakeSetting", not on)
+	end,
+})
+CameraBox:CreateToggle({
+	Name = "Hitbox alerts",
+	Desc = "The game's own enemy hitbox display",
+	Flag = "HitboxAlerts",
+	CurrentValue = false,
+	Callback = function(on)
+		applyGameSetting("HitboxSetting", on)
+	end,
+})
+CameraBox:CreateToggle({
+	Name = "Lock FOV",
+	Desc = "Keep the camera FOV at the slider value",
+	Flag = "FovLock",
+	CurrentValue = false,
+})
+CameraBox:CreateSlider({
+	Name = "FOV",
+	Range = { 40, 120 },
+	Increment = 5,
+	Suffix = "°",
+	CurrentValue = 70,
+	Flag = "FovValue",
+	DependsOn = "FovLock",
+})
+CameraBox:CreateDivider()
+CameraBox:CreateToggle({
+	Name = "Job HUD",
+	Desc = "Small panel with job progress and survival values",
+	Flag = "JobHud",
+	CurrentValue = false,
+})
+
+----- Combat tab -----
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "swords" })
+local LockBox = CombatTab:CreateGroupbox({ Name = "Lock-on", Side = "Left" })
+local HintBox = CombatTab:CreateGroupbox({ Name = "Controls", Side = "Right" })
+
+LockBox:CreateToggle({
+	Name = "Lock on",
+	Desc = "Holds the enemy closest to the crosshair",
+	Flag = "LockOn",
+	CurrentValue = false,
+})
+LockBox:CreateDropdown({
+	Name = "Key",
+	Desc = "Press it again to release",
+	Options = { "Middle mouse", "Q", "Tab", "F", "G" },
+	CurrentOption = "Middle mouse",
+	Flag = "LockKey",
+	DependsOn = "LockOn",
+})
+LockBox:CreateSlider({
+	Name = "Range",
+	Range = { 20, 400 },
+	Increment = 10,
+	Suffix = " studs",
+	CurrentValue = 150,
+	Flag = "LockRange",
+	DependsOn = "LockOn",
+})
+LockBox:CreateToggle({
+	Name = "Turn camera",
+	Desc = "Keeps the enemy in the centre of the screen",
+	Flag = "LockCamera",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+LockBox:CreateSlider({
+	Name = "Camera speed",
+	Range = { 4, 30 },
+	Increment = 1,
+	CurrentValue = 14,
+	Flag = "LockCameraSpeed",
+	DependsOn = { Flag = "LockCamera", Value = true },
+})
+LockBox:CreateToggle({
+	Name = "Turn character",
+	Desc = "Faces the enemy so melee hits land",
+	Flag = "LockTurnCharacter",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+LockBox:CreateSlider({
+	Name = "Turn speed",
+	Range = { 10, 100 },
+	Increment = 5,
+	CurrentValue = 60,
+	Flag = "LockTurnSpeed",
+	DependsOn = "LockTurnCharacter",
+})
+
+HintBox:CreateParagraph({
+	Title = "How to use",
+	Content = "Press the lock key to hold the enemy nearest to the crosshair, press it again to release. The mouse wheel moves to the next enemy while the lock is held. The lock drops by itself when the enemy dies or leaves the range.",
+})
+HintBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		if not lockState.active or not lockState.target then
+			return "<Muted>not locked</Muted>"
+		end
+		local position = targetPosition(lockState.target)
+		local root = localRoot()
+		if not position or not root then
+			return "<Muted>not locked</Muted>"
+		end
+		local name = (lockState.target.info and lockState.target.info.display) or "enemy"
+		return string.format("<Accent>%s</Accent> <Muted>%s</Muted>", escapeRich(name), formatDistance((position - root.Position).Magnitude))
+	end,
+})
+HintBox:CreateToggle({
+	Name = "Indicator",
+	Desc = "Ring around the locked enemy",
+	Flag = "LockIndicator",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+HintBox:CreateToggle({
+	Name = "Wheel switches",
+	Desc = "Mouse wheel jumps to the next enemy",
+	Flag = "LockSwitch",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+HintBox:CreateToggle({
+	Name = "Mobile button",
+	Desc = "On-screen lock button on touch devices",
+	Flag = "LockMobile",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+HintBox:CreateSlider({
+	Name = "Button size",
+	Range = { 44, 96 },
+	Increment = 4,
+	CurrentValue = 64,
+	Flag = "LockMobileSize",
+	DependsOn = { Flag = "LockMobile", Value = true },
+})
+HintBox:CreateButton({
+	Name = "Release lock",
+	Callback = function()
+		releaseLock()
+	end,
+})
+
+----- Info tab -----
+
+local InfoTab = Window:CreateTab({ Name = "Info", Icon = "scroll-text" })
+local FixerBox = InfoTab:CreateGroupbox({ Name = "Fixer", Side = "Left" })
+local SessionBox = InfoTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+
+FixerBox:CreateStatusList({
+	Name = "Profile",
+	MaxRows = 6,
+	UpdateRate = 1,
+	EmptyText = "No data yet",
+	Update = function()
+		local rows = {}
+		local money = dataNumber("Money")
+		local xp = dataNumber("XP")
+		local grade = dataNumber("Grade")
+		local quotas = dataNumber("SuccessfulQuotas")
+		local ammo = dataNumber("AmmoReserves")
+		local deaths = dataNumber("TotalDeaths")
+		if money ~= nil then
+			table.insert(rows, { Text = "Money", Value = tostring(money) })
+		end
+		if xp ~= nil then
+			table.insert(rows, { Text = "XP", Value = tostring(xp) })
+		end
+		if grade ~= nil then
+			table.insert(rows, { Text = "Grade", Value = "G" .. tostring(grade) })
+		end
+		if quotas ~= nil then
+			table.insert(rows, { Text = "Quotas", Value = tostring(quotas) })
+		end
+		if ammo ~= nil then
+			table.insert(rows, { Text = "Ammo reserve", Value = tostring(ammo) })
+		end
+		if deaths ~= nil then
+			table.insert(rows, { Text = "Deaths", Value = tostring(deaths) })
+		end
+		local data = playerData()
+		local upgrades = data and data:FindFirstChild("Upgrades")
+		if upgrades then
+			for _, upgrade in ipairs(upgrades:GetChildren()) do
+				if upgrade:IsA("ValueBase") then
+					table.insert(rows, { Text = upgrade.Name, Value = tostring(upgrade.Value) })
+				end
+			end
+		end
+		return rows
+	end,
+})
+
+FixerBox:CreateStatusList({
+	Name = "Bestiary",
+	MaxRows = 5,
+	UpdateRate = 1,
+	EmptyText = "No enemies in range",
+	Update = function()
+		local rows = {}
+		local origin = distanceOrigin()
+		for _, target in pairs(targets) do
+			if target.kind == "enemy" and target.focusPart and target.focusPart.Parent then
+				local info = target.info or {}
+				local humanoid = target.humanoid
+				local health = humanoid and humanoid.Health or 0
+				local maxHealth = humanoid and humanoid.MaxHealth or 0
+				local distance = (target.focusPart.Position - origin).Magnitude
+				local text = (info.display or "Enemy") .. "  G" .. tostring(info.grade or "?")
+				local value = string.format("%d/%d · %s", math.floor(health + 0.5), math.floor(maxHealth + 0.5), formatDistance(distance))
+				table.insert(rows, { Text = text, Value = value })
+			end
+		end
+		return rows
+	end,
+})
+
+SessionBox:CreateStatusList({
+	Name = "Server",
+	MaxRows = 7,
+	UpdateRate = 1,
+	Update = function()
+		local rows = {}
+		table.insert(rows, { Text = "Game", Value = escapeRich(game.Name) })
+		table.insert(rows, { Text = "Place", Value = tostring(game.PlaceId) })
+		table.insert(rows, { Text = "Version", Value = tostring(game.PlaceVersion) })
+		local map = workspace:FindFirstChild("Map")
+		local currentMap = map and map:FindFirstChild("CurrentMap")
+		if currentMap and currentMap:IsA("ValueBase") then
+			table.insert(rows, { Text = "Map", Value = escapeRich(tostring(currentMap.Value)) })
+		end
+		local gamemode = workspace:FindFirstChild("ActiveGamemode")
+		if gamemode and gamemode:IsA("ValueBase") then
+			table.insert(rows, { Text = "Mode", Value = escapeRich(tostring(gamemode.Value)) })
+		end
+		local info = jobInfo()
+		local jobType = info and info:FindFirstChild("Type")
+		if jobType and jobType:IsA("ValueBase") then
+			table.insert(rows, { Text = "Job", Value = escapeRich(tostring(jobType.Value)) })
+		end
+		table.insert(rows, { Text = "Players", Value = tostring(#Players:GetPlayers()) })
+		table.insert(rows, { Text = "Host", Value = tostring(LocalPlayer:GetAttribute("Host")) })
+		table.insert(rows, { Text = "JobId", Value = tostring(game.JobId):sub(1, 8) })
+		return rows
+	end,
+})
+
+----- Codex -----
+
+local codexCache = {}
+
+local function moduleTable(name, getter)
+	if codexCache[name] ~= nil then
+		return codexCache[name] or nil
+	end
+	local module = asset(name)
+	if not module then
+		codexCache[name] = false
+		return nil
+	end
+	local ok, result = pcall(function()
+		return require(module)[getter]()
+	end)
+	if ok and type(result) == "table" then
+		codexCache[name] = result
+		return result
+	end
+	codexCache[name] = false
+	return nil
+end
+
+local function damageTable()
+	return moduleTable("DamageValues", "GetTable")
+end
+
+local function itemTable()
+	return moduleTable("ItemTable", "GetTable")
+end
+
+local function equipTable()
+	return moduleTable("EquipsTable", "GetTable")
+end
+
+local function abilityInfo()
+	if codexCache.abilityInfo ~= nil then
+		return codexCache.abilityInfo or nil
+	end
+	local module = asset("AbilityInfo")
+	if not module then
+		codexCache.abilityInfo = false
+		return nil
+	end
+	local ok, result = pcall(function()
+		return require(module)
+	end)
+	if ok and type(result) == "table" then
+		codexCache.abilityInfo = result
+		return result
+	end
+	codexCache.abilityInfo = false
+	return nil
+end
+
+local function buildWeaponRows()
+	local rows = {}
+	local weapons = asset("WeaponScripts")
+	if not weapons then
+		return rows
+	end
+	local damage = damageTable()
+	local info = abilityInfo()
+	for _, folder in ipairs(weapons:GetChildren()) do
+		if folder:IsA("Folder") then
+			local modules = {}
+			for _, child in ipairs(folder:GetChildren()) do
+				if child:IsA("ModuleScript") then
+					table.insert(modules, child)
+				end
+			end
+			table.sort(modules, function(a, b)
+				return a.Name < b.Name
+			end)
+			for _, module in ipairs(modules) do
+				local id = module:GetAttribute("Name")
+				if type(id) ~= "string" then
+					id = module.Name
+				end
+				local data = damage and damage[id]
+				local meta = info and info[id]
+				local damageText = "-"
+				local staggerText = "-"
+				if data then
+					damageText = string.format("%d-%d", math.floor((data.DamageMin or 0) + 0.5), math.floor((data.DamageMax or 0) + 0.5))
+					staggerText = string.format("%.1f", data.StaggerDamage or 0)
+				end
+				table.insert(rows, {
+					folder.Name,
+					id,
+					(meta and meta.Type) or "—",
+					damageText,
+					staggerText,
+				})
+			end
+		end
+	end
+	return rows
+end
+
+local function buildItemRows()
+	local rows = {}
+	local items = itemTable()
+	if not items then
+		return rows
+	end
+	local names = {}
+	for name in pairs(items) do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		local entry = items[name]
+		if type(entry) == "table" then
+			local description = tostring(entry.Description or entry.Lore or "")
+			description = description:gsub("\n", " ")
+			if #description > 64 then
+				description = description:sub(1, 61) .. "..."
+			end
+			table.insert(rows, {
+				tostring(entry.Name or name),
+				tostring(entry.Type or "-"),
+				tostring(entry.MaxStack or 1),
+				escapeRich(description),
+			})
+		end
+	end
+	return rows
+end
+
+local function buildEquipRows()
+	local rows = {}
+	local equips = equipTable()
+	if not equips then
+		return rows
+	end
+	local names = {}
+	for name in pairs(equips) do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		local entry = equips[name]
+		if type(entry) == "table" then
+			table.insert(rows, {
+				tostring(entry.Name or name),
+				tostring(entry.Type or "-"),
+				tostring(entry.Grade or "-"),
+				tostring(entry.Defense or 0),
+			})
+		end
+	end
+	return rows
+end
+
+local CODEX = {
+	Weapons = {
+		columns = {
+			"Weapon",
+			{ Name = "Ability", Width = 0.3 },
+			{ Name = "Type", Width = 0.2 },
+			{ Name = "Damage", Align = "Right" },
+			{ Name = "Stagger", Align = "Right" },
+		},
+		build = buildWeaponRows,
+	},
+	Items = {
+		columns = {
+			"Item",
+			{ Name = "Type", Width = 0.25 },
+			{ Name = "Stack", Align = "Right", Width = 0.1 },
+			{ Name = "Effect", Width = 0.42 },
+		},
+		build = buildItemRows,
+	},
+	Equipment = {
+		columns = {
+			"Equipment",
+			{ Name = "Slot", Width = 0.25 },
+			{ Name = "Grade", Align = "Right", Width = 0.12 },
+			{ Name = "Defense", Align = "Right", Width = 0.15 },
+		},
+		build = buildEquipRows,
+	},
+}
+
+local refreshCodex
+
+local CodexTab = Window:CreateTab({ Name = "Codex", Icon = "table" })
+
+local CodexDropdown = CodexTab:CreateDropdown({
+	Name = "Codex",
+	Desc = "Weapons, items and clothes read from the game modules",
+	Options = { "Weapons", "Items", "Equipment" },
+	CurrentOption = "Weapons",
+	Flag = "CodexSource",
+	Callback = function()
+		task.spawn(function()
+			if refreshCodex then
+				refreshCodex()
+			end
+		end)
+	end,
+})
+
+local CodexTable = CodexTab:CreateTable({
+	Name = "Codex",
+	Columns = CODEX.Weapons.columns,
+	Rows = {},
+	MaxRows = 11,
+	EmptyText = "Pick a source above",
+})
+
+refreshCodex = function()
+	local source = flag("CodexSource", "Weapons")
+	local entry = CODEX[source]
+	if not entry then
+		return
+	end
+	local ok, rows = pcall(entry.build)
+	if not ok or type(rows) ~= "table" then
+		rows = {}
+	end
+	pcall(function()
+		CodexTable:SetColumns(entry.columns)
+		CodexTable:SetRows(rows)
+	end)
+end
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local StyleBox = SettingsTab:CreateGroupbox({ Name = "Colors", Side = "Left" })
+StyleBox:CreateColorPicker({ Name = "Enemy", Color = COLOR_ENEMY, Flag = "EnemyColor" })
+StyleBox:CreateColorPicker({ Name = "Elite", Color = COLOR_ELITE, Flag = "EliteColor" })
+StyleBox:CreateColorPicker({ Name = "NPC", Color = COLOR_NPC, Flag = "NpcColor" })
+StyleBox:CreateColorPicker({ Name = "Ally", Color = COLOR_ALLY, Flag = "AllyColor" })
+StyleBox:CreateColorPicker({ Name = "Gathering", Color = COLOR_GATHERING, Flag = "GatheringColor" })
+
+local ActionsBox = SettingsTab:CreateGroupbox({ Name = "Actions", Side = "Right" })
+ActionsBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 100, 5000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 2500,
+	Flag = "RenderDistance",
+})
+ActionsBox:CreateButton({
+	Name = "Refresh",
+	Desc = "Rescan enemies, NPCs and loot",
+	Callback = function()
+		pcall(collectTargets)
+		Window:Notify({ Title = "Refreshed", Content = "Target list rebuilt", Type = "Info" })
+	end,
+})
+ActionsBox:CreateButton({
+	Name = "Clear ESP",
+	Desc = "Remove every label, highlight and line",
+	Callback = function()
+		clearAllTargets()
+		Window:Notify({ Title = "Cleared", Content = "All ESP objects removed", Type = "Info" })
+	end,
+})
+ActionsBox:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop the visuals",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptPurgatorio
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+----- Runtime -----
+
+resetFlagCache()
+
+local running = true
+local collectAccumulator = 0
+local visualAccumulator = 0
+local effectsAccumulator = 0
+local lastError = nil
+
+-- pcall alone would swallow a broken render tick, so every failure is kept
+-- and warned once per message; GetLastError exposes it to the caller.
+local function safeCall(fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then
+		local message = tostring(err)
+		lastError = message
+		if stats.lastError ~= message then
+			stats.lastError = message
+			warn("[RobScript Purgatorio] " .. message)
+		end
+	end
+	return ok
+end
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	if deltaTime > 0 then
+		stats.fps = math.floor(1 / deltaTime + 0.5)
+	end
+	collectAccumulator = collectAccumulator + deltaTime
+	visualAccumulator = visualAccumulator + deltaTime
+	effectsAccumulator = effectsAccumulator + deltaTime
+
+	if collectAccumulator >= COLLECT_INTERVAL then
+		collectAccumulator = 0
+		safeCall(collectTargets)
+	end
+
+	if visualAccumulator >= VISUAL_INTERVAL then
+		visualAccumulator = 0
+		for _, target in pairs(targets) do
+			safeCall(updateTarget, target)
+		end
+		updateStats()
+	end
+
+	if effectsAccumulator >= EFFECTS_INTERVAL then
+		effectsAccumulator = 0
+		if flag("Fullbright", false) then
+			refreshFullbright()
+		end
+		refreshFov()
+		safeCall(updateOverlay)
+		safeCall(updateMobileLock)
+	end
+end)
+
+local lockConnection = RunService.RenderStepped:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	if flag("LockOn", false) then
+		safeCall(updateLock, deltaTime)
+	elseif lockState.active then
+		releaseLock()
+	end
+end)
+
+local lockInput = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running or not flag("LockOn", false) then
+		return
+	end
+	local expected = LOCK_KEYS[flag("LockKey", "Middle mouse")]
+	if not expected then
+		return
+	end
+	local matches = false
+	if expected.EnumType == Enum.UserInputType then
+		matches = input.UserInputType == expected
+	else
+		matches = input.KeyCode == expected
+	end
+	if matches then
+		safeCall(toggleLock)
+	end
+end)
+
+local lockWheel = UserInputService.InputChanged:Connect(function(input, processed)
+	if processed or not running or not lockState.active then
+		return
+	end
+	if not flag("LockSwitch", true) then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseWheel and input.Position.Z ~= 0 then
+		safeCall(cycleLock, input.Position.Z > 0 and 1 or -1)
+	end
+end)
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			setFlag("EnemyESP", false)
+			setFlag("NPCESP", false)
+			setFlag("AllyESP", false)
+			setFlag("GatheringESP", false)
+			setFlag("LockOn", false)
+			releaseLock()
+			clearAllTargets()
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	pcall(function()
+		lockConnection:Disconnect()
+	end)
+	pcall(function()
+		lockInput:Disconnect()
+	end)
+	pcall(function()
+		lockWheel:Disconnect()
+	end)
+	pcall(releaseLock)
+	pcall(destroyMobileLock)
+	clearAllTargets()
+	destroyOverlay()
+	pcall(function()
+		setFullbright(false)
+	end)
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptPurgatorio then
+		getgenv().RobScriptPurgatorio = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptPurgatorio = {
+	Version = "1.1",
+	Actions = {
+		Refresh = collectTargets,
+		Clear = clearAllTargets,
+		RefreshCodex = refreshCodex,
+		Destroy = destroy,
+	},
+	GetStats = function()
+		return {
+			enemies = stats.enemies,
+			npcs = stats.npcs,
+			allies = stats.allies,
+			gathering = stats.gathering,
+			targets = (function()
+				local count = 0
+				for _ in pairs(targets) do
+					count = count + 1
+				end
+				return count
+			end)(),
+		}
+	end,
+	GetLock = function()
+		local target = lockState.target
+		return {
+			active = lockState.active,
+			target = target and ((target.info and target.info.display) or "enemy") or nil,
+			distance = (function()
+				local position = target and targetPosition(target)
+				local root = localRoot()
+				if not position or not root then
+					return nil
+				end
+				return math.floor((position - root.Position).Magnitude + 0.5)
+			end)(),
+		}
+	end,
+	ToggleLock = function()
+		return toggleLock()
+	end,
+	CycleLock = function(direction)
+		if not lockState.active then
+			return false
+		end
+		cycleLock(direction)
+		return true
+	end,
+	ToggleUI = function()
+		pcall(function()
+			Window:Toggle()
+		end)
+	end,
+	ReleaseLock = function()
+		releaseLock()
+	end,
+	ShowMobileLock = function(force)
+		mobileState.force = force == true
+		updateMobileLock()
+		return mobileState.gui ~= nil and mobileState.gui.Enabled
+	end,
+	GetLastError = function()
+		return lastError
+	end,
+	GetCodexCount = function()
+		local source = flag("CodexSource", "Weapons")
+		local entry = CODEX[source]
+		if not entry then
+			return 0
+		end
+		local ok, rows = pcall(entry.build)
+		if ok and type(rows) == "table" then
+			return #rows
+		end
+		return 0
+	end,
+	SaveConfig = function(name)
+		return (pcall(function()
+			Window:SaveConfig(name)
+		end))
+	end,
+	LoadConfig = function(name)
+		return (pcall(function()
+			Window:LoadConfig(name)
+		end))
+	end,
+	ListConfigs = function()
+		local ok, list = pcall(function()
+			return Window:ListConfigs()
+		end)
+		if ok and type(list) == "table" then
+			return list
+		end
+		return {}
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	GetCodexSources = function()
+		local list = {}
+		for key in pairs(CODEX) do
+			table.insert(list, key)
+		end
+		table.sort(list)
+		return list
+	end,
+	SetCodex = function(source)
+		if not CODEX[source] then
+			return false
+		end
+		pcall(function()
+			setFlag("CodexSource", source)
+		end)
+		pcall(refreshCodex)
+		return true
+	end,
+	SelectTab = function(name)
+		local map = { Visuals = VisualsTab, World = WorldTab, Combat = CombatTab, Info = InfoTab, Codex = CodexTab, Settings = SettingsTab }
+		local tab = map[name]
+		if not tab then
+			return false
+		end
+		return (pcall(function()
+			Window:SelectTab(tab)
+		end))
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+task.spawn(function()
+	pcall(collectTargets)
+	pcall(refreshCodex)
+end)
+
+Window:Notify({ Title = "Robscript Team", Content = "PURGATORIO v1 is ready", Type = "Success" })
+
+return getgenv().RobScriptPurgatorio
