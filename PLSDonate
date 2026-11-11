@@ -2012,10 +2012,6 @@ HopBox:CreateLabel({
 	Text = "<Muted>" .. Airflow:T("Autoload link is set by default") .. "</Muted>",
 })
 
-HopBox:CreateLabel({
-	Text = "<Muted>" .. Airflow:T("Paste the raw link you load the hub from") .. "</Muted>",
-})
-
 HopBox:CreateToggle({
 	Name = "Voice servers",
 	Desc = "Hops into the voice chat world when the account allows it",
