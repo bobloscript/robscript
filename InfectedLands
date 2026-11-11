@@ -1,0 +1,2507 @@
+-- Robscript Team - Infected Lands
+-- Game: Infected Lands | placeId 122789100578830 | gameId 8468366390
+-- Tabs: Status, Visuals, Style, Settings
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptIL
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its loops, highlights and labels die first.
+do
+	local existing = getgenv().RobScriptIL
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript IL] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Language -----
+
+-- The script itself stays English: every visible string goes through the
+-- library dictionary, so the flag in the header switches language live without
+-- rebuilding the window. Dropdown values stay English for the callbacks.
+local RU_STRINGS = {
+	-- tabs and boxes
+	["Status"] = "Статус",
+	["Visuals"] = "Визуалы",
+	["Style"] = "Стиль",
+	["Map"] = "Карта",
+	["Settings"] = "Настройки",
+	["Survival"] = "Выживание",
+	["Lifetime"] = "За всё время",
+	["On the game map"] = "На игровой карте",
+	["Layers"] = "Слои",
+	["Colors"] = "Цвета",
+	["Range"] = "Дальность",
+	["Distance range"] = "Дальность",
+	["Players & infected"] = "Игроки и заражённые",
+	["World"] = "Мир",
+
+	-- survival statuses
+	["Stamina"] = "Стамина",
+	["Hunger"] = "Голод",
+	["Thirst"] = "Жажда",
+	["Infection"] = "Заражение",
+	["Protection"] = "Защита",
+	["clean"] = "чисто",
+	["stage %d"] = "стадия %d",
+	["immune %ds"] = "иммунитет %dс",
+	["spawn shield"] = "щит после спавна",
+	["none"] = "нет",
+
+	-- lifetime
+	["Days survived"] = "Дней выжито",
+	["Zombie kills"] = "Убито зомби",
+	["Player kills"] = "Убито игроков",
+	["Playtime"] = "Наиграно",
+	["Profession"] = "Профессия",
+	["tier %d"] = "тир %d",
+	["Zombie kills (prof)"] = "Убийства (проф.)",
+	["headshots %d"] = "в голову %d",
+	["Markers"] = "Метки",
+	["on screen"] = "на экране",
+	["Airdrop credits"] = "Кредиты аирдропа",
+	["blood moon %d"] = "кровавая луна %d",
+
+	-- hud
+	["On-screen HUD"] = "HUD на экране",
+	["Survival bars in the corner of the screen"] = "Полосы выживания в углу экрана",
+	["HUD corner"] = "Угол HUD",
+	["HUD scale"] = "Масштаб HUD",
+	["Top Left"] = "Слева сверху",
+	["Top Right"] = "Справа сверху",
+	["Bottom Left"] = "Слева снизу",
+	["Bottom Right"] = "Справа снизу",
+	["no waypoint"] = "нет вейпоинта",
+	["STAGE %d"] = "СТАДИЯ %d",
+
+	-- players
+	["Player ESP"] = "ESP игроков",
+	["Survivors and infected players"] = "Выжившие и заражённые игроки",
+	["Show"] = "Показывать",
+	["Everyone"] = "Все",
+	["Infected only"] = "Только заражённые",
+	["Clean only"] = "Только чистые",
+	["Name"] = "Имя",
+	["Faction"] = "Фракция",
+	["Health"] = "Здоровье",
+	["Distance"] = "Дистанция",
+	["Infected tag"] = "Метка заражения",
+	["Chams"] = "Подсветка",
+	["Players"] = "Игроки",
+	["tracked · %s"] = "в зоне · %s",
+
+	-- zombies
+	["Zombie ESP"] = "ESP зомби",
+	["Infected NPCs with health and archetype"] = "Заражённые с HP и архетипом",
+	["Blood moon tag"] = "Метка кровавой луны",
+	["Spawn code"] = "Код спавна",
+	["Zombies"] = "Зомби",
+	["nearby · %s"] = "рядом · %s",
+
+	-- loot
+	["Loot ESP"] = "ESP лута",
+	["Unlooted containers, crates and corpses"] = "Необысканные контейнеры, ящики и трупы",
+	["Types"] = "Типы",
+	["Container name"] = "Название контейнера",
+	["Hide looted"] = "Скрывать обысканное",
+	["Containers"] = "Контейнеры",
+	["unlooted · %s"] = "необыскано · %s",
+	["Loot"] = "Лут",
+
+	-- vehicles, corpses, airdrops
+	["Vehicle ESP"] = "ESP машин",
+	["Cars with health and fuel"] = "Машины с HP и топливом",
+	["Fuel"] = "Топливо",
+	["Corpses"] = "Трупы",
+	["Player and zombie bodies left on the map"] = "Тела игроков и зомби на карте",
+	["Owner name"] = "Имя владельца",
+	["Airdrops"] = "Аирдропы",
+	["Military crates after a drop"] = "Военные ящики после дропа",
+	["Airdrop"] = "Аирдроп",
+	["Vehicles"] = "Машины",
+	["Corpse"] = "Труп",
+	["Player"] = "Игрок",
+	["Infected player"] = "Заражённый игрок",
+	["Vehicle"] = "Машина",
+	["Gun crate"] = "Оружейный ящик",
+
+	-- style
+	["Players further than this are not tracked"] = "Игроки дальше не отслеживаются",
+	["Text size"] = "Размер текста",
+	["Marker limit"] = "Лимит меток",
+	["Caps how many labels are drawn at once"] = "Сколько подписей рисовать одновременно",
+	["Distance from"] = "Дистанция от",
+	["Camera"] = "Камера",
+	["Character"] = "Персонаж",
+	["Camera is smoother while driving, character matches your body"] = "Камера плавнее в машине, персонаж — по телу",
+	["Clear ESP"] = "Очистить ESP",
+	["Remove every highlight and label"] = "Убрать все метки и подсветки",
+	["Unload"] = "Выгрузить",
+	["Close the interface and stop everything"] = "Закрыть интерфейс и остановить всё",
+
+	-- settings and map tab
+	["Configs"] = "Конфиги",
+	["Theme"] = "Тема",
+	["Panic key"] = "Паника",
+	["End hides every marker and the on-screen HUD, the window stays open. RightControl toggles the interface."] = "End скрывает метки и HUD, окно остаётся. RightControl показывает и скрывает интерфейс.",
+	["Markers on map"] = "Метки на карте",
+	["Draws into the map the game opens with M"] = "Рисует на карте, которую игра открывает по M",
+	["Clear waypoint"] = "Сбросить вейпоинт",
+	["Removes the diamond and the HUD arrow"] = "Убирает ромб и стрелку на HUD",
+	["How to use"] = "Как пользоваться",
+	["Open the map with M. Right click the map to drop a waypoint, the HUD arrow under the bars points to it and shows the distance. Everything else is drawn next to the game's own markers."] = "Открой карту на M. Правый клик по карте ставит вейпоинт: стрелка под полосами HUD показывает на него и дистанцию. Остальные метки рисуются рядом с маркерами игры.",
+	["Waypoint"] = "Вейпоинт",
+	["not set"] = "не задан",
+	["Including infected, colored by state"] = "Включая заражённых, цвет по состоянию",
+	["Unlooted containers found by the scanner"] = "Необысканные контейнеры, найденные сканером",
+
+	-- notifications
+	["Cleared"] = "Готово",
+	["All ESP objects removed"] = "Все метки ESP убраны",
+	["Infected Lands survival hub is ready"] = "Хаб Infected Lands готов",
+	["infected lands - survival"] = "infected lands - выживание",
+	["Survival 1.0"] = "Выживание 1.0",
+	["studs"] = "стадов",
+	["Guns"] = "Оружие",
+	["Medical"] = "Медицина",
+	["Food"] = "Еда",
+	["Other"] = "Прочее",
+	["fuel"] = "топл.",
+	["flat"] = "пробито",
+	["Zombie"] = "Зомби",
+	["Speedy zombie"] = "Быстрый зомби",
+	["Tanky zombie"] = "Танк-зомби",
+	["BLOOD MOON"] = "КРОВАВАЯ ЛУНА",
+	["INFECTED"] = "ЗАРАЖЁН",
+	["WRECK"] = "ХЛАМ",
+	["AIRDROP"] = "АИРДРОП",
+}
+
+pcall(function()
+	Airflow:AddLanguage("ru", {
+		Name = "Русский",
+		Flag = "ru",
+		Strings = RU_STRINGS,
+	})
+end)
+
+-- Translation helper: works even if the library build has no T, and keeps the
+-- raw string when the key is missing.
+local unpackArgs = table.unpack or unpack
+
+local translationCache = {}
+
+local function T(text, ...)
+	local count = select("#", ...)
+	if count == 0 then
+		local cached = translationCache[text]
+		if cached then
+			return cached
+		end
+	end
+	local args = { ... }
+	local ok, translated = pcall(function()
+		return Airflow:T(text, unpackArgs(args, 1, count))
+	end)
+	if ok and type(translated) == "string" then
+		-- Only real translations are cached: caching the source string would
+		-- poison the cache once the player switches language.
+		if count == 0 and translated ~= text then
+			translationCache[text] = translated
+		end
+		return translated
+	end
+	if count > 0 then
+		local formatted, value = pcall(string.format, text, unpackArgs(args, 1, count))
+		if formatted then
+			return value
+		end
+	end
+	return text
+end
+
+----- Constants -----
+
+-- Collection rebuilds the marker list; visuals only push text into labels that
+-- already exist. Loot needs a walk over the world, so it runs slower.
+local COLLECT_INTERVAL = 0.35
+local VISUAL_INTERVAL = 0.05
+local LOOT_SCAN_INTERVAL = 1.2
+local HUD_INTERVAL = 0.2
+local MAP_INTERVAL = 0.25
+
+-- Roblox keeps about 31 highlights alive at once, so chams are rationed by
+-- distance and never starve the billboards.
+local CHAM_BUDGET = 24
+local MAX_MARKERS = 160
+
+local COLOR_PLAYER = Color3.fromRGB(90, 214, 255)
+local COLOR_INFECTED = Color3.fromRGB(255, 86, 122)
+local COLOR_ZOMBIE = Color3.fromRGB(255, 176, 96)
+local COLOR_LOOT = Color3.fromRGB(255, 208, 92)
+local COLOR_RARE = Color3.fromRGB(255, 138, 62)
+local COLOR_VEHICLE = Color3.fromRGB(176, 124, 255)
+local COLOR_CORPSE = Color3.fromRGB(150, 160, 175)
+local COLOR_AIRDROP = Color3.fromRGB(120, 255, 180)
+
+local KIND_PLAYER = "player"
+local KIND_ZOMBIE = "zombie"
+local KIND_LOOT = "loot"
+local KIND_VEHICLE = "vehicle"
+local KIND_CORPSE = "corpse"
+local KIND_AIRDROP = "airdrop"
+
+local FACTION_TAG = {
+	civ = "CIV",
+	ng = "NG",
+	fm = "FM",
+	un = "UN",
+}
+
+local LOOT_CATEGORIES = { "Guns", "Medical", "Food", "Vehicles", "Other" }
+
+----- Flags -----
+
+-- Flags are cached after the interface is built, so a config load cannot
+-- desync the runtime: every tick reads the same objects the user sees.
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+local function number(value, fallback)
+	local parsed = tonumber(value)
+	if parsed == nil then
+		return fallback
+	end
+	return parsed
+end
+
+----- Helpers -----
+
+local function escapeRichText(text)
+	local value = tostring(text)
+	value = value:gsub("&", "&amp;")
+	value = value:gsub("<", "&lt;")
+	value = value:gsub(">", "&gt;")
+	return value
+end
+
+-- Turns "gun_crate_Normal" and "Zombie_01_S1_P1" into readable words without
+-- destroying names that already carry their own capitals.
+local function prettify(text)
+	local spaced = tostring(text):gsub("_", " ")
+	spaced = spaced:gsub("(%l)(%u)", "%1 %2")
+	spaced = spaced:gsub("(%u)(%u%l)", "%1 %2")
+	spaced = spaced:gsub("^%l", string.upper)
+	return spaced
+end
+
+-- Distance is measured from the camera: in this game the character can be in a
+-- vehicle seat while the camera is somewhere else entirely.
+local function distanceOrigin()
+	if flag("DistanceFrom", "Camera") == "Character" then
+		local character = LocalPlayer.Character
+		if character then
+			local root = character:FindFirstChild("HumanoidRootPart")
+			if root then
+				return root.Position
+			end
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		return camera.CFrame.Position
+	end
+	return Vector3.zero
+end
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function firstBasePart(model)
+	local primary = model.PrimaryPart
+	if primary then
+		return primary
+	end
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") then
+			return child
+		end
+	end
+	return model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function rootOf(model)
+	if not model then
+		return nil
+	end
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	local head = model:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head
+	end
+	return firstBasePart(model)
+end
+
+local function percent(value, maximum)
+	if not maximum or maximum <= 0 then
+		return 0
+	end
+	return math.clamp(value / maximum, 0, 1)
+end
+
+----- State -----
+
+-- visuals[adornee] = { billboard, label, highlight }
+local visuals = {}
+local stats = { players = 0, zombies = 0, loot = 0, vehicles = 0, corpses = 0, airdrops = 0, markers = 0 }
+local sessionStart = os.clock()
+local running = true
+local hud = { gui = nil, rows = {}, title = nil, frame = nil, scale = nil, waypoint = nil }
+
+----- Map projection -----
+
+-- The game ships its own top-down raster, so the hub draws markers over that
+-- instead of inventing a map: same picture the player sees in the game menu.
+local MAP_FALLBACK = {
+	image = "rbxassetid://82250200093950",
+	minX = -7168,
+	spanX = 14329,
+	minZ = -11236,
+	spanZ = 14304,
+	northIsNegativeZ = true,
+}
+
+local function readMapConfig()
+	local ok, cfg = pcall(function()
+		return require(game:GetService("ReplicatedStorage").Shared.common.config.mapConfig)
+	end)
+	if ok and type(cfg) == "table" and type(cfg.bounds) == "table" and type(cfg.image) == "string" then
+		local bounds = cfg.bounds
+		local minX = tonumber(bounds.minX)
+		local spanX = tonumber(bounds.spanX)
+		local minZ = tonumber(bounds.minZ)
+		local spanZ = tonumber(bounds.spanZ)
+		if minX and spanX and minZ and spanZ and spanX > 0 and spanZ > 0 then
+			return {
+				image = cfg.image,
+				minX = minX,
+				spanX = spanX,
+				minZ = minZ,
+				spanZ = spanZ,
+				northIsNegativeZ = cfg.northIsNegativeZ ~= false,
+			}
+		end
+	end
+	return MAP_FALLBACK
+end
+
+local MAP = readMapConfig()
+
+local function worldToUV(x, z)
+	local u = (x - MAP.minX) / MAP.spanX
+	local v = (z - MAP.minZ) / MAP.spanZ
+	if not MAP.northIsNegativeZ then
+		v = 1 - v
+	end
+	return u, v
+end
+
+local function uvToWorld(u, v)
+	if not MAP.northIsNegativeZ then
+		v = 1 - v
+	end
+	return MAP.minX + u * MAP.spanX, MAP.minZ + v * MAP.spanZ
+end
+
+-- The game already ships a map on M, so the hub does not draw a second one: it
+-- adds a marker layer inside PlayerGui.MapUI.Map and lets the game pan it.
+local mapState = {
+	folder = nil,
+	parent = nil,
+	self = nil,
+	waypointMarker = nil,
+	pool = setmetatable({}, { __mode = "k" }),
+	waypoint = nil,
+	clickConnection = nil,
+	clickParent = nil,
+}
+
+----- Visual objects -----
+
+local function buildBillboard(part)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ESP_Billboard"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(240, 34)
+	billboard.StudsOffset = Vector3.new(0, math.max(part.Size.Y * 0.8, 0.5) + 0.5, 0)
+	billboard.Enabled = false
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ESP_Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 14
+	label.RichText = true
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Bottom
+	label.TextStrokeTransparency = 0.35
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = ""
+	label.Parent = billboard
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard, label
+end
+
+local function buildHighlight(model)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "ESP_Chams"
+	highlight.Adornee = model
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillTransparency = 0.7
+	highlight.OutlineTransparency = 0.1
+	highlight.Parent = model
+	return highlight
+end
+
+local function destroyVisual(visual)
+	if visual.highlight then
+		pcall(function()
+			visual.highlight:Destroy()
+		end)
+		visual.highlight = nil
+	end
+	if visual.billboard then
+		pcall(function()
+			visual.billboard:Destroy()
+		end)
+		visual.billboard = nil
+		visual.label = nil
+	end
+end
+
+local function ensureVisual(adornee)
+	local visual = visuals[adornee]
+	if visual and visual.billboard and visual.billboard.Parent == adornee then
+		return visual
+	end
+	if visual then
+		destroyVisual(visual)
+	end
+	local billboard, label = buildBillboard(adornee)
+	visual = { billboard = billboard, label = label }
+	visuals[adornee] = visual
+	return visual
+end
+
+local function clearVisuals()
+	for adornee, visual in pairs(visuals) do
+		destroyVisual(visual)
+		visuals[adornee] = nil
+	end
+	for _, key in pairs({ "players", "zombies", "loot", "vehicles", "corpses", "airdrops", "markers" }) do
+		stats[key] = 0
+	end
+end
+
+----- Loot -----
+
+local LOOT_HOST_NAMES = {
+	["_LootProxies"] = true,
+	["_ClientPrefabLootPrompts"] = true,
+}
+
+local lootHosts = {}
+local lootHostsScannedAt = 0
+
+-- Loot is stored under two proxy hosts that the game streams in with houses, so
+-- the world is walked on a slow timer instead of every frame.
+local function scanLootHosts()
+	local hosts = {}
+	local stack = { workspace }
+	while #stack > 0 do
+		local current = table.remove(stack)
+		for _, child in ipairs(current:GetChildren()) do
+			if LOOT_HOST_NAMES[child.Name] then
+				hosts[#hosts + 1] = child
+			elseif child ~= workspace.CurrentCamera then
+				stack[#stack + 1] = child
+			end
+		end
+	end
+	lootHosts = hosts
+	lootHostsScannedAt = os.clock()
+	return hosts
+end
+
+local function isLooted(instance)
+	local node = instance
+	for _ = 1, 3 do
+		if not node then
+			break
+		end
+		if node:GetAttribute("Looted") == true then
+			return true
+		end
+		node = node.Parent
+	end
+	return false
+end
+
+local function lootTitle(prompt)
+	local text = prompt.ObjectText
+	if type(text) ~= "string" or text == "" or string.find(string.lower(text), "loot available", 1, true) then
+		local parent = prompt.Parent
+		if parent then
+			local cleaned = parent.Name
+			cleaned = cleaned:gsub("_Normal$", ""):gsub("_Rare$", ""):gsub("_Common$", "")
+			return prettify(cleaned)
+		end
+		return "Container"
+	end
+	return text
+end
+
+local function lootCategory(title)
+	local low = string.lower(title)
+	if string.find(low, "gun", 1, true)
+		or string.find(low, "display case", 1, true)
+		or string.find(low, "military", 1, true)
+		or string.find(low, "armory", 1, true)
+		or string.find(low, "police", 1, true)
+	then
+		return "Guns"
+	end
+	if string.find(low, "medical", 1, true)
+		or string.find(low, "ambulance", 1, true)
+		or string.find(low, "clinic", 1, true)
+		or string.find(low, "pharmacy", 1, true)
+		or string.find(low, "medbag", 1, true)
+		or string.find(low, "hospital", 1, true)
+	then
+		return "Medical"
+	end
+	if string.find(low, "refriger", 1, true)
+		or string.find(low, "fridge", 1, true)
+		or string.find(low, "kitchen", 1, true)
+		or string.find(low, "food", 1, true)
+		or string.find(low, "ice box", 1, true)
+		or string.find(low, "vending", 1, true)
+		or string.find(low, "microwave", 1, true)
+		or string.find(low, "stove", 1, true)
+		or string.find(low, "freezer", 1, true)
+		or string.find(low, "pantry", 1, true)
+		or string.find(low, "soda", 1, true)
+		or string.find(low, "beer", 1, true)
+	then
+		return "Food"
+	end
+	if string.find(low, "vehicle", 1, true)
+		or string.find(low, "wreck", 1, true)
+		or string.find(low, "truck", 1, true)
+		or string.find(low, "sedan", 1, true)
+		or string.find(low, "trunk", 1, true)
+	then
+		return "Vehicles"
+	end
+	return "Other"
+end
+
+----- Collection -----
+
+local candidates = {}
+
+local function pushCandidate(kind, adornee, model, distance, text, color, chams)
+	if not adornee or not adornee.Parent then
+		return
+	end
+	candidates[#candidates + 1] = {
+		kind = kind,
+		adornee = adornee,
+		model = model,
+		distance = distance,
+		text = text,
+		color = color,
+		chams = chams,
+	}
+end
+
+local function collectPlayers(origin)
+	if not flag("PlayerESP", true) then
+		return
+	end
+	local filter = flag("PlayerFilter", "Everyone")
+	local limit = number(flag("PlayerRenderDistance", 1500), 1500)
+	local showName = flag("PlayerName", true)
+	local showFaction = flag("PlayerFaction", true)
+	local showHealth = flag("PlayerHealth", true)
+	local showDistance = flag("PlayerDistance", true)
+	local showInfected = flag("PlayerInfectedTag", true)
+	local chams = flag("PlayerChams", true)
+	local colorClean = flag("PlayerColor", COLOR_PLAYER)
+	local colorInfected = flag("InfectedColor", COLOR_INFECTED)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local character = player.Character
+			local adornee = character and rootOf(character)
+			if adornee then
+				local infected = player:GetAttribute("Infected") == true
+				local stage = number(player:GetAttribute("InfectionStage"), 0)
+				local allowed = filter == "Everyone"
+					or (filter == "Infected only" and infected)
+					or (filter == "Clean only" and not infected)
+				if allowed then
+					local distance = (adornee.Position - origin).Magnitude
+					if distance <= limit or limit == 0 then
+						local humanoid = character:FindFirstChildOfClass("Humanoid")
+						local health = humanoid and humanoid.Health or 0
+						local maxHealth = humanoid and humanoid.MaxHealth or 100
+						local faction = player:GetAttribute("DeployFaction")
+						local lines = {}
+
+						if showName then
+							lines[#lines + 1] = escapeRichText(player.Name)
+						end
+						if showFaction and type(faction) == "string" then
+							local tag = FACTION_TAG[faction] or string.upper(faction)
+							lines[#lines + 1] = "<Muted>[" .. escapeRichText(tag) .. "]</Muted>"
+						end
+						if showInfected and infected then
+							lines[#lines + 1] = "<Error>" .. T("INFECTED") .. " " .. tostring(stage) .. "</Error>"
+						end
+
+						local meta = {}
+						if showHealth and humanoid then
+							local bar = percent(health, maxHealth)
+							local tone = bar > 0.6 and "Success" or (bar > 0.3 and "Warning" or "Error")
+							meta[#meta + 1] = "<" .. tone .. ">" .. tostring(math.floor(health)) .. "</" .. tone .. ">"
+						end
+						if showDistance then
+							meta[#meta + 1] = "<Muted>" .. formatDistance(distance) .. "</Muted>"
+						end
+						if #meta > 0 then
+							lines[#lines + 1] = table.concat(meta, " <Muted>·</Muted> ")
+						end
+
+						pushCandidate(
+							KIND_PLAYER,
+							adornee,
+							character,
+							distance,
+							table.concat(lines, " "),
+							infected and colorInfected or colorClean,
+							chams
+						)
+					end
+				end
+			end
+		end
+	end
+end
+
+local function collectZombies(origin)
+	if not flag("ZombieESP", true) then
+		return
+	end
+	local folder = workspace:FindFirstChild("Zombies")
+	if not folder then
+		return
+	end
+	local limit = number(flag("ZombieRenderDistance", 1200), 1200)
+	local showName = flag("ZombieName", true)
+	local showHealth = flag("ZombieHealth", true)
+	local showDistance = flag("ZombieDistance", true)
+	local showArchetype = flag("ZombieArchetype", true)
+	local showType = flag("ZombieType", false)
+	local chams = flag("ZombieChams", true)
+	local baseColor = flag("ZombieColor", COLOR_ZOMBIE)
+
+	for _, model in ipairs(folder:GetChildren()) do
+		local adornee = rootOf(model)
+		if adornee and model:GetAttribute("Dead") ~= true then
+			local distance = (adornee.Position - origin).Magnitude
+			if distance <= limit then
+				local health = number(model:GetAttribute("Health"), 0)
+				local maxHealth = number(model:GetAttribute("MaxHealth"), 100)
+				local archetype = model:GetAttribute("ZombieArchetype") or "Default"
+				local zombieType = tostring(model:GetAttribute("ZombieType") or model.Name)
+				local bloodMoon = model:GetAttribute("BloodMoonZombie") == true
+
+				local lines = {}
+				if showName then
+					local label = archetype ~= "Default" and (archetype .. " zombie") or "Zombie"
+					lines[#lines + 1] = escapeRichText(T(label))
+				end
+				if showArchetype and bloodMoon then
+					lines[#lines + 1] = "<Error>" .. T("BLOOD MOON") .. "</Error>"
+				end
+				if showType then
+					local tier = zombieType:match("S(%d)_P(%d)")
+					if tier then
+						lines[#lines + 1] = "<Muted>S" .. tier .. "·P" .. (zombieType:match("S%d_P(%d)") or "?") .. "</Muted>"
+					end
+				end
+
+				local meta = {}
+				if showHealth then
+					local bar = percent(health, maxHealth)
+					local tone = bar > 0.6 and "Success" or (bar > 0.3 and "Warning" or "Error")
+					meta[#meta + 1] = "<" .. tone .. ">" .. tostring(math.floor(health)) .. "</" .. tone .. ">"
+				end
+				if showDistance then
+					meta[#meta + 1] = "<Muted>" .. formatDistance(distance) .. "</Muted>"
+				end
+				if #meta > 0 then
+					lines[#lines + 1] = table.concat(meta, " <Muted>·</Muted> ")
+				end
+
+				local color = baseColor
+				if archetype == "Tanky" then
+					color = Color3.fromRGB(255, 106, 106)
+				elseif archetype == "Speedy" then
+					color = Color3.fromRGB(255, 220, 110)
+				elseif bloodMoon then
+					color = Color3.fromRGB(255, 62, 92)
+				end
+
+				pushCandidate(KIND_ZOMBIE, adornee, model, distance, table.concat(lines, " "), color, chams)
+			end
+		end
+	end
+end
+
+local function collectVehicles(origin)
+	if not flag("VehicleESP", false) then
+		return
+	end
+	local folder = workspace:FindFirstChild("Vehicles")
+	if not folder then
+		return
+	end
+	local limit = number(flag("VehicleRenderDistance", 1200), 1200)
+	local showName = flag("VehicleName", true)
+	local showHealth = flag("VehicleHealth", true)
+	local showFuel = flag("VehicleFuel", true)
+	local showDistance = flag("VehicleDistance", true)
+	local chams = flag("VehicleChams", true)
+	local color = flag("VehicleColor", COLOR_VEHICLE)
+
+	for _, model in ipairs(folder:GetChildren()) do
+		local adornee = firstBasePart(model)
+		if adornee then
+			local distance = (adornee.Position - origin).Magnitude
+			if distance <= limit then
+				local hp = number(model:GetAttribute("Vehicle_HealthPercent"), number(model:GetAttribute("Vehicle_HP"), 100))
+				local destroyed = model:GetAttribute("Vehicle_Destroyed") == true
+				local fuel = number(model:GetAttribute("Fuel_Current"), 0)
+				local fuelMax = number(model:GetAttribute("Fuel_Max"), 1)
+				local fuelPercent = math.floor(percent(fuel, fuelMax) * 100 + 0.5)
+				local flat = number(model:GetAttribute("Tire_FlatCount"), 0)
+
+				local lines = {}
+				if showName then
+					local name = model:GetAttribute("Vehicle_Name") or prettify(model.Name)
+					lines[#lines + 1] = escapeRichText(tostring(name))
+				end
+				if destroyed then
+					lines[#lines + 1] = "<Error>" .. T("WRECK") .. "</Error>"
+				end
+
+				local meta = {}
+				if showHealth then
+					local tone = hp > 60 and "Success" or (hp > 30 and "Warning" or "Error")
+					meta[#meta + 1] = "<" .. tone .. ">" .. tostring(math.floor(hp)) .. "%</" .. tone .. ">"
+				end
+				if showFuel then
+					meta[#meta + 1] = "<Muted>" .. tostring(fuelPercent) .. "% " .. T("fuel") .. "</Muted>"
+				end
+				if flat > 0 then
+					meta[#meta + 1] = "<Warning>" .. tostring(flat) .. " " .. T("flat") .. "</Warning>"
+				end
+				if showDistance then
+					meta[#meta + 1] = "<Muted>" .. formatDistance(distance) .. "</Muted>"
+				end
+				if #meta > 0 then
+					lines[#lines + 1] = table.concat(meta, " <Muted>·</Muted> ")
+				end
+
+				pushCandidate(KIND_VEHICLE, adornee, model, distance, table.concat(lines, " "), color, chams)
+			end
+		end
+	end
+end
+
+local function collectCorpses(origin)
+	if not flag("CorpseESP", false) then
+		return
+	end
+	local limit = number(flag("CorpseRenderDistance", 600), 600)
+	local showNames = flag("CorpseNames", true)
+	local chams = flag("CorpseChams", false)
+	local color = flag("CorpseColor", COLOR_CORPSE)
+
+	for _, folderName in ipairs({ "PlayerCorpses", "ZombieCorpses" }) do
+		local folder = workspace:FindFirstChild(folderName)
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				local adornee = firstBasePart(model)
+				if adornee then
+					local distance = (adornee.Position - origin).Magnitude
+					if distance <= limit then
+						local lines = {}
+						if showNames then
+							local raw = model.Name:gsub("'s corpse", ""):gsub("s corpse", "")
+							lines[#lines + 1] = escapeRichText(raw)
+						else
+							lines[#lines + 1] = folderName == "ZombieCorpses" and "Zombie corpse" or "Corpse"
+						end
+						lines[#lines + 1] = "<Muted>" .. formatDistance(distance) .. "</Muted>"
+						pushCandidate(KIND_CORPSE, adornee, model, distance, table.concat(lines, " "), color, chams)
+					end
+				end
+			end
+		end
+	end
+end
+
+local function collectAirdrops(origin)
+	if not flag("AirdropESP", true) then
+		return
+	end
+	local folder = workspace:FindFirstChild("Airdrops")
+	if not folder then
+		return
+	end
+	local limit = number(flag("AirdropRenderDistance", 3000), 3000)
+	local color = flag("AirdropColor", COLOR_AIRDROP)
+	local chams = flag("AirdropChams", true)
+
+	for _, model in ipairs(folder:GetChildren()) do
+		local adornee = firstBasePart(model)
+		if adornee then
+			local distance = (adornee.Position - origin).Magnitude
+			if distance <= limit then
+				local text = "<Accent>" .. T("AIRDROP") .. "</Accent> <Muted>" .. formatDistance(distance) .. "</Muted>"
+				pushCandidate(KIND_AIRDROP, adornee, model, distance, text, color, chams)
+			end
+		end
+	end
+end
+
+local function collectLoot(origin)
+	if not flag("LootESP", true) then
+		return
+	end
+	if os.clock() - lootHostsScannedAt > LOOT_SCAN_INTERVAL or #lootHosts == 0 then
+		scanLootHosts()
+	end
+
+	local showNames = flag("LootNames", true)
+	local showDistance = flag("LootDistanceTag", true)
+	local chams = flag("LootChams", true)
+	local hideLooted = flag("LootHideLooted", true)
+	local range = number(flag("LootRenderDistance", 225), 225)
+	local allowed = flag("LootTypes", LOOT_CATEGORIES)
+	if type(allowed) ~= "table" or #allowed == 0 then
+		allowed = LOOT_CATEGORIES
+	end
+	local color = flag("LootColor", COLOR_LOOT)
+	local rareColor = flag("RareColor", COLOR_RARE)
+
+	-- A host is a folder of proxy parts, and the prompt hangs off the proxy, so
+	-- both shapes are accepted: a prompt child or a proxy with a prompt inside.
+	for _, host in ipairs(lootHosts) do
+		if host.Parent then
+			for _, node in ipairs(host:GetChildren()) do
+				local prompt = nil
+				local adornee = nil
+				if node:IsA("ProximityPrompt") then
+					prompt = node
+					adornee = node.Parent
+				else
+					prompt = node:FindFirstChildOfClass("ProximityPrompt")
+					adornee = node
+				end
+				if prompt and adornee and adornee:IsA("BasePart") then
+					local distance = (adornee.Position - origin).Magnitude
+					if distance <= range then
+						local title = lootTitle(prompt)
+						local category = lootCategory(title)
+						local allowedCategory = table.find(allowed, category) ~= nil
+						local looted = hideLooted and isLooted(adornee)
+						if allowedCategory and not looted then
+							local lines = {}
+							if showNames then
+								lines[#lines + 1] = escapeRichText(title)
+							else
+								lines[#lines + 1] = "Loot"
+							end
+							if showDistance then
+								lines[#lines + 1] = "<Muted>" .. formatDistance(distance) .. "</Muted>"
+							end
+							local tint = category == "Guns" and rareColor or color
+							pushCandidate(KIND_LOOT, adornee, node, distance, table.concat(lines, " "), tint, chams)
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+----- Render -----
+
+local function renderCandidate(item, textSize, chamBudget)
+	local visual = ensureVisual(item.adornee)
+	if not visual or not visual.label then
+		return
+	end
+
+	visual.label.TextSize = textSize
+	visual.label.Text = item.text
+	visual.label.TextColor3 = item.color
+	visual.billboard.Size = UDim2.fromOffset(math.max(160, math.floor(190 * textSize / 14)), math.floor(textSize * 2.5))
+	visual.billboard.Enabled = true
+
+	if item.chams and item.model and chamBudget.left > 0 then
+		if not visual.highlight or visual.highlight.Parent ~= item.model then
+			if visual.highlight then
+				pcall(function()
+					visual.highlight:Destroy()
+				end)
+			end
+			local ok, highlight = pcall(buildHighlight, item.model)
+			visual.highlight = ok and highlight or nil
+		end
+		if visual.highlight then
+			visual.highlight.FillColor = item.color
+			visual.highlight.OutlineColor = item.color
+			chamBudget.left = chamBudget.left - 1
+		end
+	elseif visual.highlight then
+		pcall(function()
+			visual.highlight:Destroy()
+		end)
+		visual.highlight = nil
+	end
+end
+
+local function renderList(list)
+	local textSize = number(flag("TextSize", 14), 14)
+	local chamBudget = { left = CHAM_BUDGET }
+	local seen = {}
+
+	for _, item in ipairs(list) do
+		seen[item.adornee] = true
+		pcall(renderCandidate, item, textSize, chamBudget)
+	end
+
+	for adornee, visual in pairs(visuals) do
+		if not seen[adornee] then
+			destroyVisual(visual)
+			visuals[adornee] = nil
+		end
+	end
+end
+
+local function countStats(list)
+	stats.players = 0
+	stats.zombies = 0
+	stats.loot = 0
+	stats.vehicles = 0
+	stats.corpses = 0
+	stats.airdrops = 0
+	stats.markers = #list
+
+	for _, item in ipairs(list) do
+		if item.kind == KIND_PLAYER then
+			stats.players = stats.players + 1
+		elseif item.kind == KIND_ZOMBIE then
+			stats.zombies = stats.zombies + 1
+		elseif item.kind == KIND_LOOT then
+			stats.loot = stats.loot + 1
+		elseif item.kind == KIND_VEHICLE then
+			stats.vehicles = stats.vehicles + 1
+		elseif item.kind == KIND_CORPSE then
+			stats.corpses = stats.corpses + 1
+		elseif item.kind == KIND_AIRDROP then
+			stats.airdrops = stats.airdrops + 1
+		end
+	end
+end
+
+local function sortByDistance(a, b)
+	return a.distance < b.distance
+end
+
+local function collect()
+	candidates = {}
+
+	local origin = distanceOrigin()
+	pcall(collectPlayers, origin)
+	pcall(collectZombies, origin)
+	pcall(collectVehicles, origin)
+	pcall(collectCorpses, origin)
+	pcall(collectAirdrops, origin)
+	pcall(collectLoot, origin)
+
+	table.sort(candidates, sortByDistance)
+
+	local cap = number(flag("MaxMarkers", MAX_MARKERS), MAX_MARKERS)
+	if cap > 0 and #candidates > cap then
+		local trimmed = {}
+		for index = 1, cap do
+			trimmed[index] = candidates[index]
+		end
+		candidates = trimmed
+	end
+
+	countStats(candidates)
+	return candidates
+end
+
+----- On-screen HUD -----
+
+local function hudParent()
+	local ok, hui = pcall(function()
+		return gethui()
+	end)
+	if ok and typeof(hui) == "Instance" then
+		return hui
+	end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- PlayerGui is rebuilt on every respawn, so a HUD that survived can end up
+-- parentless. Reattaching on each refresh keeps it on screen after deaths.
+local function attachHud(gui)
+	local ok = pcall(function()
+		gui.Parent = hudParent()
+	end)
+	if ok and gui.Parent then
+		return true
+	end
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if playerGui then
+		pcall(function()
+			gui.Parent = playerGui
+		end)
+	end
+	return gui.Parent ~= nil
+end
+
+local HUD_ROWS = {
+	{ key = "Stamina", label = "Stamina" },
+	{ key = "Hunger", label = "Hunger" },
+	{ key = "Thirst", label = "Thirst" },
+	{ key = "Infection", label = "Infection" },
+}
+
+local function buildHud()
+	if hud.gui then
+		return
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RobScriptIL_Hud"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 60
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Enabled = true
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.AnchorPoint = Vector2.new(0, 0)
+	frame.Position = UDim2.fromOffset(18, 18)
+	frame.Size = UDim2.fromOffset(226, 22 + #HUD_ROWS * 22 + 26)
+	frame.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+	frame.BackgroundTransparency = 0.25
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(38, 38, 46)
+	stroke.Thickness = 1
+	stroke.Transparency = 0.2
+	stroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.fromOffset(12, 6)
+	title.Size = UDim2.new(1, -24, 0, 14)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 11
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = Color3.fromRGB(255, 59, 127)
+	title.Text = "INFECTED LANDS"
+	title.Parent = frame
+
+	hud.rows = {}
+	for index, row in ipairs(HUD_ROWS) do
+		local y = 24 + (index - 1) * 22
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Label"
+		label.BackgroundTransparency = 1
+		label.Position = UDim2.fromOffset(12, y)
+		label.Size = UDim2.fromOffset(58, 14)
+		label.Font = Enum.Font.Gotham
+		label.TextSize = 11
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextColor3 = Color3.fromRGB(141, 141, 153)
+		label.Text = T(row.label)
+		label.Parent = frame
+
+		local track = Instance.new("Frame")
+		track.Name = "Track"
+		track.Position = UDim2.fromOffset(74, y + 3)
+		track.Size = UDim2.fromOffset(100, 8)
+		track.BackgroundColor3 = Color3.fromRGB(42, 42, 51)
+		track.BorderSizePixel = 0
+		track.Parent = frame
+
+		local trackCorner = Instance.new("UICorner")
+		trackCorner.CornerRadius = UDim.new(1, 0)
+		trackCorner.Parent = track
+
+		local fill = Instance.new("Frame")
+		fill.Name = "Fill"
+		fill.Size = UDim2.fromScale(1, 1)
+		fill.BackgroundColor3 = Color3.fromRGB(255, 59, 127)
+		fill.BorderSizePixel = 0
+		fill.Parent = track
+
+		local fillCorner = Instance.new("UICorner")
+		fillCorner.CornerRadius = UDim.new(1, 0)
+		fillCorner.Parent = fill
+
+		local value = Instance.new("TextLabel")
+		value.Name = "Value"
+		value.BackgroundTransparency = 1
+		value.Position = UDim2.fromOffset(180, y)
+		value.Size = UDim2.fromOffset(36, 14)
+		value.Font = Enum.Font.GothamBold
+		value.TextSize = 11
+		value.TextXAlignment = Enum.TextXAlignment.Right
+		value.TextColor3 = Color3.fromRGB(245, 245, 247)
+		value.Text = "--"
+		value.Parent = frame
+
+		hud.rows[row.key] = { fill = fill, value = value, label = label }
+	end
+
+	-- Waypoint line lives under the bars: an arrow that turns with the camera
+	-- plus the distance, so a map click works without opening the map again.
+	local arrow = Instance.new("TextLabel")
+	arrow.Name = "WaypointArrow"
+	arrow.BackgroundTransparency = 1
+	arrow.Position = UDim2.fromOffset(12, 24 + #HUD_ROWS * 22)
+	arrow.Size = UDim2.fromOffset(14, 16)
+	arrow.Font = Enum.Font.GothamBold
+	arrow.TextSize = 12
+	arrow.TextColor3 = Color3.fromRGB(255, 59, 127)
+	arrow.Text = "▲"
+	arrow.Visible = false
+	arrow.Parent = frame
+
+	local waypointValue = Instance.new("TextLabel")
+	waypointValue.Name = "WaypointValue"
+	waypointValue.BackgroundTransparency = 1
+	waypointValue.Position = UDim2.fromOffset(30, 24 + #HUD_ROWS * 22)
+	waypointValue.Size = UDim2.new(1, -42, 0, 16)
+	waypointValue.Font = Enum.Font.Gotham
+	waypointValue.TextSize = 11
+	waypointValue.TextXAlignment = Enum.TextXAlignment.Left
+	waypointValue.TextColor3 = Color3.fromRGB(141, 141, 153)
+	waypointValue.Text = T("no waypoint")
+	waypointValue.Parent = frame
+
+	hud.waypoint = { arrow = arrow, value = waypointValue }
+
+	local scale = Instance.new("UIScale")
+	scale.Name = "Scale"
+	scale.Scale = number(flag("HudScale", 1), 1)
+	scale.Parent = frame
+
+	attachHud(gui)
+
+	hud.gui = gui
+	hud.frame = frame
+	hud.scale = scale
+	hud.title = title
+end
+
+-- The HUD is the hub's own ScreenGui, so the library cannot translate it: the
+-- labels are re-read from the dictionary when the player switches language.
+local function applyHudLanguage()
+	translationCache = {}
+	if not hud.gui then
+		return
+	end
+	for _, row in ipairs(HUD_ROWS) do
+		local entry = hud.rows[row.key]
+		if entry and entry.label then
+			entry.label.Text = T(row.label)
+		end
+	end
+	if hud.waypoint and not mapState.waypoint then
+		hud.waypoint.value.Text = T("no waypoint")
+	end
+end
+
+local function destroyHud()
+	if not hud.gui then
+		return
+	end
+	pcall(function()
+		hud.gui:Destroy()
+	end)
+	hud.gui = nil
+	hud.frame = nil
+	hud.scale = nil
+	hud.title = nil
+	hud.rows = {}
+end
+
+local function setHudCorner()
+	if not hud.frame then
+		return
+	end
+	local corner = flag("HudCorner", "Top Left")
+	if corner == "Top Right" then
+		hud.frame.AnchorPoint = Vector2.new(1, 0)
+		hud.frame.Position = UDim2.new(1, -18, 0, 18)
+	elseif corner == "Bottom Left" then
+		hud.frame.AnchorPoint = Vector2.new(0, 1)
+		hud.frame.Position = UDim2.new(0, 18, 1, -18)
+	elseif corner == "Bottom Right" then
+		hud.frame.AnchorPoint = Vector2.new(1, 1)
+		hud.frame.Position = UDim2.new(1, -18, 1, -18)
+	else
+		hud.frame.AnchorPoint = Vector2.new(0, 0)
+		hud.frame.Position = UDim2.fromOffset(18, 18)
+	end
+	if hud.scale then
+		hud.scale.Scale = number(flag("HudScale", 1), 1)
+	end
+end
+
+local function refreshHud()
+	if not flag("HudEnabled", true) then
+		if hud.gui then
+			hud.gui.Enabled = false
+		end
+		return
+	end
+	if not hud.gui then
+		local ok = pcall(buildHud)
+		if not ok then
+			return
+		end
+		pcall(setHudCorner)
+	end
+	if not hud.gui.Parent then
+		attachHud(hud.gui)
+	end
+	hud.gui.Enabled = true
+
+	local stamina = number(LocalPlayer:GetAttribute("Stamina"), 0)
+	local maxStamina = math.max(number(LocalPlayer:GetAttribute("MaxStamina"), 100), 1)
+	local hunger = number(LocalPlayer:GetAttribute("Hunger"), 0)
+	local maxHunger = math.max(number(LocalPlayer:GetAttribute("MaxHunger"), 100), 1)
+	local thirst = number(LocalPlayer:GetAttribute("Thirst"), 0)
+	local maxThirst = math.max(number(LocalPlayer:GetAttribute("MaxThirst"), 100), 1)
+	local infection = number(LocalPlayer:GetAttribute("InfectionPercent"), 0)
+	local stage = number(LocalPlayer:GetAttribute("InfectionStage"), 0)
+
+	local rows = hud.rows
+	if rows.Stamina then
+		rows.Stamina.fill.Size = UDim2.fromScale(percent(stamina, maxStamina), 1)
+		rows.Stamina.fill.BackgroundColor3 = Color3.fromRGB(255, 59, 127)
+		rows.Stamina.value.Text = string.format("%d", math.floor(stamina))
+	end
+	if rows.Hunger then
+		local value = percent(hunger, maxHunger)
+		rows.Hunger.fill.Size = UDim2.fromScale(value, 1)
+		rows.Hunger.fill.BackgroundColor3 = value > 0.5 and Color3.fromRGB(120, 220, 140)
+			or (value > 0.25 and Color3.fromRGB(255, 200, 90) or Color3.fromRGB(255, 90, 90))
+		rows.Hunger.value.Text = string.format("%d", math.floor(hunger))
+	end
+	if rows.Thirst then
+		local value = percent(thirst, maxThirst)
+		rows.Thirst.fill.Size = UDim2.fromScale(value, 1)
+		rows.Thirst.fill.BackgroundColor3 = value > 0.5 and Color3.fromRGB(110, 190, 255)
+			or (value > 0.25 and Color3.fromRGB(255, 200, 90) or Color3.fromRGB(255, 90, 90))
+		rows.Thirst.value.Text = string.format("%d", math.floor(thirst))
+	end
+	if rows.Infection then
+		rows.Infection.fill.Size = UDim2.fromScale(math.clamp(infection / 100, 0, 1), 1)
+		rows.Infection.fill.BackgroundColor3 = stage > 0 and Color3.fromRGB(214, 78, 214) or Color3.fromRGB(120, 220, 140)
+		rows.Infection.value.Text = stage > 0 and ("S" .. tostring(math.floor(stage))) or T("clean")
+	end
+	if hud.title then
+		hud.title.Text = stage > 0 and ("INFECTED LANDS · " .. T("STAGE %d", math.floor(stage))) or "INFECTED LANDS"
+	end
+
+	if hud.waypoint then
+		local waypoint = mapState.waypoint
+		local character = LocalPlayer.Character
+		local part = character and rootOf(character)
+		if waypoint and part then
+			local dx = waypoint.x - part.Position.X
+			local dz = waypoint.z - part.Position.Z
+			local camera = workspace.CurrentCamera
+			local look = camera and camera.CFrame.LookVector or part.CFrame.LookVector
+			local bearing = math.deg(math.atan2(dx, -dz) - math.atan2(look.X, -look.Z))
+			hud.waypoint.arrow.Visible = true
+			hud.waypoint.arrow.Rotation = bearing
+			hud.waypoint.value.Text = formatDistance(math.sqrt(dx * dx + dz * dz))
+		else
+			hud.waypoint.arrow.Visible = false
+			hud.waypoint.value.Text = T("no waypoint")
+		end
+	end
+end
+
+----- Markers on the game map -----
+
+local function mapColorFor(kind, player)
+	if kind == KIND_PLAYER then
+		if player and player:GetAttribute("Infected") == true then
+			return flag("InfectedColor", COLOR_INFECTED)
+		end
+		return flag("PlayerColor", COLOR_PLAYER)
+	elseif kind == KIND_ZOMBIE then
+		return flag("ZombieColor", COLOR_ZOMBIE)
+	elseif kind == KIND_LOOT then
+		return flag("LootColor", COLOR_LOOT)
+	elseif kind == KIND_VEHICLE then
+		return flag("VehicleColor", COLOR_VEHICLE)
+	elseif kind == KIND_AIRDROP then
+		return flag("AirdropColor", COLOR_AIRDROP)
+	end
+	return flag("CorpseColor", COLOR_CORPSE)
+end
+
+local function setWaypoint(x, z)
+	if not x or not z then
+		mapState.waypoint = nil
+	else
+		mapState.waypoint = { x = x, z = z }
+	end
+	if mapState.waypointMarker then
+		local waypoint = mapState.waypoint
+		mapState.waypointMarker.Visible = waypoint ~= nil
+		if waypoint then
+			local u, v = worldToUV(waypoint.x, waypoint.z)
+			mapState.waypointMarker.Position = UDim2.fromScale(u, v)
+		end
+	end
+	return mapState.waypoint
+end
+
+local function clearWaypoint()
+	return setWaypoint(nil, nil)
+end
+
+local function destroyMapLayer()
+	if mapState.clickConnection then
+		pcall(function()
+			mapState.clickConnection:Disconnect()
+		end)
+		mapState.clickConnection = nil
+	end
+	mapState.clickParent = nil
+	if mapState.folder then
+		pcall(function()
+			mapState.folder:Destroy()
+		end)
+	end
+	mapState.folder = nil
+	mapState.parent = nil
+	mapState.self = nil
+	mapState.waypointMarker = nil
+	mapState.pool = setmetatable({}, { __mode = "k" })
+end
+
+-- The layer is a Folder, not a Frame: a full size Frame would swallow clicks
+-- meant for the game's own teleport picker on the map.
+local function ensureMapLayer(parent)
+	if mapState.folder and mapState.folder.Parent == parent and mapState.self then
+		return mapState.folder
+	end
+	destroyMapLayer()
+
+	local folder = Instance.new("Folder")
+	folder.Name = "RobScriptIL_Markers"
+
+	local selfArrow = Instance.new("TextLabel")
+	selfArrow.Name = "Self"
+	selfArrow.AnchorPoint = Vector2.new(0.5, 0.5)
+	selfArrow.BackgroundTransparency = 1
+	selfArrow.Size = UDim2.fromOffset(18, 18)
+	selfArrow.Font = Enum.Font.GothamBold
+	selfArrow.TextSize = 14
+	selfArrow.Text = "▲"
+	selfArrow.TextColor3 = flag("PlayerColor", COLOR_PLAYER)
+	selfArrow.ZIndex = 6
+	selfArrow.Parent = folder
+
+	local waypoint = Instance.new("TextLabel")
+	waypoint.Name = "Waypoint"
+	waypoint.AnchorPoint = Vector2.new(0.5, 0.5)
+	waypoint.BackgroundTransparency = 1
+	waypoint.Size = UDim2.fromOffset(18, 18)
+	waypoint.Font = Enum.Font.GothamBold
+	waypoint.TextSize = 14
+	waypoint.Text = "◆"
+	waypoint.TextColor3 = Color3.fromRGB(245, 245, 247)
+	waypoint.Visible = false
+	waypoint.ZIndex = 7
+	waypoint.Parent = folder
+
+	folder.Parent = parent
+	mapState.folder = folder
+	mapState.parent = parent
+	mapState.self = selfArrow
+	mapState.waypointMarker = waypoint
+
+	-- Left click stays with the game (teleport picker), so the waypoint is set
+	-- with a right click on the map.
+	mapState.clickParent = parent
+	mapState.clickConnection = parent.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton2 then
+			return
+		end
+		local size = parent.AbsoluteSize
+		if size.X <= 0 or size.Y <= 0 then
+			return
+		end
+		local u = (input.Position.X - parent.AbsolutePosition.X) / size.X
+		local v = (input.Position.Y - parent.AbsolutePosition.Y) / size.Y
+		if u >= 0 and u <= 1 and v >= 0 and v <= 1 then
+			local x, z = uvToWorld(u, v)
+			setWaypoint(x, z)
+		end
+	end)
+
+	if mapState.waypoint then
+		local u, v = worldToUV(mapState.waypoint.x, mapState.waypoint.z)
+		waypoint.Position = UDim2.fromScale(u, v)
+		waypoint.Visible = true
+	end
+
+	return folder
+end
+
+local function resolveMap()
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	local ui = playerGui and playerGui:FindFirstChild("MapUI")
+	local map = ui and ui:FindFirstChild("Map")
+	if map and map:IsA("GuiObject") and map.Visible and map.AbsoluteSize.X > 0 then
+		return map
+	end
+	return nil
+end
+
+local function hostPosition(host)
+	if host:IsA("BasePart") then
+		return host.Position
+	end
+	local sum, count = Vector3.zero, 0
+	for _, child in ipairs(host:GetChildren()) do
+		if child:IsA("BasePart") then
+			sum = sum + child.Position
+			count = count + 1
+		end
+	end
+	if count > 0 then
+		return sum / count
+	end
+	local part = host:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function placeDot(instance, kind, world, size, player)
+	local u, v = worldToUV(world.X, world.Z)
+	if u < 0 or u > 1 or v < 0 or v > 1 then
+		return
+	end
+	local dot = mapState.pool[instance]
+	if not dot or not dot.Parent then
+		dot = Instance.new("Frame")
+		dot.Name = "Dot"
+		dot.AnchorPoint = Vector2.new(0.5, 0.5)
+		dot.BorderSizePixel = 0
+		dot.ZIndex = 5
+		local dotCorner = Instance.new("UICorner")
+		dotCorner.CornerRadius = UDim.new(1, 0)
+		dotCorner.Parent = dot
+		dot.Parent = mapState.folder
+		mapState.pool[instance] = dot
+	end
+	dot.Visible = true
+	dot.Position = UDim2.fromScale(u, v)
+	dot.Size = UDim2.fromOffset(size, size)
+	dot.BackgroundColor3 = mapColorFor(kind, player)
+end
+
+local function refreshMapMarkers()
+	if not flag("MapMarkers", true) then
+		if mapState.folder then
+			destroyMapLayer()
+		end
+		return
+	end
+
+	local parent = resolveMap()
+	if not parent then
+		return
+	end
+	ensureMapLayer(parent)
+
+	local character = LocalPlayer.Character
+	local originPart = character and rootOf(character)
+	if not originPart then
+		return
+	end
+	local position = originPart.Position
+	local seen = {}
+
+	if flag("MapPlayers", true) then
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer then
+				local otherCharacter = player.Character
+				local root = otherCharacter and rootOf(otherCharacter)
+				if root then
+					seen[otherCharacter] = true
+					placeDot(otherCharacter, KIND_PLAYER, root.Position, 7, player)
+				end
+			end
+		end
+	end
+
+	if flag("MapZombies", true) then
+		local folder = workspace:FindFirstChild("Zombies")
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				local root = rootOf(model)
+				if root and model:GetAttribute("Dead") ~= true then
+					seen[model] = true
+					placeDot(model, KIND_ZOMBIE, root.Position, 6)
+				end
+			end
+		end
+	end
+
+	if flag("MapLoot", true) then
+		for _, host in ipairs(lootHosts) do
+			if host.Parent and not isLooted(host) then
+				local hostPos = hostPosition(host)
+				if hostPos then
+					seen[host] = true
+					placeDot(host, KIND_LOOT, hostPos, 4)
+				end
+			end
+		end
+	end
+
+	if flag("MapVehicles", false) then
+		local folder = workspace:FindFirstChild("Vehicles")
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				local root = firstBasePart(model)
+				if root then
+					seen[model] = true
+					placeDot(model, KIND_VEHICLE, root.Position, 6)
+				end
+			end
+		end
+	end
+
+	if flag("MapAirdrops", true) then
+		local folder = workspace:FindFirstChild("Airdrops")
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				local root = firstBasePart(model)
+				if root then
+					seen[model] = true
+					placeDot(model, KIND_AIRDROP, root.Position, 8)
+				end
+			end
+		end
+	end
+
+	for instance, dot in pairs(mapState.pool) do
+		if not seen[instance] and dot.Parent then
+			dot.Visible = false
+		end
+	end
+
+	local u, v = worldToUV(position.X, position.Z)
+	if mapState.self then
+		mapState.self.Position = UDim2.fromScale(u, v)
+		mapState.self.TextColor3 = flag("PlayerColor", COLOR_PLAYER)
+		local look = originPart.CFrame.LookVector
+		mapState.self.Rotation = math.deg(math.atan2(look.X, -look.Z))
+	end
+end
+
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "infected lands - survival",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptIL" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "Survival 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- Status tab -----
+
+local tabs = {}
+
+local StatusTab = Window:CreateTab({ Name = "Status", Icon = "activity" })
+local SurvivalBox = StatusTab:CreateGroupbox({ Name = "Survival", Side = "Left" })
+local LifetimeBox = StatusTab:CreateGroupbox({ Name = "Lifetime", Side = "Right" })
+
+SurvivalBox:CreateStatus({
+	Name = "Stamina",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.3,
+	Update = function()
+		local value = number(LocalPlayer:GetAttribute("Stamina"), 0)
+		local max = number(LocalPlayer:GetAttribute("MaxStamina"), 100)
+		local exhausted = LocalPlayer:GetAttribute("StaminaExhausted") == true
+		local tone = exhausted and "Error" or (value > max * 0.35 and "Accent" or "Warning")
+		return string.format("<%s>%d</%s> <Muted>/ %d</Muted>", tone, math.floor(value), tone, math.floor(max))
+	end,
+})
+
+SurvivalBox:CreateStatus({
+	Name = "Hunger",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		local value = number(LocalPlayer:GetAttribute("Hunger"), 0)
+		local max = number(LocalPlayer:GetAttribute("MaxHunger"), 100)
+		local ratio = percent(value, max)
+		local tone = ratio > 0.5 and "Success" or (ratio > 0.25 and "Warning" or "Error")
+		return string.format("<%s>%d</%s> <Muted>/ %d</Muted>", tone, math.floor(value), tone, math.floor(max))
+	end,
+})
+
+SurvivalBox:CreateStatus({
+	Name = "Thirst",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		local value = number(LocalPlayer:GetAttribute("Thirst"), 0)
+		local max = number(LocalPlayer:GetAttribute("MaxThirst"), 100)
+		local ratio = percent(value, max)
+		local tone = ratio > 0.5 and "Success" or (ratio > 0.25 and "Warning" or "Error")
+		return string.format("<%s>%d</%s> <Muted>/ %d</Muted>", tone, math.floor(value), tone, math.floor(max))
+	end,
+})
+
+SurvivalBox:CreateStatus({
+	Name = "Infection",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		local stage = number(LocalPlayer:GetAttribute("InfectionStage"), 0)
+		local percentValue = number(LocalPlayer:GetAttribute("InfectionPercent"), 0)
+		local immunity = number(LocalPlayer:GetAttribute("InfectionImmunityRemaining"), 0)
+		if stage <= 0 and percentValue <= 0 then
+			if immunity and immunity > 0 then
+				return string.format("<Success>%s</Success> <Muted>%s</Muted>", T("clean"), T("immune %ds", math.floor(immunity)))
+			end
+			return string.format("<Success>%s</Success>", T("clean"))
+		end
+		return string.format("<Error>%s</Error> <Muted>%d%%</Muted>", T("stage %d", math.floor(stage)), math.floor(percentValue))
+	end,
+})
+
+SurvivalBox:CreateStatus({
+	Name = "Protection",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if LocalPlayer:GetAttribute("SpawnProtectionActive") == true then
+			return string.format("<Success>%s</Success>", T("spawn shield"))
+		end
+		return string.format("<Muted>%s</Muted>", T("none"))
+	end,
+})
+
+SurvivalBox:CreateDivider()
+SurvivalBox:CreateToggle({
+	Name = "On-screen HUD",
+	Desc = "Survival bars in the corner of the screen",
+	Flag = "HudEnabled",
+	CurrentValue = true,
+})
+SurvivalBox:CreateDropdown({
+	Name = "HUD corner",
+	Options = { "Top Left", "Top Right", "Bottom Left", "Bottom Right" },
+	CurrentOption = "Top Left",
+	Flag = "HudCorner",
+	DependsOn = "HudEnabled",
+})
+SurvivalBox:CreateSlider({
+	Name = "HUD scale",
+	Range = { 0.7, 1.6 },
+	Increment = 0.1,
+	CurrentValue = 1,
+	Flag = "HudScale",
+	DependsOn = "HudEnabled",
+})
+
+LifetimeBox:CreateStatus({
+	Name = "Days survived",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Accent>%d</Accent>", math.floor(number(LocalPlayer:GetAttribute("LifetimeDaysSurvived"), 0)))
+	end,
+})
+
+LifetimeBox:CreateStatus({
+	Name = "Zombie kills",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Success>%d</Success>", math.floor(number(LocalPlayer:GetAttribute("LifetimeZombiesKilled"), 0)))
+	end,
+})
+
+LifetimeBox:CreateStatus({
+	Name = "Player kills",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Error>%d</Error>", math.floor(number(LocalPlayer:GetAttribute("LifetimePlayersKilled"), 0)))
+	end,
+})
+
+LifetimeBox:CreateStatus({
+	Name = "Playtime",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		local seconds = number(LocalPlayer:GetAttribute("LifetimePlaytime"), 0)
+		return string.format("<Text>%dh %dm</Text>", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+	end,
+})
+
+LifetimeBox:CreateDivider()
+LifetimeBox:CreateStatus({
+	Name = "Profession",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local profession = LocalPlayer:GetAttribute("SelectedProfession") or "none"
+		local name = tostring(profession):gsub("^profession%.", "")
+		local tier = number(LocalPlayer:GetAttribute("profession_" .. name .. "Tier"), 0)
+		return string.format("<Accent>%s</Accent> <Muted>%s</Muted>", prettify(name), T("tier %d", math.floor(tier)))
+	end,
+})
+
+LifetimeBox:CreateStatus({
+	Name = "Zombie kills (prof)",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local kills = number(LocalPlayer:GetAttribute("ProfessionProgress_professionProgress_zombieKills"), 0)
+		local heads = number(LocalPlayer:GetAttribute("ProfessionProgress_professionProgress_zombieHeadshotKills"), 0)
+		return string.format("<Text>%d</Text> <Muted>%s</Muted>", math.floor(kills), T("headshots %d", math.floor(heads)))
+	end,
+})
+
+LifetimeBox:CreateDivider()
+LifetimeBox:CreateStatus({
+	Name = "Markers",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>%s</Muted>", stats.markers, T("on screen"))
+	end,
+})
+
+LifetimeBox:CreateStatus({
+	Name = "Airdrop credits",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Warning>%d</Warning> <Muted>%s</Muted>",
+			math.floor(number(LocalPlayer:GetAttribute("AirdropCredits"), 0)),
+			T("blood moon %d", math.floor(number(LocalPlayer:GetAttribute("BloodMoonTokens"), 0))))
+	end,
+})
+
+----- Visuals tab -----
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local ActorsBox = VisualsTab:CreateGroupbox({ Name = "Players & infected", Side = "Left" })
+local WorldBox = VisualsTab:CreateGroupbox({ Name = "World", Side = "Right" })
+
+ActorsBox:CreateToggle({
+	Name = "Player ESP",
+	Desc = "Survivors and infected players",
+	Flag = "PlayerESP",
+	CurrentValue = true,
+})
+ActorsBox:CreateDropdown({
+	Name = "Show",
+	Options = { "Everyone", "Infected only", "Clean only" },
+	CurrentOption = "Everyone",
+	Flag = "PlayerFilter",
+	DependsOn = "PlayerESP",
+})
+ActorsBox:CreateToggle({ Name = "Name", Flag = "PlayerName", CurrentValue = true, DependsOn = "PlayerESP" })
+ActorsBox:CreateToggle({ Name = "Faction", Flag = "PlayerFaction", CurrentValue = true, DependsOn = "PlayerESP" })
+ActorsBox:CreateToggle({ Name = "Health", Flag = "PlayerHealth", CurrentValue = true, DependsOn = "PlayerESP" })
+ActorsBox:CreateToggle({ Name = "Distance", Flag = "PlayerDistance", CurrentValue = true, DependsOn = "PlayerESP" })
+ActorsBox:CreateToggle({ Name = "Infected tag", Flag = "PlayerInfectedTag", CurrentValue = true, DependsOn = "PlayerESP" })
+ActorsBox:CreateToggle({ Name = "Chams", Flag = "PlayerChams", CurrentValue = true, DependsOn = "PlayerESP" })
+
+ActorsBox:CreateDivider()
+ActorsBox:CreateStatus({
+	Name = "Players",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local limit = number(flag("PlayerRenderDistance", 1500), 1500)
+		return string.format("<Success>%d</Success> <Muted>%s</Muted>", stats.players, T("tracked · %s", formatDistance(limit)))
+	end,
+})
+
+ActorsBox:CreateDivider()
+ActorsBox:CreateToggle({
+	Name = "Zombie ESP",
+	Desc = "Infected NPCs with health and archetype",
+	Flag = "ZombieESP",
+	CurrentValue = true,
+})
+ActorsBox:CreateToggle({ Name = "Name", Flag = "ZombieName", CurrentValue = true, DependsOn = "ZombieESP" })
+ActorsBox:CreateToggle({ Name = "Health", Flag = "ZombieHealth", CurrentValue = true, DependsOn = "ZombieESP" })
+ActorsBox:CreateToggle({ Name = "Distance", Flag = "ZombieDistance", CurrentValue = true, DependsOn = "ZombieESP" })
+ActorsBox:CreateToggle({ Name = "Blood moon tag", Flag = "ZombieArchetype", CurrentValue = true, DependsOn = "ZombieESP" })
+ActorsBox:CreateToggle({ Name = "Spawn code", Flag = "ZombieType", CurrentValue = false, DependsOn = "ZombieESP" })
+ActorsBox:CreateToggle({ Name = "Chams", Flag = "ZombieChams", CurrentValue = true, DependsOn = "ZombieESP" })
+ActorsBox:CreateStatus({
+	Name = "Zombies",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local limit = number(flag("ZombieRenderDistance", 1200), 1200)
+		return string.format("<Warning>%d</Warning> <Muted>%s</Muted>", stats.zombies, T("nearby · %s", formatDistance(limit)))
+	end,
+})
+
+WorldBox:CreateToggle({
+	Name = "Loot ESP",
+	Desc = "Unlooted containers, crates and corpses",
+	Flag = "LootESP",
+	CurrentValue = true,
+})
+WorldBox:CreateDropdown({
+	Name = "Types",
+	Options = LOOT_CATEGORIES,
+	MultipleOptions = true,
+	CurrentOption = LOOT_CATEGORIES,
+	Flag = "LootTypes",
+	DependsOn = "LootESP",
+})
+WorldBox:CreateToggle({ Name = "Container name", Flag = "LootNames", CurrentValue = true, DependsOn = "LootESP" })
+WorldBox:CreateToggle({ Name = "Distance", Flag = "LootDistanceTag", CurrentValue = true, DependsOn = "LootESP" })
+WorldBox:CreateToggle({ Name = "Hide looted", Flag = "LootHideLooted", CurrentValue = true, DependsOn = "LootESP" })
+WorldBox:CreateToggle({ Name = "Chams", Flag = "LootChams", CurrentValue = true, DependsOn = "LootESP" })
+WorldBox:CreateStatus({
+	Name = "Containers",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local limit = number(flag("LootRenderDistance", 225), 225)
+		return string.format("<Accent>%d</Accent> <Muted>%s</Muted>", stats.loot, T("unlooted · %s", formatDistance(limit)))
+	end,
+})
+
+WorldBox:CreateDivider()
+WorldBox:CreateToggle({
+	Name = "Vehicle ESP",
+	Desc = "Cars with health and fuel",
+	Flag = "VehicleESP",
+	CurrentValue = false,
+})
+WorldBox:CreateToggle({ Name = "Name", Flag = "VehicleName", CurrentValue = true, DependsOn = "VehicleESP" })
+WorldBox:CreateToggle({ Name = "Health", Flag = "VehicleHealth", CurrentValue = true, DependsOn = "VehicleESP" })
+WorldBox:CreateToggle({ Name = "Fuel", Flag = "VehicleFuel", CurrentValue = true, DependsOn = "VehicleESP" })
+WorldBox:CreateToggle({ Name = "Distance", Flag = "VehicleDistance", CurrentValue = true, DependsOn = "VehicleESP" })
+WorldBox:CreateToggle({ Name = "Chams", Flag = "VehicleChams", CurrentValue = true, DependsOn = "VehicleESP" })
+
+WorldBox:CreateDivider()
+WorldBox:CreateToggle({
+	Name = "Corpses",
+	Desc = "Player and zombie bodies left on the map",
+	Flag = "CorpseESP",
+	CurrentValue = false,
+})
+WorldBox:CreateToggle({ Name = "Owner name", Flag = "CorpseNames", CurrentValue = true, DependsOn = "CorpseESP" })
+WorldBox:CreateToggle({ Name = "Chams", Flag = "CorpseChams", CurrentValue = false, DependsOn = "CorpseESP" })
+
+WorldBox:CreateDivider()
+WorldBox:CreateToggle({
+	Name = "Airdrops",
+	Desc = "Military crates after a drop",
+	Flag = "AirdropESP",
+	CurrentValue = true,
+})
+WorldBox:CreateToggle({ Name = "Chams", Flag = "AirdropChams", CurrentValue = true, DependsOn = "AirdropESP" })
+
+----- Style tab -----
+
+local StyleTab = Window:CreateTab({ Name = "Style", Icon = "palette" })
+local ColorBox = StyleTab:CreateGroupbox({ Name = "Colors", Side = "Left" })
+local RangeBox = StyleTab:CreateGroupbox({ Name = "Range", Side = "Right" })
+
+ColorBox:CreateColorPicker({ Name = "Player", Color = COLOR_PLAYER, Flag = "PlayerColor" })
+ColorBox:CreateColorPicker({ Name = "Infected player", Color = COLOR_INFECTED, Flag = "InfectedColor" })
+ColorBox:CreateDivider()
+ColorBox:CreateColorPicker({ Name = "Zombie", Color = COLOR_ZOMBIE, Flag = "ZombieColor" })
+ColorBox:CreateColorPicker({ Name = "Corpse", Color = COLOR_CORPSE, Flag = "CorpseColor" })
+ColorBox:CreateDivider()
+ColorBox:CreateColorPicker({ Name = "Loot", Color = COLOR_LOOT, Flag = "LootColor" })
+ColorBox:CreateColorPicker({ Name = "Gun crate", Color = COLOR_RARE, Flag = "RareColor" })
+ColorBox:CreateDivider()
+ColorBox:CreateColorPicker({ Name = "Vehicle", Color = COLOR_VEHICLE, Flag = "VehicleColor" })
+ColorBox:CreateColorPicker({ Name = "Airdrop", Color = COLOR_AIRDROP, Flag = "AirdropColor" })
+
+RangeBox:CreateSection("Distance range")
+RangeBox:CreateSlider({
+	Name = "Players",
+	Range = { 100, 5000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 1500,
+	Flag = "PlayerRenderDistance",
+	Desc = "Players further than this are not tracked",
+})
+RangeBox:CreateSlider({
+	Name = "Zombies",
+	Range = { 100, 3000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 1200,
+	Flag = "ZombieRenderDistance",
+})
+RangeBox:CreateSlider({
+	Name = "Loot",
+	Range = { 50, 1000 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 225,
+	Flag = "LootRenderDistance",
+})
+RangeBox:CreateSlider({
+	Name = "Vehicles",
+	Range = { 100, 5000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 1200,
+	Flag = "VehicleRenderDistance",
+})
+RangeBox:CreateSlider({
+	Name = "Corpses",
+	Range = { 100, 2000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 600,
+	Flag = "CorpseRenderDistance",
+})
+RangeBox:CreateSlider({
+	Name = "Airdrops",
+	Range = { 200, 8000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 3000,
+	Flag = "AirdropRenderDistance",
+})
+
+RangeBox:CreateDivider()
+RangeBox:CreateSlider({
+	Name = "Text size",
+	Range = { 10, 22 },
+	Increment = 1,
+	CurrentValue = 14,
+	Flag = "TextSize",
+})
+RangeBox:CreateSlider({
+	Name = "Marker limit",
+	Range = { 40, 400 },
+	Increment = 20,
+	CurrentValue = 160,
+	Flag = "MaxMarkers",
+	Desc = "Caps how many labels are drawn at once",
+})
+RangeBox:CreateDropdown({
+	Name = "Distance from",
+	Options = { "Camera", "Character" },
+	CurrentOption = "Camera",
+	Flag = "DistanceFrom",
+	Desc = "Camera is smoother while driving, character matches your body",
+})
+RangeBox:CreateButton({
+	Name = "Clear ESP",
+	Desc = "Remove every highlight and label",
+	Callback = function()
+		clearVisuals()
+		Window:Notify({ Title = "Cleared", Content = "All ESP objects removed", Type = "Info" })
+	end,
+})
+RangeBox:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop everything",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptIL
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+----- Map tab -----
+
+local MapTab = Window:CreateTab({ Name = "Map", Icon = "map" })
+local OverlayBox = MapTab:CreateGroupbox({ Name = "On the game map", Side = "Left" })
+local LayerBox = MapTab:CreateGroupbox({ Name = "Layers", Side = "Right" })
+
+OverlayBox:CreateToggle({
+	Name = "Markers on map",
+	Desc = "Draws into the map the game opens with M",
+	Flag = "MapMarkers",
+	CurrentValue = true,
+})
+OverlayBox:CreateButton({
+	Name = "Clear waypoint",
+	Desc = "Removes the diamond and the HUD arrow",
+	Callback = function()
+		clearWaypoint()
+		Window:Notify({ Title = "Waypoint", Content = "Cleared", Type = "Info" })
+	end,
+})
+OverlayBox:CreateDivider()
+OverlayBox:CreateParagraph({
+	Title = "How to use",
+	Content = "Open the map with M. Right click the map to drop a waypoint, the HUD arrow under the bars points to it and shows the distance. Everything else is drawn next to the game's own markers.",
+})
+
+LayerBox:CreateToggle({ Name = "Players", Desc = "Including infected, colored by state", Flag = "MapPlayers", CurrentValue = true })
+LayerBox:CreateToggle({ Name = "Zombies", Flag = "MapZombies", CurrentValue = true })
+LayerBox:CreateToggle({ Name = "Loot", Desc = "Unlooted containers found by the scanner", Flag = "MapLoot", CurrentValue = true })
+LayerBox:CreateToggle({ Name = "Vehicles", Flag = "MapVehicles", CurrentValue = false })
+LayerBox:CreateToggle({ Name = "Airdrops", Flag = "MapAirdrops", CurrentValue = true })
+LayerBox:CreateDivider()
+LayerBox:CreateStatus({
+	Name = "Waypoint",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local waypoint = mapState.waypoint
+		local character = LocalPlayer.Character
+		local part = character and rootOf(character)
+		if not waypoint or not part then
+			return string.format("<Muted>%s</Muted>", T("not set"))
+		end
+		local dx = waypoint.x - part.Position.X
+		local dz = waypoint.z - part.Position.Z
+		return string.format("<Accent>%s</Accent> <Muted>%d, %d</Muted>",
+			formatDistance(math.sqrt(dx * dx + dz * dz)), math.floor(waypoint.x), math.floor(waypoint.z))
+	end,
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+SettingsTab:CreateParagraph({
+	Title = "Panic key",
+	Content = "End hides every marker and the on-screen HUD, the window stays open. RightControl toggles the interface.",
+})
+
+tabs.Status = StatusTab
+tabs.Visuals = VisualsTab
+tabs.Style = StyleTab
+tabs.Map = MapTab
+tabs.Settings = SettingsTab
+
+----- Runtime -----
+
+resetFlagCache()
+
+local visualAccumulator = 0
+local collectAccumulator = 0
+local hudAccumulator = 0
+local mapAccumulator = 0
+local mapErrorShown = false
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	collectAccumulator = collectAccumulator + deltaTime
+	visualAccumulator = visualAccumulator + deltaTime
+	hudAccumulator = hudAccumulator + deltaTime
+	mapAccumulator = mapAccumulator + deltaTime
+
+	if collectAccumulator >= COLLECT_INTERVAL then
+		collectAccumulator = 0
+		collect()
+	end
+
+	if visualAccumulator >= VISUAL_INTERVAL then
+		visualAccumulator = 0
+		renderList(candidates)
+	end
+
+	if hudAccumulator >= HUD_INTERVAL then
+		hudAccumulator = 0
+		pcall(refreshHud)
+	end
+
+	if mapAccumulator >= MAP_INTERVAL then
+		mapAccumulator = 0
+		local mapOk, mapErr = pcall(refreshMapMarkers)
+		if not mapOk and not mapErrorShown then
+			mapErrorShown = true
+			print("[RobScript IL] map markers error: " .. tostring(mapErr))
+		end
+	end
+end)
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			setFlag("PlayerESP", false)
+			setFlag("ZombieESP", false)
+			setFlag("LootESP", false)
+			setFlag("VehicleESP", false)
+			setFlag("CorpseESP", false)
+			setFlag("AirdropESP", false)
+			setFlag("HudEnabled", false)
+			clearVisuals()
+			if hud.gui then
+				hud.gui.Enabled = false
+			end
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	clearVisuals()
+	destroyHud()
+	destroyMapLayer()
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptIL then
+		getgenv().RobScriptIL = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptIL = {
+	Version = "1.1",
+	Actions = {
+		Refresh = collect,
+		Clear = clearVisuals,
+		Destroy = destroy,
+		ScanLoot = scanLootHosts,
+	},
+	GetStats = function()
+		local snapshot = {}
+		for key, value in pairs(stats) do
+			snapshot[key] = value
+		end
+		return snapshot
+	end,
+	GetProfiles = function()
+		return {
+			profession = LocalPlayer:GetAttribute("SelectedProfession"),
+			infectionStage = LocalPlayer:GetAttribute("InfectionStage"),
+			infectionPercent = LocalPlayer:GetAttribute("InfectionPercent"),
+			hunger = LocalPlayer:GetAttribute("Hunger"),
+			thirst = LocalPlayer:GetAttribute("Thirst"),
+			stamina = LocalPlayer:GetAttribute("Stamina"),
+		}
+	end,
+	-- Both api.Get("Flag") and api:Get("Flag") work: the colon form passes the
+	-- API table as the first argument.
+	Get = function(first, second)
+		if type(first) == "table" then
+			return flag(second, nil)
+		end
+		return flag(first, second)
+	end,
+	Set = function(first, second, third)
+		if type(first) == "table" then
+			return setFlag(second, third)
+		end
+		return setFlag(first, second)
+	end,
+	SelectTab = function(first, second)
+		local target = type(first) == "table" and second or first
+		local tab = type(target) == "table" and target or tabs[target]
+		if not tab then
+			return false
+		end
+		return (pcall(function()
+			Window:SelectTab(tab)
+		end))
+	end,
+	ListTabs = function()
+		local names = {}
+		for name in pairs(tabs) do
+			names[#names + 1] = name
+		end
+		table.sort(names)
+		return names
+	end,
+	GetMarkers = function()
+		local list = {}
+		for _, item in ipairs(candidates) do
+			list[#list + 1] = {
+				kind = item.kind,
+				name = item.adornee.Name,
+				distance = math.floor(item.distance),
+				text = item.text,
+			}
+		end
+		return list
+	end,
+	GetHud = function()
+		return {
+			enabled = hud.gui ~= nil and hud.gui.Enabled,
+			parent = hud.gui and hud.gui.Parent and hud.gui.Parent:GetFullName() or nil,
+			corner = flag("HudCorner", "Top Left"),
+			scale = number(flag("HudScale", 1), 1),
+		}
+	end,
+	MapMarkers = function()
+		return {
+			attached = mapState.folder ~= nil and mapState.folder.Parent ~= nil,
+			parent = mapState.folder and mapState.folder.Parent and mapState.folder.Parent:GetFullName() or nil,
+			dots = mapState.folder ~= nil and #mapState.folder:GetChildren() or 0,
+		}
+	end,
+	SetWaypoint = function(x, z)
+		return setWaypoint(tonumber(x), tonumber(z))
+	end,
+	ClearWaypoint = function()
+		return clearWaypoint()
+	end,
+	GetWaypoint = function()
+		local waypoint = mapState.waypoint
+		if not waypoint then
+			return nil
+		end
+		local character = LocalPlayer.Character
+		local part = character and rootOf(character)
+		local distance = nil
+		if part then
+			local dx = waypoint.x - part.Position.X
+			local dz = waypoint.z - part.Position.Z
+			distance = math.sqrt(dx * dx + dz * dz)
+		end
+		return { x = waypoint.x, z = waypoint.z, distance = distance }
+	end,
+	MapBounds = function()
+		return {
+			image = MAP.image,
+			minX = MAP.minX,
+			spanX = MAP.spanX,
+			minZ = MAP.minZ,
+			spanZ = MAP.spanZ,
+			northIsNegativeZ = MAP.northIsNegativeZ,
+		}
+	end,
+	Uptime = function()
+		return os.clock() - sessionStart
+	end,
+	GetLanguage = function()
+		local ok, code = pcall(function()
+			return Airflow:GetLanguage()
+		end)
+		return ok and code or nil
+	end,
+	SetLanguage = function(code)
+		local ok = pcall(function()
+			Airflow:SetLanguage(code)
+		end)
+		if ok then
+			pcall(applyHudLanguage)
+		end
+		return ok
+	end,
+	Translate = function(first, ...)
+		if type(first) == "table" then
+			return T(...)
+		end
+		return T(first, ...)
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+pcall(function()
+	Airflow:OnLanguageChanged(function()
+		pcall(applyHudLanguage)
+	end)
+end)
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+pcall(applyHudLanguage)
+
+pcall(refreshHud)
+
+Window:Notify({ Title = "Robscript Team", Content = "Infected Lands survival hub is ready", Type = "Success" })
+
+return getgenv().RobScriptIL
