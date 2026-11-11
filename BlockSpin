@@ -1,0 +1,3378 @@
+-- Robscript Team - BlockSpin Steak Cook
+-- Game: BlockSpin | placeId 104715542330896 | gameId 6765805766
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptCook
+--
+-- Walks the cook job like a person would: fridge -> assigned grill -> press
+-- Finish inside the green zone. No teleports, no walk-speed changes.
+
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its worker loop cannot keep walking the character.
+do
+	local existing = getgenv().RobScriptCook
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript Cook] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local JOB_NAME = "steakhouse_cook"
+
+-- Arrival radii are horizontal: the interaction points sit above the floor,
+-- so a 3D distance would never reach zero.
+local FRIDGE_ARRIVE = 4.5
+local GRILL_ARRIVE = 2.9
+local PRESS_MARGIN = 0.010
+local MOVE_REISSUE = 0.25
+local STUCK_JUMP_AFTER = 1.2
+
+local PHASE_IDLE = "Idle"
+local PHASE_JOB = "Not on the cook job"
+local PHASE_FRIDGE = "Walking to the fridge"
+local PHASE_TAKE = "Taking a steak"
+local PHASE_GRILL = "Walking to the grill"
+local PHASE_COOK = "Cooking"
+local PHASE_PRESS = "Pressing Finish"
+local PHASE_SETTLE = "Settling the order"
+local PHASE_RETRY = "Retrying"
+local PHASE_DEAD = "Dead, waiting for respawn"
+local PHASE_RETURN = "Walking back to the kitchen"
+
+----- Drawing is irrelevant here; only the GUI is used -----
+
+----- Flags -----
+
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local function character()
+	local char = LocalPlayer.Character
+	if char and char.Parent and char:FindFirstChildOfClass("Humanoid") then
+		return char, char:FindFirstChildOfClass("Humanoid"), char:FindFirstChild("HumanoidRootPart")
+	end
+	return nil
+end
+
+local function horizontalDistance(a, b)
+	local dx, dz = a.X - b.X, a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+local function money()
+	local hud = LocalPlayer:FindFirstChild("PlayerGui")
+	local top = hud and hud:FindFirstChild("TopRightHud")
+	local holder = top and top:FindFirstChild("Holder")
+	local frame = holder and holder:FindFirstChild("Frame")
+	local label = frame and frame:FindFirstChild("MoneyTextLabel")
+	if not label then
+		return nil
+	end
+	return tonumber((label.Text:gsub("[^%d]", "")))
+end
+
+-- The restaurant model is looked up instead of hard-coded, so the script keeps
+-- working if the job moves to another tile.
+local function findKitchen()
+	local map = workspace:FindFirstChild("Map")
+	local tiles = map and map:FindFirstChild("Tiles")
+	if not tiles then
+		return nil
+	end
+	local _, _, root = character()
+	local origin = root and root.Position or Vector3.zero
+	local best, bestDistance = nil, math.huge
+	for _, tile in ipairs(tiles:GetChildren()) do
+		local house = tile:FindFirstChild("SteakHouse")
+		if house then
+			local interior = house:FindFirstChild("Interior")
+			local fridge = interior and interior:FindFirstChild("Fridge")
+			local base = fridge and fridge:FindFirstChild("Base")
+			local ok, frame = pcall(function()
+				return house:GetBoundingBox()
+			end)
+			local position = ok and frame.Position or Vector3.zero
+			local distance = (position - origin).Magnitude
+			if distance < bestDistance and base then
+				best, bestDistance = house, distance
+			end
+		end
+	end
+	return best
+end
+
+-- The fridge model contains two parts named "Base"; only one of them carries
+-- the interaction attachment, so the prompt is searched across the whole model.
+local function fridgePrompt(house)
+	local interior = house and house:FindFirstChild("Interior")
+	local fridge = interior and interior:FindFirstChild("Fridge")
+	if not fridge then
+		return nil, nil
+	end
+	for _, descendant in ipairs(fridge:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") and descendant.ObjectText == "Get Steak" then
+			return descendant, descendant.Parent
+		end
+	end
+	for _, descendant in ipairs(fridge:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") then
+			return descendant, descendant.Parent
+		end
+	end
+	return nil, nil
+end
+
+local function worldPositionOf(instance)
+	if not instance then
+		return nil
+	end
+	if instance:IsA("Attachment") then
+		return instance.WorldPosition
+	end
+	if instance:IsA("BasePart") then
+		return instance.Position
+	end
+	local ok, frame = pcall(function()
+		return instance:GetBoundingBox()
+	end)
+	return ok and frame and frame.Position or nil
+end
+
+local function grillsOf(house)
+	local list = {}
+	local interior = house and house:FindFirstChild("Interior")
+	if not interior then
+		return list
+	end
+	for _, child in ipairs(interior:GetChildren()) do
+		if child.Name == "Grill" and child:FindFirstChild("GrillArea") then
+			list[#list + 1] = child
+		end
+	end
+	return list
+end
+
+local GRILL_ITEM = "94793051349"
+local GRILL_STATE = "943224801405"
+
+local function grillItem(grill)
+	return tostring(grill:GetAttribute(GRILL_ITEM) or "")
+end
+
+local function grillState(grill)
+	return tostring(grill:GetAttribute(GRILL_STATE) or "")
+end
+
+-- The game drops a Beacon on the grill you were assigned to.
+local function beaconGrill(grills)
+	local beacon = workspace:FindFirstChild("Beacon")
+	if not beacon then
+		return nil
+	end
+	local ok, frame = pcall(function()
+		return beacon:GetBoundingBox()
+	end)
+	if not ok then
+		return nil
+	end
+	local best, bestDistance = nil, math.huge
+	for index, grill in ipairs(grills) do
+		local area = grill:FindFirstChild("GrillArea")
+		local distance = (area.Position - frame.Position).Magnitude
+		if distance < bestDistance then
+			best, bestDistance = index, distance
+		end
+	end
+	return best
+end
+
+local function freeGrill(grills)
+	local _, _, root = character()
+	local origin = root and root.Position or Vector3.zero
+	local best, bestDistance = nil, math.huge
+	for index, grill in ipairs(grills) do
+		if grillItem(grill) == "" then
+			local area = grill:FindFirstChild("GrillArea")
+			local distance = (area.Position - origin).Magnitude
+			if distance < bestDistance then
+				best, bestDistance = index, distance
+			end
+		end
+	end
+	return best
+end
+
+local function cookableTool()
+	local char = LocalPlayer.Character
+	if char then
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Tool") and child:GetAttribute("IsCookable") == true then
+				return child, "hand"
+			end
+		end
+	end
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	if backpack then
+		for _, child in ipairs(backpack:GetChildren()) do
+			if child:IsA("Tool") and child:GetAttribute("IsCookable") == true then
+				return child, "backpack"
+			end
+		end
+	end
+	return nil
+end
+
+----- State -----
+
+-- Declared before navigation on purpose: navigate() reads both of these, and a
+-- later declaration would leave them as globals (nil) inside its upvalues.
+local state = {
+	phase = PHASE_IDLE,
+	auto = false,
+	cooked = 0,
+	perfect = 0,
+	failed = 0,
+	earned = 0,
+	startedAt = 0,
+	sessionCash = 0,
+	lastResult = "-",
+	lastGrill = 0,
+	lastPress = 0,
+	dead = false,
+	needReturn = false,
+	ticks = 0,
+	lastError = nil,
+}
+
+local running = true
+
+----- Navigation -----
+
+-- Kitchen coordinates measured on the live map. Every entry is relative to the
+-- kitchen centre, and the centre itself is recomputed from the four grill models
+-- at runtime, so the numbers survive a different server or a moved restaurant.
+local ANCHOR_OFFSETS = {
+	Vector3.new(0, 0, 0),
+	Vector3.new(-7, 0, -6),
+	Vector3.new(9, 0, 0),
+	Vector3.new(0, 0, 7),
+	Vector3.new(-4, 0, 4),
+}
+
+local stuckAnchors = {}
+local anchorIndex = 1
+
+local function floorYAt(position)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local char = LocalPlayer.Character
+	if char then
+		params.FilterDescendantsInstances = { char }
+	end
+	local result = workspace:Raycast(position + Vector3.new(0, 8, 0), Vector3.new(0, -40, 0), params)
+	return result and result.Position.Y or nil
+end
+
+-- Centre of the cooking area: the average of the four grill areas, with the
+-- fridge pulled in so the point never lands on a counter.
+local function prepareAnchors(house)
+	local center = Vector3.new(-264.0, 0, 343.7)
+	local grillList = grillsOf(house)
+	local sumX, sumZ, count = 0, 0, 0
+	for _, grill in ipairs(grillList) do
+		local area = grill:FindFirstChild("GrillArea")
+		if area then
+			sumX = sumX + area.Position.X
+			sumZ = sumZ + area.Position.Z
+			count = count + 1
+		end
+	end
+	if count > 0 then
+		center = Vector3.new(sumX / count, 0, sumZ / count)
+	end
+	local floor = floorYAt(center) or 252.4
+	center = Vector3.new(center.X, floor, center.Z)
+
+	stuckAnchors = {}
+	for _, offset in ipairs(ANCHOR_OFFSETS) do
+		stuckAnchors[#stuckAnchors + 1] = center + offset
+	end
+	anchorIndex = 1
+	return center
+end
+
+local function nextAnchor()
+	if #stuckAnchors == 0 then
+		return nil
+	end
+	local anchor = stuckAnchors[anchorIndex]
+	anchorIndex = anchorIndex % #stuckAnchors + 1
+	return anchor
+end
+
+-- Walks toward a point and reports whether the character actually moved, so a
+-- wedged body can be told apart from a slow one.
+local function waitWhileMoving(goal, arriveXZ, deadline)
+	local _, humanoid, root = character()
+	if not humanoid or not root then
+		return false, false
+	end
+	local startPosition = root.Position
+	local lastPosition = root.Position
+	local lastMovedAt = os.clock()
+	local jumps = 0
+	while os.clock() < deadline do
+		if not running or not state.auto then
+			return false, false
+		end
+		humanoid:MoveTo(goal)
+		task.wait(MOVE_REISSUE)
+		if not root.Parent then
+			return false, false
+		end
+		if horizontalDistance(root.Position, goal) <= arriveXZ then
+			return true, true
+		end
+		if (root.Position - lastPosition).Magnitude > 0.6 then
+			lastPosition = root.Position
+			lastMovedAt = os.clock()
+		elseif os.clock() - lastMovedAt > STUCK_JUMP_AFTER then
+			-- A small hop over a counter edge, exactly like a player would.
+			humanoid.Jump = true
+			jumps = jumps + 1
+			lastMovedAt = os.clock()
+		end
+	end
+	local moved = (root.Position - startPosition).Magnitude > 2
+	return false, moved
+end
+
+-- PathfindingService gives a walking route around counters; the final stretch is
+-- plain MoveTo because the interaction points sit inside solid props. When the
+-- character wedges anyway, it steps to the measured kitchen coordinates and then
+-- resumes the interrupted walk.
+local function navigate(goal, arriveXZ, timeout)
+	local _, humanoid, root = character()
+	if not humanoid or not root then
+		return false
+	end
+	local deadline = os.clock() + (timeout or 18)
+
+	local ok, path = pcall(function()
+		local newPath = PathfindingService:CreatePath({
+			AgentRadius = 2,
+			AgentHeight = 5,
+			AgentCanJump = true,
+			AgentMaxSlope = 45,
+		})
+		newPath:ComputeAsync(root.Position, goal)
+		return newPath
+	end)
+
+	local waypoints = ok and path and path:GetWaypoints() or {}
+	state.trace = "n:wps:" .. #waypoints
+	if #waypoints > 1 then
+		for index = 2, #waypoints do
+			if os.clock() > deadline or not running or not state.auto then
+				return false
+			end
+			local waypoint = waypoints[index]
+			if waypoint.Action == Enum.PathWaypointAction.Jump then
+				humanoid.Jump = true
+			end
+			local reached = waitWhileMoving(waypoint.Position, 2.2, math.min(deadline, os.clock() + 4))
+			state.trace = ("n:wp%d:%s"):format(index, tostring(reached))
+			if not reached and not running then
+				return false
+			end
+		end
+	end
+
+	local arrived = waitWhileMoving(goal, arriveXZ, math.min(deadline, os.clock() + 9))
+	if arrived then
+		humanoid:MoveTo(root.Position)
+		return true
+	end
+
+	-- Stuck: walk to the kitchen coordinates, then continue the same goal.
+	for attempt = 1, 3 do
+		if not running or not state.auto or os.clock() > deadline then
+			break
+		end
+		local anchor = nextAnchor()
+		if not anchor then
+			break
+		end
+		state.trace = "n:unstick" .. attempt
+		local _, moved = waitWhileMoving(anchor, 3.0, math.min(deadline, os.clock() + 4))
+		if not moved then
+			-- Nothing helped: nudge sideways so the body leaves the corner.
+			local _, _, currentRoot = character()
+			if currentRoot then
+				humanoid:MoveTo(currentRoot.Position + Vector3.new(3, 0, 0))
+				task.wait(0.4)
+			end
+		end
+		if waitWhileMoving(goal, arriveXZ, math.min(deadline, os.clock() + 6)) then
+			humanoid:MoveTo(root.Position)
+			return true
+		end
+	end
+
+	humanoid:MoveTo(root.Position)
+	return false
+end
+
+-- Keeps the character clear of the counter: the grill area centre sits inside
+-- the solid counter, so the approach point is pushed toward the room instead.
+local function approachPoint(targetPosition, targetSize, center)
+	local delta = Vector3.new(center.X - targetPosition.X, 0, center.Z - targetPosition.Z)
+	if delta.Magnitude < 0.1 then
+		delta = Vector3.new(1, 0, 0)
+	end
+	local depth = math.min(targetSize.X, targetSize.Z) * 0.5 + 1.5
+	return targetPosition + delta.Unit * depth
+end
+
+----- Finish press -----
+
+local function pressFinish(button)
+	local fired = pcall(function()
+		firesignal(button.MouseButton1Click)
+	end)
+	if fired then
+		return true
+	end
+	-- Fallback for executors without firesignal.
+	local okMove = pcall(function()
+		mousemoveabs(button.AbsolutePosition.X + button.AbsoluteSize.X * 0.5,
+			button.AbsolutePosition.Y + button.AbsoluteSize.Y * 0.5)
+	end)
+	if okMove then
+		pcall(mouse1click)
+		return true
+	end
+	return false
+end
+
+----- ESP (built in, off by default) -----
+
+-- Ported from the standalone BlockSpin ESP. Kept inside its own table so its
+-- helpers cannot clash with the cooking code.
+local Esp = {
+	targets = {},
+	stats = { players = 0, objects = 0 },
+}
+
+do
+	local CHAM_BUDGET = 28
+	local COLLECT_INTERVAL = 0.2
+	local VISUAL_INTERVAL = 0.033
+	local TEXT_INTERVAL = 0.2
+	local OBJECT_TEXT_INTERVAL = 0.5
+
+	local COLOR_PLAYER = Color3.fromRGB(90, 214, 255)
+	local COLOR_COMBAT = Color3.fromRGB(255, 78, 122)
+	local COLOR_DEAD = Color3.fromRGB(150, 150, 160)
+	local COLOR_MONEY = Color3.fromRGB(94, 255, 132)
+	local COLOR_LOOT = Color3.fromRGB(255, 196, 64)
+	local COLOR_VEHICLE = Color3.fromRGB(176, 124, 255)
+	local COLOR_NPC = Color3.fromRGB(141, 141, 153)
+	local COLOR_PUMPKIN = Color3.fromRGB(255, 159, 67)
+	local COLOR_AIRDROP = Color3.fromRGB(255, 215, 0)
+
+	local PLAYER_BOX_SIZE = Vector3.new(2.6, 5.2, 2.6)
+
+	local KIND_PLAYER = "player"
+	local KIND_DROP = "drop"
+	local KIND_VEHICLE = "vehicle"
+	local KIND_NPC = "npc"
+	local KIND_PUMPKIN = "pumpkin"
+	local KIND_AIRDROP = "airdrop"
+
+	local DRAWING = (type(Drawing) == "table" and type(Drawing.new) == "function") and Drawing or nil
+
+	local function newLine()
+		if not DRAWING then
+			return nil
+		end
+		local ok, line = pcall(DRAWING.new, "Line")
+		if ok and line then
+			line.Visible = false
+			return line
+		end
+		return nil
+	end
+
+	local function escapeRichText(text)
+		local value = tostring(text)
+		value = value:gsub("&", "&amp;")
+		value = value:gsub("<", "&lt;")
+		value = value:gsub(">", "&gt;")
+		return value
+	end
+
+	local function prettify(text)
+		local spaced = tostring(text):gsub("_", " ")
+		spaced = spaced:gsub("(%l)(%u)", "%1 %2")
+		spaced = spaced:gsub("(%u)(%u%l)", "%1 %2")
+		spaced = spaced:gsub("^%l", string.upper)
+		return spaced
+	end
+
+	local function distanceOrigin()
+		if flag("DistanceFrom", "Camera") == "Character" then
+			local _, _, root = character()
+			if root then
+				return root.Position
+			end
+		end
+		local camera = workspace.CurrentCamera
+		if camera then
+			return camera.CFrame.Position
+		end
+		return Vector3.zero
+	end
+
+	local function shortDistance(studs)
+		if studs >= 1000 then
+			return string.format("%.1fk", studs / 1000)
+		end
+		return string.format("%dm", math.floor(studs + 0.5))
+	end
+
+	local function parseDropSource(drop)
+		for _, value in pairs(drop:GetAttributes()) do
+			if type(value) == "string" and value:sub(1, 1) == "{" then
+				local custom = value:match('"custom_field_01"%s*:%s*"([^"]*)"')
+				if custom and custom ~= "" then
+					return custom
+				end
+				local sku = value:match('"sku"%s*:%s*"([^"]*)"')
+				if sku and sku ~= "" then
+					return prettify(sku)
+				end
+			end
+		end
+		return nil
+	end
+
+	local function dropAmount(drop)
+		local billboard = drop:FindFirstChildOfClass("BillboardGui")
+		local label = billboard and billboard:FindFirstChildOfClass("TextLabel")
+		if not label or type(label.Text) ~= "string" then
+			return nil
+		end
+		return label.Text:match("x%s*(%d+)")
+	end
+
+	local function dropTitle(drop)
+		local itemType = drop:GetAttribute("item_type")
+		if type(itemType) == "string" and itemType ~= "" then
+			if itemType == "money" then
+				return "Money"
+			end
+			if drop.Name:match("^%d+$") then
+				return prettify(itemType)
+			end
+		end
+		if drop.Name:match("^%d+$") then
+			return type(itemType) == "string" and prettify(itemType) or "Item"
+		end
+		return drop.Name
+	end
+
+	local function firstBasePart(model)
+		local primary = model.PrimaryPart
+		if primary then
+			return primary
+		end
+		for _, child in ipairs(model:GetChildren()) do
+			if child:IsA("BasePart") then
+				return child
+			end
+		end
+		return model:FindFirstChildWhichIsA("BasePart", true)
+	end
+
+	local function releaseVisuals(target)
+		if target.highlight then
+			pcall(function()
+				target.highlight:Destroy()
+			end)
+			target.highlight = nil
+		end
+		if target.billboard then
+			pcall(function()
+				target.billboard:Destroy()
+			end)
+			target.billboard = nil
+			target.label = nil
+		end
+		if target.lines then
+			for _, line in ipairs(target.lines) do
+				pcall(function()
+					line.Visible = false
+					line:Remove()
+				end)
+			end
+			target.lines = nil
+		end
+		if target.tracer then
+			pcall(function()
+				target.tracer.Visible = false
+				target.tracer:Remove()
+			end)
+			target.tracer = nil
+		end
+		target.hasVisual = false
+	end
+
+	local function buildBillboard(part, offsetY)
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "ESP_Billboard"
+		billboard.AlwaysOnTop = true
+		billboard.LightInfluence = 0
+		billboard.Size = UDim2.fromOffset(260, 44)
+		billboard.StudsOffset = Vector3.new(0, offsetY, 0)
+		billboard.Enabled = false
+
+		local label = Instance.new("TextLabel")
+		label.Name = "ESP_Label"
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 14
+		label.RichText = true
+		label.TextXAlignment = Enum.TextXAlignment.Center
+		label.TextYAlignment = Enum.TextYAlignment.Bottom
+		label.TextStrokeTransparency = 0.35
+		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.Text = ""
+		label.Parent = billboard
+
+		billboard.Adornee = part
+		billboard.Parent = part
+		return billboard, label
+	end
+
+	local function buildHighlight(model)
+		local highlight = Instance.new("Highlight")
+		highlight.Name = "ESP_Chams"
+		highlight.Adornee = model
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.FillTransparency = 0.65
+		highlight.OutlineTransparency = 0.1
+		highlight.Parent = model
+		return highlight
+	end
+
+	local function resolveParts(target)
+		local model = target.model
+		if not model or not model.Parent then
+			return false
+		end
+		if target.kind == KIND_PLAYER then
+			target.root = model:FindFirstChild("HumanoidRootPart")
+			target.focusPart = model:FindFirstChild("Head") or target.root
+			target.humanoid = model:FindFirstChildOfClass("Humanoid")
+		elseif target.kind == KIND_NPC then
+			target.humanoid = model:FindFirstChildOfClass("Humanoid")
+			target.root = (target.humanoid and target.humanoid.RootPart) or firstBasePart(model)
+			target.focusPart = model:FindFirstChild("Head") or target.root
+		elseif target.kind == KIND_VEHICLE then
+			target.seat = model:FindFirstChild("DriverSeat", true)
+			target.root = firstBasePart(model)
+			target.focusPart = target.root
+			target.humanoid = nil
+		else
+			target.root = firstBasePart(model)
+			target.focusPart = target.root
+			target.humanoid = nil
+		end
+		return target.root ~= nil and target.focusPart ~= nil
+	end
+
+	local function createTarget(kind, model, player)
+		local target = {
+			kind = kind,
+			model = model,
+			player = player,
+			hasVisual = false,
+			chamSlot = false,
+			lastTextAt = 0,
+		}
+		if not resolveParts(target) then
+			return nil
+		end
+		return target
+	end
+
+	local function dropTarget(model)
+		local target = Esp.targets[model]
+		if not target then
+			return
+		end
+		releaseVisuals(target)
+		Esp.targets[model] = nil
+	end
+
+	function Esp.Clear()
+		for model in pairs(Esp.targets) do
+			dropTarget(model)
+		end
+		Esp.stats.players = 0
+		Esp.stats.objects = 0
+	end
+
+	local function collectPlayers(seen)
+		if not flag("PlayerESP", false) then
+			return
+		end
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer then
+				local char = player.Character
+				if char and char.Parent then
+					local target = Esp.targets[char]
+					if not target then
+						target = createTarget(KIND_PLAYER, char, player)
+						if target then
+							Esp.targets[char] = target
+						end
+					else
+						target.player = player
+					end
+					if target then
+						seen[char] = true
+					end
+				end
+			end
+		end
+	end
+
+	local function collectFolder(folder, kind, enabled, seen, filter)
+		if not enabled or not folder then
+			return
+		end
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Model") and (not filter or filter(child)) then
+				local target = Esp.targets[child]
+				if not target then
+					target = createTarget(kind, child, nil)
+					if target then
+						Esp.targets[child] = target
+					end
+				end
+				if target then
+					seen[child] = true
+				end
+			end
+		end
+	end
+
+	local function collectVehicles(seen)
+		if not flag("VehicleESP", false) then
+			return
+		end
+		local folder = workspace:FindFirstChild("Vehicles")
+		if folder then
+			collectFolder(folder, KIND_VEHICLE, true, seen, function(model)
+				return model:FindFirstChild("DriverSeat", true) ~= nil
+			end)
+		end
+		for _, child in ipairs(workspace:GetChildren()) do
+			if child:IsA("Model") and child:FindFirstChild("DriverSeat", true) then
+				local target = Esp.targets[child]
+				if not target then
+					target = createTarget(KIND_VEHICLE, child, nil)
+					if target then
+						Esp.targets[child] = target
+					end
+				end
+				if target then
+					seen[child] = true
+				end
+			end
+		end
+	end
+
+	local function collectAirdrops(seen)
+		if not flag("AirdropESP", false) then
+			return
+		end
+		local candidates = {}
+		for _, child in ipairs(workspace:GetChildren()) do
+			candidates[#candidates + 1] = child
+		end
+		local map = workspace:FindFirstChild("Map")
+		if map then
+			for _, child in ipairs(map:GetChildren()) do
+				candidates[#candidates + 1] = child
+			end
+		end
+		for _, child in ipairs(candidates) do
+			local lower = child.Name:lower()
+			if child:IsA("Model") and child.Name ~= "AirDropPoints"
+				and (lower:find("airdrop", 1, true) or lower:find("crate", 1, true)) then
+				local target = Esp.targets[child]
+				if not target then
+					target = createTarget(KIND_AIRDROP, child, nil)
+					if target then
+						Esp.targets[child] = target
+					end
+				end
+				if target then
+					seen[child] = true
+				end
+			end
+		end
+	end
+
+	local function applyChamBudget()
+		local origin = distanceOrigin()
+		local candidates = {}
+		for _, target in pairs(Esp.targets) do
+			if target.focusPart and target.focusPart.Parent then
+				candidates[#candidates + 1] = target
+			end
+		end
+		for _, target in ipairs(candidates) do
+			target.chamSlot = false
+		end
+		if #candidates > CHAM_BUDGET then
+			table.sort(candidates, function(a, b)
+				return (a.focusPart.Position - origin).Magnitude < (b.focusPart.Position - origin).Magnitude
+			end)
+			for index = 1, CHAM_BUDGET do
+				candidates[index].chamSlot = true
+			end
+		else
+			for _, target in ipairs(candidates) do
+				target.chamSlot = true
+			end
+		end
+	end
+
+	local function collectTargets()
+		local seen = {}
+		collectPlayers(seen)
+		collectFolder(workspace:FindFirstChild("DroppedItems"), KIND_DROP, flag("DropESP", false), seen)
+		local map = workspace:FindFirstChild("Map")
+		collectFolder(map and map:FindFirstChild("NPCs"), KIND_NPC, flag("NpcESP", false), seen)
+		collectFolder(workspace:FindFirstChild("QuestPumpkins"), KIND_PUMPKIN, flag("PumpkinESP", false), seen)
+		collectVehicles(seen)
+		collectAirdrops(seen)
+		for model in pairs(Esp.targets) do
+			if not seen[model] then
+				dropTarget(model)
+			end
+		end
+		applyChamBudget()
+	end
+
+	local function playerColor(player)
+		if not player then
+			return COLOR_PLAYER
+		end
+		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health <= 0 then
+			return COLOR_DEAD
+		end
+		if player:GetAttribute("IsInCombat") == true then
+			return flag("CombatColor", COLOR_COMBAT)
+		end
+		return flag("PlayerColor", COLOR_PLAYER)
+	end
+
+	local function targetColor(target)
+		if target.kind == KIND_PLAYER then
+			return playerColor(target.player)
+		elseif target.kind == KIND_DROP then
+			if target.model:GetAttribute("item_type") == "money" then
+				return flag("MoneyColor", COLOR_MONEY)
+			end
+			return flag("LootColor", COLOR_LOOT)
+		elseif target.kind == KIND_VEHICLE then
+			return flag("VehicleColor", COLOR_VEHICLE)
+		elseif target.kind == KIND_NPC then
+			return flag("NpcColor", COLOR_NPC)
+		elseif target.kind == KIND_PUMPKIN then
+			return flag("PumpkinColor", COLOR_PUMPKIN)
+		end
+		return flag("AirdropColor", COLOR_AIRDROP)
+	end
+
+	local function playerLabelText(target, distance)
+		local player = target.player
+		if not player then
+			return ""
+		end
+		local parts = {}
+		if flag("PlayerName", true) then
+			local color = player:GetAttribute("IsInCombat") == true and "#FF4E7A" or "#FFFFFF"
+			parts[#parts + 1] = string.format('<font color="%s">%s</font>', color, escapeRichText(player.Name))
+		end
+		local details = {}
+		if flag("PlayerJob", true) then
+			local job = player:GetAttribute("Job")
+			if type(job) == "string" and job ~= "" then
+				details[#details + 1] = escapeRichText(prettify(job))
+			end
+		end
+		if flag("PlayerHealth", true) and target.humanoid then
+			details[#details + 1] = string.format("%d HP", math.floor(target.humanoid.Health + 0.5))
+		end
+		if flag("PlayerDistance", true) then
+			details[#details + 1] = shortDistance(distance)
+		end
+		if #details > 0 then
+			parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+		end
+		local level = player:GetAttribute("level")
+		if flag("PlayerLevel", true) and typeof(level) == "number" and level > 1 then
+			parts[#parts + 1] = string.format('<font color="#7FD4FF">Lv %d</font>', level)
+		end
+		return table.concat(parts, "\n")
+	end
+
+	local function dropLabelText(target, distance)
+		local drop = target.model
+		local parts = {
+			string.format('<font color="#FFFFFF">%s</font>', escapeRichText(dropTitle(drop))),
+		}
+		local details = {}
+		local amount = dropAmount(drop)
+		if amount then
+			details[#details + 1] = string.format("x%s", amount)
+		end
+		local source = parseDropSource(drop)
+		if source and flag("DropSource", true) then
+			details[#details + 1] = escapeRichText(source)
+		end
+		if flag("DropDistance", true) then
+			details[#details + 1] = shortDistance(distance)
+		end
+		if #details > 0 then
+			parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+		end
+		return table.concat(parts, "\n")
+	end
+
+	local function vehicleLabelText(target, distance)
+		local model = target.model
+		local parts = {
+			string.format('<font color="#FFFFFF">%s</font>', escapeRichText(model.Name)),
+		}
+		local details = {}
+		if flag("VehicleDriver", true) then
+			local driverName = nil
+			if target.seat and target.seat.Occupant then
+				local char = target.seat.Occupant.Parent
+				local driverPlayer = char and Players:GetPlayerFromCharacter(char)
+				driverName = driverPlayer and driverPlayer.Name or (char and char.Name)
+			end
+			details[#details + 1] = driverName and escapeRichText(driverName) or "empty"
+		end
+		if flag("VehicleDistance", true) then
+			details[#details + 1] = shortDistance(distance)
+		end
+		if #details > 0 then
+			parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+		end
+		return table.concat(parts, "\n")
+	end
+
+	local function worldLabelText(target, distance)
+		local model = target.model
+		local parts = {
+			string.format('<font color="#FFFFFF">%s</font>', escapeRichText(model.Name)),
+		}
+		local details = {}
+		if target.kind == KIND_PUMPKIN then
+			local spot = model:GetAttribute("Spot")
+			if type(spot) == "string" and spot ~= "" then
+				details[#details + 1] = escapeRichText(spot)
+			end
+		end
+		if flag("WorldDistance", true) then
+			details[#details + 1] = shortDistance(distance)
+		end
+		if #details > 0 then
+			parts[#parts + 1] = string.format('<font color="#A6A6B4">%s</font>', table.concat(details, "  |  "))
+		end
+		return table.concat(parts, "\n")
+	end
+
+	local function targetLabelText(target, distance)
+		if target.kind == KIND_PLAYER then
+			return playerLabelText(target, distance)
+		elseif target.kind == KIND_DROP then
+			return dropLabelText(target, distance)
+		elseif target.kind == KIND_VEHICLE then
+			return vehicleLabelText(target, distance)
+		end
+		return worldLabelText(target, distance)
+	end
+
+	local function updateChams(target, color, enabled)
+		if not enabled then
+			if target.highlight then
+				pcall(function()
+					target.highlight:Destroy()
+				end)
+				target.highlight = nil
+			end
+			return
+		end
+		if not target.highlight or not target.highlight.Parent then
+			target.highlight = buildHighlight(target.model)
+		end
+		target.highlight.FillColor = color
+		target.highlight.OutlineColor = color
+		target.highlight.FillTransparency = 0.65
+		target.highlight.OutlineTransparency = 0.1
+		target.highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	end
+
+	local function updateBillboard(target, color, distance, visible)
+		if not target.billboard or not target.billboard.Parent then
+			local offsetY = 2.6
+			if target.kind == KIND_DROP then
+				offsetY = 1.5
+			elseif target.kind == KIND_VEHICLE then
+				offsetY = 2.2
+			elseif target.kind == KIND_PUMPKIN then
+				offsetY = 1.4
+			elseif target.kind == KIND_AIRDROP then
+				offsetY = 3
+			end
+			target.billboard, target.label = buildBillboard(target.focusPart, offsetY)
+		end
+		local renderDistance = flag("RenderDistance", 2000)
+		target.billboard.MaxDistance = renderDistance
+		target.billboard.Enabled = visible
+		if not visible then
+			return
+		end
+		local now = os.clock()
+		local interval = target.kind == KIND_PLAYER and TEXT_INTERVAL or OBJECT_TEXT_INTERVAL
+		if now - target.lastTextAt >= interval then
+			target.lastTextAt = now
+			target.label.Text = targetLabelText(target, distance)
+		end
+		target.label.TextColor3 = color
+		target.label.TextSize = flag("TextSize", 14)
+	end
+
+	local function projectBox(center, size)
+		local camera = workspace.CurrentCamera
+		if not camera then
+			return nil
+		end
+		local half = size * 0.5
+		local minX, minY = math.huge, math.huge
+		local maxX, maxY = -math.huge, -math.huge
+		local hits = 0
+		for x = -1, 1, 2 do
+			for y = -1, 1, 2 do
+				for z = -1, 1, 2 do
+					local world = center + Vector3.new(half.X * x, half.Y * y, half.Z * z)
+					local screen = camera:WorldToViewportPoint(world)
+					if screen.Z > 0 then
+						hits = hits + 1
+						minX = math.min(minX, screen.X)
+						minY = math.min(minY, screen.Y)
+						maxX = math.max(maxX, screen.X)
+						maxY = math.max(maxY, screen.Y)
+					end
+				end
+			end
+		end
+		if hits < 2 then
+			return nil
+		end
+		return minX, minY, maxX, maxY
+	end
+
+	local function updateBox(target, color, visible)
+		local boxFlag = target.kind == KIND_PLAYER and "PlayerBox" or "VehicleBox"
+		local boxable = target.kind == KIND_PLAYER or target.kind == KIND_VEHICLE
+		if not (visible and boxable and flag(boxFlag, false)) then
+			if target.lines then
+				for _, line in ipairs(target.lines) do
+					line.Visible = false
+				end
+			end
+			return
+		end
+
+		local center, size
+		if target.kind == KIND_PLAYER then
+			if not target.root then
+				return
+			end
+			center, size = target.root.Position, PLAYER_BOX_SIZE
+		else
+			local ok, frame, boxSize = pcall(function()
+				local cf, sz = target.model:GetBoundingBox()
+				return cf, sz
+			end)
+			if not ok then
+				return
+			end
+			center, size = frame.Position, boxSize
+		end
+
+		local minX, minY, maxX, maxY = projectBox(center, size)
+		if not minX then
+			return
+		end
+		if not target.lines then
+			target.lines = { newLine(), newLine(), newLine(), newLine() }
+		end
+		local lines = target.lines
+		if not lines[1] then
+			return
+		end
+		local corners = {
+			{ Vector2.new(minX, minY), Vector2.new(maxX, minY) },
+			{ Vector2.new(maxX, minY), Vector2.new(maxX, maxY) },
+			{ Vector2.new(maxX, maxY), Vector2.new(minX, maxY) },
+			{ Vector2.new(minX, maxY), Vector2.new(minX, minY) },
+		}
+		for index = 1, 4 do
+			local line = lines[index]
+			if line then
+				line.From = corners[index][1]
+				line.To = corners[index][2]
+				line.Color = color
+				line.Thickness = 1
+				line.Visible = true
+			end
+		end
+	end
+
+	local function updateTracer(target, color, visible)
+		local tracerFlag = target.kind == KIND_PLAYER and "PlayerTracer" or "VehicleTracer"
+		local traceable = target.kind == KIND_PLAYER or target.kind == KIND_VEHICLE
+		if not (visible and traceable and flag(tracerFlag, false)) then
+			if target.tracer and target.tracer.Visible then
+				target.tracer.Visible = false
+			end
+			return
+		end
+		local camera = workspace.CurrentCamera
+		if not camera then
+			return
+		end
+		local viewport = camera.ViewportSize
+		local screen = camera:WorldToViewportPoint(target.focusPart.Position)
+		if screen.Z <= 0 then
+			if target.tracer then
+				target.tracer.Visible = false
+			end
+			return
+		end
+		if not target.tracer then
+			target.tracer = newLine()
+		end
+		if not target.tracer then
+			return
+		end
+		target.tracer.From = Vector2.new(viewport.X * 0.5, viewport.Y)
+		target.tracer.To = Vector2.new(screen.X, screen.Y)
+		target.tracer.Color = color
+		target.tracer.Thickness = 1
+		target.tracer.Visible = true
+	end
+
+	local function updateTarget(target)
+		if not target.model or not target.model.Parent then
+			releaseVisuals(target)
+			return
+		end
+		if not target.root or not target.root.Parent then
+			if not resolveParts(target) then
+				releaseVisuals(target)
+				return
+			end
+		end
+		local origin = distanceOrigin()
+		local distance = (target.focusPart.Position - origin).Magnitude
+		local inRange = distance <= flag("RenderDistance", 2000)
+		local color = targetColor(target)
+		local visible = inRange
+		if target.kind == KIND_PLAYER and not target.player then
+			visible = false
+		end
+
+		local chamsFlag = "Chams"
+		if target.kind == KIND_DROP then
+			chamsFlag = "DropChams"
+		elseif target.kind == KIND_VEHICLE then
+			chamsFlag = "VehicleChams"
+		elseif target.kind == KIND_NPC then
+			chamsFlag = "NpcChams"
+		elseif target.kind == KIND_PUMPKIN then
+			chamsFlag = "PumpkinChams"
+		elseif target.kind == KIND_AIRDROP then
+			chamsFlag = "AirdropChams"
+		end
+
+		updateChams(target, color, visible and target.chamSlot and flag(chamsFlag, true))
+		updateBillboard(target, color, distance, visible)
+		updateBox(target, color, visible)
+		updateTracer(target, color, visible)
+		target.hasVisual = visible
+	end
+
+	local collectAccumulator = 0
+	local visualAccumulator = 0
+
+	local function anyEnabled()
+		return flag("PlayerESP", false)
+			or flag("DropESP", false)
+			or flag("VehicleESP", false)
+			or flag("NpcESP", false)
+			or flag("PumpkinESP", false)
+			or flag("AirdropESP", false)
+	end
+
+	function Esp.Update(deltaTime)
+		if not anyEnabled() then
+			if next(Esp.targets) then
+				Esp.Clear()
+			end
+			return
+		end
+
+		collectAccumulator = collectAccumulator + deltaTime
+		visualAccumulator = visualAccumulator + deltaTime
+
+		if collectAccumulator >= COLLECT_INTERVAL then
+			collectAccumulator = 0
+			pcall(collectTargets)
+		end
+		if visualAccumulator >= VISUAL_INTERVAL then
+			visualAccumulator = 0
+			for _, target in pairs(Esp.targets) do
+				pcall(updateTarget, target)
+			end
+			local players, objects = 0, 0
+			for _, target in pairs(Esp.targets) do
+				if target.hasVisual then
+					if target.kind == KIND_PLAYER then
+						players = players + 1
+					else
+						objects = objects + 1
+					end
+				end
+			end
+			Esp.stats.players = players
+			Esp.stats.objects = objects
+		end
+	end
+end
+
+----- Lock-on (souls-like, ported from the Purgatory script) -----
+
+-- Holds the player nearest to the crosshair until they die, leave the range or
+-- the lock key is pressed again. Wheel cycles between targets while held.
+local lockState = { active = false, target = nil, indicator = nil }
+
+local LOCK_KEYS = {
+	["Middle mouse"] = Enum.UserInputType.MouseButton3,
+	["Q"] = Enum.KeyCode.Q,
+	["Tab"] = Enum.KeyCode.Tab,
+	["F"] = Enum.KeyCode.F,
+	["G"] = Enum.KeyCode.G,
+}
+
+local function lockRange()
+	return tonumber(flag("LockRange", 250)) or 250
+end
+
+local function lockFocusPart(player)
+	local char = player and player.Character
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function lockTargetAlive(entry)
+	if not entry or not entry.player then
+		return false
+	end
+	local char = entry.player.Character
+	if not char or not char.Parent then
+		return false
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then
+		return false
+	end
+	return lockFocusPart(entry.player) ~= nil
+end
+
+local function aimedAngle(position)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local offset = position - camera.CFrame.Position
+	if offset.Magnitude < 0.5 then
+		return nil
+	end
+	return math.deg(math.acos(math.clamp(camera.CFrame.LookVector:Dot(offset.Unit), -1, 1)))
+end
+
+local function lockCandidates()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return {}
+	end
+	local origin = camera.CFrame.Position
+	local maxDistance = lockRange()
+	local list = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local part = lockFocusPart(player)
+			if part then
+				local distance = (part.Position - origin).Magnitude
+				if distance <= maxDistance then
+					local angle = aimedAngle(part.Position)
+					if angle then
+						list[#list + 1] = { player = player, part = part, angle = angle, distance = distance }
+					end
+				end
+			end
+		end
+	end
+	-- Souls-like order: targets roughly in front win by angle, and when nothing
+	-- is in front the nearest one is still lockable. Force mode ignores the
+	-- crosshair completely and always grabs the closest body.
+	if flag("ForceLock", false) then
+		table.sort(list, function(a, b)
+			return a.distance < b.distance
+		end)
+		return list
+	end
+	table.sort(list, function(a, b)
+		local aFront = a.angle <= 60
+		local bFront = b.angle <= 60
+		if aFront ~= bFront then
+			return aFront
+		end
+		if aFront then
+			return a.angle < b.angle
+		end
+		return a.distance < b.distance
+	end)
+	return list
+end
+
+local function destroyLockIndicator()
+	if lockState.indicator then
+		pcall(function()
+			lockState.indicator:Destroy()
+		end)
+		lockState.indicator = nil
+	end
+end
+
+local function buildLockIndicator(part)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "RSP_Lock"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(56, 56)
+	billboard.StudsOffset = Vector3.new(0, 2.2, 0)
+
+	local ring = Instance.new("Frame")
+	ring.Name = "Ring"
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Position = UDim2.fromScale(0.5, 0.5)
+	ring.Size = UDim2.fromOffset(34, 34)
+	ring.BackgroundTransparency = 1
+	ring.Parent = billboard
+
+	local ringCorner = Instance.new("UICorner")
+	ringCorner.CornerRadius = UDim.new(1, 0)
+	ringCorner.Parent = ring
+
+	local ringStroke = Instance.new("UIStroke")
+	ringStroke.Color = Color3.fromRGB(255, 59, 127)
+	ringStroke.Thickness = 2.5
+	ringStroke.Transparency = 0.05
+	ringStroke.Parent = ring
+
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromScale(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(5, 5)
+	dot.BackgroundColor3 = Color3.fromRGB(255, 59, 127)
+	dot.BorderSizePixel = 0
+	dot.Parent = billboard
+
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = dot
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard
+end
+
+local function releaseLock()
+	lockState.active = false
+	lockState.target = nil
+	destroyLockIndicator()
+end
+
+local function engageLock()
+	lockState.target = nil
+	local list = lockCandidates()
+	if #list == 0 then
+		releaseLock()
+		return false
+	end
+	lockState.target = list[1]
+	lockState.active = true
+	destroyLockIndicator()
+	lockState.indicator = buildLockIndicator(list[1].part)
+	return true
+end
+
+local function toggleLock()
+	if lockState.active then
+		releaseLock()
+		return false
+	end
+	return engageLock()
+end
+
+local function cycleLock(direction)
+	local list = lockCandidates()
+	if #list == 0 then
+		releaseLock()
+		return
+	end
+	local index = nil
+	for i, entry in ipairs(list) do
+		if lockState.target and entry.player == lockState.target.player then
+			index = i
+			break
+		end
+	end
+	if not index then
+		lockState.target = list[1]
+		lockState.active = true
+		destroyLockIndicator()
+		lockState.indicator = buildLockIndicator(list[1].part)
+		return
+	end
+	index = index + (direction or 1)
+	if index > #list then
+		index = 1
+	end
+	if index < 1 then
+		index = #list
+	end
+	lockState.target = list[index]
+	lockState.active = true
+	destroyLockIndicator()
+	lockState.indicator = buildLockIndicator(list[index].part)
+end
+
+local function updateLock(deltaTime)
+	if not lockState.active then
+		return
+	end
+	local force = flag("ForceLock", false)
+
+	-- Force mode never lets go on its own: if the body disappears it grabs the
+	-- next closest one instead of dropping the lock.
+	if not lockTargetAlive(lockState.target) then
+		if force and engageLock() then
+			return
+		end
+		releaseLock()
+		return
+	end
+	local part = lockFocusPart(lockState.target.player)
+	local camera = workspace.CurrentCamera
+	local _, _, root = character()
+	if not part or not camera or not root then
+		releaseLock()
+		return
+	end
+
+	local position = part.Position
+	if (position - camera.CFrame.Position).Magnitude > lockRange() * 1.4 then
+		if force and engageLock() then
+			return
+		end
+		releaseLock()
+		return
+	end
+
+	if force then
+		-- Hard snap: the camera lands on the target in the same frame.
+		camera.CFrame = CFrame.lookAt(camera.CFrame.Position, position)
+	elseif flag("LockCamera", true) then
+		local desired = CFrame.lookAt(camera.CFrame.Position, position)
+		local speed = tonumber(flag("LockCameraSpeed", 14)) or 14
+		local alpha = 1 - math.exp(-(deltaTime or 0.016) * speed)
+		camera.CFrame = camera.CFrame:Lerp(desired, alpha)
+	end
+
+	-- Facing the target only matters for melee; during auto cooking it would
+	-- fight the walking controller, so it is skipped then.
+	if (force or flag("LockTurnCharacter", false)) and not state.auto then
+		local flat = Vector3.new(position.X, root.Position.Y, position.Z)
+		if force then
+			root.CFrame = CFrame.lookAt(root.Position, flat)
+		else
+			local alpha = 1 - math.exp(-(deltaTime or 0.016) * 12)
+			root.CFrame = root.CFrame:Lerp(CFrame.lookAt(root.Position, flat), alpha)
+		end
+	end
+
+	if flag("LockIndicator", true) then
+		local indicator = lockState.indicator
+		if not indicator or indicator.Adornee ~= part or not indicator.Parent then
+			destroyLockIndicator()
+			lockState.indicator = buildLockIndicator(part)
+		end
+	else
+		destroyLockIndicator()
+	end
+end
+
+----- Map bridge -----
+
+-- Declared up here so the bridge can hide the hub once the map opens.
+local Window
+
+-- The map is its own script; this only spawns it on demand from the executor
+-- workspace so one toggle in the hub is enough.
+local function loadMapModule()
+	local existing = getgenv().RobScriptMap
+	if type(existing) == "table" and type(existing.Open) == "function" then
+		return existing, nil
+	end
+	local okRead, source = pcall(readfile, "BlockSpinMap.lua")
+	if not okRead or type(source) ~= "string" or #source < 100 then
+		return nil, "file"
+	end
+	local chunk = loadstring(source)
+	if not chunk then
+		return nil, "compile"
+	end
+	local okRun, err = pcall(chunk)
+	if not okRun then
+		return nil, tostring(err)
+	end
+	local module = getgenv().RobScriptMap
+	if type(module) ~= "table" then
+		return nil, "module"
+	end
+	return module, nil
+end
+
+local function openMap()
+	local module, reason = loadMapModule()
+	if not module then
+		return nil, reason
+	end
+	pcall(function()
+		module.Open()
+	end)
+	-- The hub draws at DisplayOrder 999, so the map is lifted above it and the
+	-- hub steps aside to keep the plan readable.
+	if type(module.Raise) == "function" then
+		pcall(function()
+			module.Raise()
+		end)
+	end
+	if Window then
+		pcall(function()
+			Window:Toggle(false)
+		end)
+	end
+	return module, nil
+end
+
+----- One cooking cycle -----
+
+local function log(line)
+	if Log then
+		pcall(function()
+			Log:Push(line)
+		end)
+	end
+end
+
+local function setPhase(phase)
+	state.phase = phase
+end
+
+local function cycle(house)
+	local prompt, attachment = fridgePrompt(house)
+	local anchor = worldPositionOf(attachment)
+	if not prompt or not anchor then
+		return "no-fridge"
+	end
+	local kitchenCenter = prepareAnchors(house)
+
+	-- 1. Already holding a steak (for example after a failed placement): skip the fridge.
+	local tool = cookableTool()
+	if not tool then
+		setPhase(PHASE_FRIDGE)
+		local fridgeApproach = approachPoint(anchor, Vector3.new(6, 3, 13), kitchenCenter)
+		local target = fridgeApproach + Vector3.new(0, -1, 0)
+		local arrived = navigate(target, FRIDGE_ARRIVE, 18)
+		if not running or not state.auto then
+			return "stop"
+		end
+		if not arrived then
+			-- Last resort: the measured fridge-side coordinate, then continue.
+			local _, moved = waitWhileMoving(anchor + Vector3.new(4, -1, 1), FRIDGE_ARRIVE, 4)
+			local _, _, currentRoot = character()
+			arrived = moved and currentRoot ~= nil and (currentRoot.Position - anchor).Magnitude <= 8
+		end
+		if not arrived then
+			log("<Warning>Could not reach the fridge</Warning>")
+			return "not-arrived"
+		end
+		local _, _, root = character()
+		if not root or (root.Position - anchor).Magnitude > 8 then
+			return "not-arrived"
+		end
+		setPhase(PHASE_TAKE)
+		pcall(fireproximityprompt, prompt)
+		task.wait(0.9)
+		tool = cookableTool()
+	end
+
+	if not tool then
+		state.failed = state.failed + 1
+		log("<Error>No steak from the fridge</Error>")
+		return "no-steak"
+	end
+
+	if tool.Parent ~= LocalPlayer.Character then
+		local _, humanoid = character()
+		if humanoid then
+			pcall(function()
+				humanoid:EquipTool(tool)
+			end)
+			task.wait(0.3)
+		end
+	end
+
+	-- 2. The beacon marks the assigned grill; a free one is the fallback.
+	local grills = grillsOf(house)
+	if #grills == 0 then
+		return "no-grill"
+	end
+	local targetIndex = beaconGrill(grills) or freeGrill(grills)
+	if not targetIndex then
+		local index = 1
+		for i, grill in ipairs(grills) do
+			if grillItem(grill) == "" then
+				index = i
+				break
+			end
+		end
+		targetIndex = index
+	end
+
+	local grill = grills[targetIndex]
+	local area = grill:FindFirstChild("GrillArea")
+	setPhase(PHASE_GRILL)
+	local grillApproach = approachPoint(area.Position, area.Size, kitchenCenter)
+	local arrivedGrill = navigate(grillApproach, GRILL_ARRIVE, 15)
+	if not running or not state.auto then
+		return "stop"
+	end
+	if not arrivedGrill then
+		log("<Warning>Could not reach the grill</Warning>")
+		return "not-arrived"
+	end
+	state.lastGrill = targetIndex
+
+	-- Close the last couple of studs to the counter so the steak places itself.
+	waitWhileMoving(area.Position, 2.8, 2.5)
+
+	-- 3. The steak places itself when the player reaches the counter.
+	local gui = LocalPlayer.PlayerGui
+	local progress = gui:FindFirstChild("ProgressBar")
+	local frame = progress and progress:FindFirstChild("ProgressBarFrame")
+	local deadline = os.clock() + 3.5
+	while os.clock() < deadline and not (frame and frame.Visible) do
+		task.wait(0.03)
+	end
+
+	if not (frame and frame.Visible) then
+		-- Try one more grill before giving up on the steak.
+		local other = freeGrill(grills)
+		if other and other ~= targetIndex then
+			local otherArea = grills[other]:FindFirstChild("GrillArea")
+			setPhase(PHASE_RETRY)
+			navigate(approachPoint(otherArea.Position, otherArea.Size, kitchenCenter), GRILL_ARRIVE, 12)
+			waitWhileMoving(otherArea.Position, 2.8, 2.5)
+			state.lastGrill = other
+			deadline = os.clock() + 3.5
+			while os.clock() < deadline and not frame.Visible do
+				task.wait(0.03)
+			end
+			grill = grills[other]
+		end
+	end
+
+	if not (frame and frame.Visible) then
+		state.failed = state.failed + 1
+		log("<Warning>Steak did not reach a grill</Warning>")
+		return "not-placed"
+	end
+
+	-- 4. Press Finish inside the green zone.
+	setPhase(PHASE_COOK)
+	local main = frame:FindFirstChild("MainFrame")
+	local amount = main and main:FindFirstChild("BarAmount")
+	local green = main and main:FindFirstChild("CookedPerfectly")
+	local inputFrame = frame:FindFirstChild("InputFrame")
+	local button = inputFrame and inputFrame:FindFirstChild("FinishBar")
+	if not (amount and green and button) then
+		return "no-widgets"
+	end
+
+	local zoneStart = green.Position.X.Scale
+	local zoneEnd = zoneStart + green.Size.X.Scale
+	local margin = math.clamp(flag("PressMargin", 0.01), 0.0, math.max(0.0, zoneEnd - zoneStart - 0.005))
+	local targetBar = zoneStart + margin
+	local cashBefore = money() or 0
+	local pressedAt = -1
+	local cookDeadline = os.clock() + 20
+	while os.clock() < cookDeadline do
+		if not running or not state.auto then
+			return "stop"
+		end
+		local bar = amount.Size.X.Scale
+		if bar >= targetBar then
+			setPhase(PHASE_PRESS)
+			pressFinish(button)
+			pressedAt = bar
+			break
+		end
+		task.wait(0.004)
+	end
+
+	if pressedAt < 0 then
+		state.failed = state.failed + 1
+		log("<Error>Green zone was missed</Error>")
+		return "missed"
+	end
+	state.lastPress = pressedAt
+
+	-- 5. Wait for the bar to close, then wait for the payout. The grill
+	-- attributes only exist while a steak sits on it, so money is the honest
+	-- success signal: the payout lands a few seconds after the press.
+	setPhase(PHASE_SETTLE)
+	local closeDeadline = os.clock() + 3
+	while os.clock() < closeDeadline and frame.Visible do
+		task.wait(0.03)
+	end
+
+	state.cooked = state.cooked + 1
+	-- The payout lands in several increments a few seconds after the press, so
+	-- the highest value seen in the window is the real amount.
+	local paid = 0
+	local payDeadline = os.clock() + 5
+	while os.clock() < payDeadline do
+		local current = money() or 0
+		if current - cashBefore > paid then
+			paid = current - cashBefore
+			state.sessionCash = current
+		end
+		task.wait(0.25)
+	end
+
+	if paid > 0 then
+		state.perfect = state.perfect + 1
+		state.earned = state.earned + paid
+		state.lastResult = string.format("+$%d", paid)
+		log(("<Success>Sold the steak</Success> <Muted>+$%d, bar %.3f</Muted>"):format(paid, pressedAt))
+	else
+		state.failed = state.failed + 1
+		state.lastResult = "No payout"
+		log(("<Warning>Steak burnt</Warning> <Muted>bar %.3f</Muted>"):format(pressedAt))
+	end
+
+	-- Small human pause before the next order.
+	task.wait(0.4)
+	return "ok"
+end
+
+----- Shelf stocker -----
+
+-- Second job in the same hub. The shop interior is too tight for the navmesh
+-- (PathfindingService returns no path inside), so the route is walked through
+-- measured points: box pile -> door -> aisle -> shelf front.
+local SHELF_JOB = "shelf_stocker"
+
+local shelfState = {
+	auto = false,
+	phase = "Idle",
+	placed = 0,
+	failed = 0,
+	earned = 0,
+	ticks = 0,
+	lastError = nil,
+	dead = false,
+}
+
+-- Assigned when the tab is built; the module logs into it.
+local ShelfLog
+
+local function shelfLog(line)
+	if ShelfLog then
+		pcall(function()
+			ShelfLog:Push(line)
+		end)
+	elseif Log then
+		pcall(function()
+			Log:Push(line)
+		end)
+	end
+end
+
+local function findStore()
+	local map = workspace:FindFirstChild("Map")
+	local tiles = map and map:FindFirstChild("Tiles")
+	if not tiles then
+		return nil
+	end
+	for _, tile in ipairs(tiles:GetChildren()) do
+		for _, model in ipairs(tile:GetChildren()) do
+			if model:IsA("Model") then
+				local interior = model:FindFirstChild("Interior")
+				if interior and interior:FindFirstChild("ShelfStockingJob") then
+					return model
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function shelfParts(store)
+	local interior = store and store:FindFirstChild("Interior")
+	local job = interior and interior:FindFirstChild("ShelfStockingJob")
+	if not job then
+		return nil
+	end
+	local boxes = {}
+	for _, child in ipairs(job:GetChildren()) do
+		if child:IsA("BasePart") and string.find(child.Name, "Box", 1, true)
+			and child:FindFirstChildWhichIsA("ProximityPrompt") then
+			boxes[#boxes + 1] = child
+		end
+	end
+	local shelves = {}
+	local folder = job:FindFirstChild("Shelves")
+	if folder then
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("BasePart") then
+				shelves[#shelves + 1] = child
+			end
+		end
+	end
+	local doorSystem = interior:FindFirstChild("DoorSystem")
+	local doorPart = doorSystem and (doorSystem:FindFirstChild("DoorBase") or doorSystem:FindFirstChildWhichIsA("BasePart"))
+	return boxes, shelves, doorPart
+end
+
+local function carriedBox()
+	local char = LocalPlayer.Character
+	if not char then
+		return nil
+	end
+	for _, child in ipairs(char:GetChildren()) do
+		if child:IsA("Tool") and string.find(child.Name, "Box", 1, true) then
+			return child
+		end
+	end
+	return nil
+end
+
+-- The shop has no navmesh, so a local walkability grid is measured once and
+-- searched with BFS. Cell size 2 studs finds the narrow gaps between racks.
+local Grid = { minX = 0, minZ = 0, cell = 2, w = 0, h = 0, cells = nil, builtAt = 0, floorY = 252 }
+
+local function gridCellIndex(ix, iz)
+	return iz * Grid.w + ix + 1
+end
+
+local function gridBuild(minX, minZ, maxX, maxZ, floorY)
+	local cell = Grid.cell
+	local w = math.max(math.ceil((maxX - minX) / cell), 1)
+	local h = math.max(math.ceil((maxZ - minZ) / cell), 1)
+	local cells = table.create(w * h, false)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local char = LocalPlayer.Character
+	if char then
+		params.FilterDescendantsInstances = { char }
+	end
+
+	local originY = floorY + 10
+	for iz = 0, h - 1 do
+		for ix = 0, w - 1 do
+			local x = minX + (ix + 0.5) * cell
+			local z = minZ + (iz + 0.5) * cell
+			local down = workspace:Raycast(Vector3.new(x, originY, z), Vector3.new(0, -25, 0), params)
+			if down then
+				local hitY = down.Position.Y
+				if math.abs(hitY - floorY) < 5 then
+					local up = workspace:Raycast(Vector3.new(x, hitY + 1.2, z), Vector3.new(0, 7, 0), params)
+					cells[gridCellIndex(ix, iz)] = (up == nil)
+				end
+			end
+		end
+	end
+
+	Grid.minX, Grid.minZ, Grid.w, Grid.h, Grid.cells = minX, minZ, w, h, cells
+	Grid.builtAt = os.clock()
+	Grid.floorY = floorY
+end
+
+local function gridWalkable(ix, iz)
+	if ix < 0 or iz < 0 or ix >= Grid.w or iz >= Grid.h then
+		return false
+	end
+	return Grid.cells[gridCellIndex(ix, iz)] == true
+end
+
+local function gridPoint(ix, iz)
+	return Vector3.new(
+		Grid.minX + (ix + 0.5) * Grid.cell,
+		Grid.floorY,
+		Grid.minZ + (iz + 0.5) * Grid.cell
+	)
+end
+
+local function gridToCell(position)
+	return math.floor((position.X - Grid.minX) / Grid.cell),
+		math.floor((position.Z - Grid.minZ) / Grid.cell)
+end
+
+-- BFS on 8 neighbours; diagonal steps need both orthogonal cells free.
+local function gridPath(from, to)
+	if not Grid.cells then
+		return {}
+	end
+	local sx, sz = gridToCell(from)
+	local tx, tz = gridToCell(to)
+
+	local function nearestWalkable(ix, iz)
+		for radius = 0, 4 do
+			for dx = -radius, radius do
+				for dz = -radius, radius do
+					if gridWalkable(ix + dx, iz + dz) then
+						return ix + dx, iz + dz
+					end
+				end
+			end
+		end
+		return nil
+	end
+
+	if not gridWalkable(sx, sz) then
+		local nx, nz = nearestWalkable(sx, sz)
+		if not nx then
+			return {}
+		end
+		sx, sz = nx, nz
+	end
+	if not gridWalkable(tx, tz) then
+		local nx, nz = nearestWalkable(tx, tz)
+		if not nx then
+			return {}
+		end
+		tx, tz = nx, nz
+	end
+
+	local startIndex = gridCellIndex(sx, sz)
+	local targetIndex = gridCellIndex(tx, tz)
+	if startIndex == targetIndex then
+		return { to }
+	end
+
+	local previous = { [startIndex] = -1 }
+	local queue = { startIndex }
+	local head = 1
+	local neighbours = {
+		{ 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+		{ 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 },
+	}
+
+	while head <= #queue do
+		local index = queue[head]
+		head = head + 1
+		if index == targetIndex then
+			break
+		end
+		local iz = math.floor((index - 1) / Grid.w)
+		local ix = (index - 1) % Grid.w
+		for _, offset in ipairs(neighbours) do
+			local nx, nz = ix + offset[1], iz + offset[2]
+			if gridWalkable(nx, nz) then
+				local diagonal = offset[1] ~= 0 and offset[2] ~= 0
+				if not diagonal or (gridWalkable(ix + offset[1], iz) and gridWalkable(ix, iz + offset[2])) then
+					local nextIndex = gridCellIndex(nx, nz)
+					if previous[nextIndex] == nil then
+						previous[nextIndex] = index
+						queue[#queue + 1] = nextIndex
+					end
+				end
+			end
+		end
+	end
+
+	if previous[targetIndex] == nil then
+		return {}
+	end
+
+	local path = {}
+	local cursor = targetIndex
+	while cursor and cursor ~= -1 do
+		local iz = math.floor((cursor - 1) / Grid.w)
+		local ix = (cursor - 1) % Grid.w
+		table.insert(path, 1, gridPoint(ix, iz))
+		cursor = previous[cursor]
+	end
+	path[#path + 1] = to
+	return path
+end
+
+-- Shelves form solid dividers, so a straight MoveTo wedges the body. This walker
+-- slides along the obstacle (alternating sides) until the goal is reachable.
+local function smartWalk(goal, arriveXZ, timeout)
+	local _, humanoid, root = character()
+	if not humanoid or not root then
+		return false
+	end
+	local deadline = os.clock() + (timeout or 10)
+	local side = 1
+	local lastPosition = root.Position
+	local lastProgressAt = os.clock()
+	while os.clock() < deadline do
+		if not running or not shelfState.auto then
+			return false
+		end
+		if horizontalDistance(root.Position, goal) <= arriveXZ then
+			humanoid:MoveTo(root.Position)
+			return true
+		end
+		humanoid:MoveTo(goal)
+		task.wait(0.2)
+		if (root.Position - lastPosition).Magnitude > 0.5 then
+			lastPosition = root.Position
+			lastProgressAt = os.clock()
+		elseif os.clock() - lastProgressAt > 0.8 then
+			local direction = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
+			if direction.Magnitude > 0.1 then
+				direction = direction.Unit
+				local sideways = Vector3.new(-direction.Z, 0, direction.X) * (side * 5)
+				humanoid:MoveTo(root.Position + sideways)
+				task.wait(0.7)
+				side = -side
+			end
+			lastPosition = root.Position
+			lastProgressAt = os.clock()
+		end
+	end
+	return false
+end
+
+local function shelfWalkTo(goal, arriveXZ, timeout)
+	local _, humanoid, root = character()
+	if not humanoid or not root then
+		return false
+	end
+	local deadline = os.clock() + (timeout or 14)
+	local path = gridPath(root.Position, goal)
+	if #path == 0 then
+		return smartWalk(goal, arriveXZ, deadline - os.clock())
+	end
+	for index, point in ipairs(path) do
+		if not running or not shelfState.auto or os.clock() > deadline then
+			return false
+		end
+		local last = index == #path
+		smartWalk(point, last and arriveXZ or 1.6, math.min(deadline - os.clock(), 6))
+	end
+	if humanoid and root then
+		humanoid:MoveTo(root.Position)
+	end
+	return horizontalDistance(root.Position, goal) <= arriveXZ + 2
+end
+
+-- Door crossing only when the run really changes rooms; walking back out and in
+-- again just to reach the next shelf wastes the whole cycle.
+local function shelfRouteTo(store, destination)
+	local _, shelves, doorPart = shelfParts(store)
+	if not doorPart or #shelves == 0 then
+		return { destination }
+	end
+	local _, _, root = character()
+	if not root then
+		return { destination }
+	end
+	local door = doorPart.Position
+	local floorY = door.Y
+	local fromX = root.Position.X
+	local toX = destination.X
+
+	local sameSide = (fromX > door.X and toX > door.X) or (fromX < door.X and toX < door.X)
+	if sameSide then
+		return { destination }
+	end
+
+	local points = {}
+	if fromX > door.X then
+		points[#points + 1] = Vector3.new(door.X + 4, floorY, door.Z)
+		points[#points + 1] = Vector3.new(door.X - 3, floorY, door.Z)
+	else
+		points[#points + 1] = Vector3.new(door.X - 3, floorY, door.Z)
+		points[#points + 1] = Vector3.new(door.X + 4, floorY, door.Z)
+	end
+	points[#points + 1] = Vector3.new(destination.X, floorY, door.Z)
+	points[#points + 1] = destination
+	return points
+end
+
+-- The game drops the same Beacon marker it uses for cooking, but here it marks
+-- the shelf you are supposed to fill.
+local function beaconPosition()
+	local beacon = workspace:FindFirstChild("Beacon")
+	if not beacon then
+		return nil
+	end
+	local ok, frame = pcall(function()
+		return beacon:GetBoundingBox()
+	end)
+	if not ok or not frame then
+		return nil
+	end
+	return frame.Position
+end
+
+local function beaconShelf(shelves, from)
+	local beacon = beaconPosition()
+	if not beacon then
+		return nil
+	end
+	local best, bestDistance = nil, math.huge
+	for _, shelf in ipairs(shelves) do
+		local distance = (shelf.Position - beacon).Magnitude
+		if distance < bestDistance then
+			best, bestDistance = shelf, distance
+		end
+	end
+	return best
+end
+
+-- Shelves worth walking to: the front row, reachable from the shop aisle.
+local function shelfFrontPoint(shelf, floorY)
+	return Vector3.new(shelf.Position.X + 7, floorY, shelf.Position.Z)
+end
+
+local function pickFreeShelf(shelves, from)
+	local best, bestDistance = nil, math.huge
+	for _, shelf in ipairs(shelves) do
+		if shelf.Position.X > 110 then
+			local distance = horizontalDistance(from, shelf.Position)
+			if distance < bestDistance then
+				best, bestDistance = shelf, distance
+			end
+		end
+	end
+	return best
+end
+
+local function pickBox(boxes, from)
+	-- The box parts are invisible anchors, so availability is the prompt state,
+	-- and boxes on the player's floor are preferred over the lower piles.
+	local best, bestDistance = nil, math.huge
+	local bestAny, bestAnyDistance = nil, math.huge
+	for _, box in ipairs(boxes) do
+		local prompt = box:FindFirstChildWhichIsA("ProximityPrompt")
+		if prompt and prompt.Enabled then
+			local distance = horizontalDistance(from, box.Position)
+			if math.abs(box.Position.Y - from.Y) < 6 and distance < bestDistance then
+				best, bestDistance = box, distance
+			end
+			if distance < bestAnyDistance then
+				bestAny, bestAnyDistance = box, distance
+			end
+		end
+	end
+	return best or bestAny
+end
+
+local function shelfStep()
+	if not shelfState.auto then
+		return
+	end
+	local char, humanoid, root = character()
+	if not char or not humanoid or humanoid.Health <= 0 then
+		if not shelfState.dead then
+			shelfState.dead = true
+			shelfState.phase = "Dead, waiting for respawn"
+			shelfLog("<Warning>Shelf run paused: character died</Warning>")
+		end
+		task.wait(0.5)
+		return
+	end
+	if shelfState.dead then
+		shelfState.dead = false
+		shelfState.phase = "Respawned"
+		shelfLog("<Success>Respawned, back to the shop</Success>")
+		task.wait(1.2)
+	end
+
+	if flag("ShelfRequireJob", true) and LocalPlayer:GetAttribute("Job") ~= SHELF_JOB then
+		shelfState.phase = "Not on the shelf job"
+		if flag("ShelfStopWithoutJob", true) then
+			shelfState.auto = false
+			setFlag("ShelfStocking", false)
+			shelfLog("<Error>Left the shelf job, auto stopped</Error>")
+		else
+			task.wait(0.5)
+		end
+		return
+	end
+
+	local store = findStore()
+	if not store then
+		shelfState.phase = "Shop not loaded"
+		task.wait(0.5)
+		return
+	end
+	local boxes, shelves, doorPart = shelfParts(store)
+	if not doorPart or #boxes == 0 or #shelves == 0 then
+		shelfState.phase = "Job props missing"
+		task.wait(0.5)
+		return
+	end
+
+	-- Build (or refresh) the shop walkability grid once per minute.
+	if not Grid.cells or os.clock() - Grid.builtAt > 60 then
+		local ok, frame, size = pcall(function()
+			return store:GetBoundingBox()
+		end)
+		if ok and frame then
+			shelfState.phase = "Scanning the shop"
+			gridBuild(
+				frame.Position.X - size.X * 0.5 - 3,
+				frame.Position.Z - size.Z * 0.5 - 3,
+				frame.Position.X + size.X * 0.5 + 3,
+				frame.Position.Z + size.Z * 0.5 + 3,
+				doorPart.Position.Y
+			)
+		end
+	end
+
+	local tool = carriedBox()
+	if not tool then
+		-- 1. take a box
+		shelfState.phase = "Walking to the boxes"
+		local box = pickBox(boxes, root.Position)
+		if not box then
+			shelfState.failed = shelfState.failed + 1
+			shelfState.phase = "No boxes left"
+			shelfLog("<Muted>No box available, waiting</Muted>")
+			task.wait(1.5)
+			return
+		end
+		local route = shelfRouteTo(store, box.Position)
+		shelfWalkTo(box.Position, 4.2, 16)
+		if not shelfState.auto then
+			shelfState.phase = "Idle"
+			return
+		end
+		shelfState.phase = "Taking a box"
+		local prompt = box:FindFirstChildWhichIsA("ProximityPrompt")
+		if prompt then
+			pcall(fireproximityprompt, prompt)
+		end
+		local deadline = os.clock() + 3
+		while os.clock() < deadline and not carriedBox() do
+			task.wait(0.1)
+		end
+		if not carriedBox() then
+			shelfState.failed = shelfState.failed + 1
+			shelfLog("<Warning>Box was not picked up</Warning>")
+			task.wait(0.6)
+			return
+		end
+	end
+
+	-- 2. carry it to the shelf the game marks
+	local target = beaconShelf(shelves, root.Position) or pickFreeShelf(shelves, root.Position)
+	if not target then
+		shelfState.phase = "No shelf target"
+		task.wait(0.5)
+		return
+	end
+	shelfState.phase = "Carrying to the shelf"
+	local floorY = doorPart.Position.Y
+	local beacon = beaconPosition()
+	local front = beacon and Vector3.new(beacon.X, floorY, beacon.Z) or shelfFrontPoint(target, floorY)
+	shelfWalkTo(front, 2.2, 20)
+	if not shelfState.auto then
+		shelfState.phase = "Idle"
+		return
+	end
+
+	-- 3. The box stocks itself while the player stands inside the ring marker;
+	-- the server takes a second or two, so the loop waits on the ring.
+	shelfState.phase = "Placing the box"
+	local cashBefore = money() or 0
+	local ring = beaconPosition() or front
+	local placedAt = nil
+	local placeDeadline = os.clock() + 14
+	while os.clock() < placeDeadline do
+		if not carriedBox() then
+			placedAt = os.clock()
+			break
+		end
+		local _, hum2, root2 = character()
+		if not hum2 or not root2 then
+			break
+		end
+		if horizontalDistance(root2.Position, ring) > 1.4 then
+			hum2:MoveTo(ring)
+			task.wait(0.15)
+		else
+			-- Standing still on the marker: no MoveTo calls, the server needs
+			-- an undisturbed second to accept the box.
+			task.wait(0.5)
+		end
+	end
+	local _, humStop, rootStop = character()
+	if humStop and rootStop then
+		humStop:MoveTo(rootStop.Position)
+	end
+
+	if carriedBox() then
+		shelfState.failed = shelfState.failed + 1
+		shelfState.phase = "Box still in hands"
+		shelfLog("<Warning>Could not place the box</Warning>")
+		return
+	end
+
+	local paid = 0
+	local payDeadline = os.clock() + 4
+	while os.clock() < payDeadline do
+		local current = money() or 0
+		if current - cashBefore > paid then
+			paid = current - cashBefore
+		end
+		task.wait(0.2)
+	end
+	shelfState.placed = shelfState.placed + 1
+	shelfState.earned = shelfState.earned + paid
+	shelfState.phase = "Box placed"
+	if paid > 0 then
+		shelfLog(("<Success>Box stocked</Success> <Muted>+$%d</Muted>"):format(paid))
+	else
+		shelfLog("<Success>Box stocked</Success>")
+	end
+	task.wait(0.3)
+end
+
+----- Worker -----
+
+local function workerStep()
+	state.seenAuto = state.auto
+	state.trace = "a:enter"
+	if not state.auto then
+		state.trace = "b:idle"
+		state.phase = PHASE_IDLE
+		task.wait(0.25)
+		return
+	end
+	local char, humanoid = character()
+	state.trace = char and "c:alive" or "c:nochar"
+	if not char or not humanoid or humanoid.Health <= 0 then
+		-- Dying mid-order is normal in BlockSpin: hold still and resume
+		-- automatically once the character is back on its feet.
+		if not state.dead then
+			state.dead = true
+			state.phase = PHASE_DEAD
+			log("<Warning>Character died, waiting for respawn</Warning>")
+		end
+		task.wait(0.5)
+		return
+	end
+	if state.dead then
+		state.dead = false
+		state.needReturn = true
+		log("<Success>Respawned</Success>")
+		task.wait(1.5)
+	end
+	if state.needReturn then
+		state.phase = PHASE_RETURN
+		local house = findKitchen()
+		local _, attachment = house and fridgePrompt(house)
+		local anchor = worldPositionOf(attachment)
+		if anchor then
+			local target = anchor + Vector3.new(3.0, -2, 0)
+			navigate(target, FRIDGE_ARRIVE, 45)
+			state.needReturn = not running
+		else
+			state.needReturn = false
+		end
+	end
+	if not state.auto then
+		state.phase = PHASE_IDLE
+		return
+	end
+	if flag("RequireJob", true) and LocalPlayer:GetAttribute("Job") ~= JOB_NAME then
+		state.phase = PHASE_JOB
+		if flag("StopWithoutJob", true) then
+			state.auto = false
+			setFlag("AutoCook", false)
+			log("<Error>Left the cook job, auto stopped</Error>")
+		else
+			task.wait(0.5)
+		end
+		return
+	end
+	local house = findKitchen()
+	state.trace = house and "f:house" or "f:nohouse"
+	if not house then
+		state.phase = PHASE_JOB
+		task.wait(0.5)
+		return
+	end
+	state.trace = "g:cycle"
+	local result = cycle(house)
+	state.trace = "h:result:" .. tostring(result)
+	if result == "stop" then
+		state.phase = PHASE_IDLE
+	elseif result ~= "ok" then
+		state.phase = "Problem: " .. tostring(result)
+		task.wait(0.6)
+	end
+end
+
+-- One failed step must never kill the loop: every tick is isolated.
+local function worker()
+	while running do
+		if shelfState.auto then
+			shelfState.ticks = shelfState.ticks + 1
+			local ok, err = pcall(shelfStep)
+			if not ok then
+				shelfState.lastError = tostring(err)
+				shelfState.phase = "Error: " .. tostring(err)
+				shelfLog(("<Error>%s</Error>"):format(tostring(err)))
+				task.wait(1)
+			end
+		else
+			state.ticks = state.ticks + 1
+			local ok, err = pcall(workerStep)
+			if not ok then
+				state.lastError = tostring(err)
+				state.phase = "Error: " .. tostring(err)
+				log(("<Error>%s</Error>"):format(tostring(err)))
+				task.wait(1)
+			end
+		end
+	end
+end
+
+----- Interface -----
+
+Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "steakhouse cook",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptCook" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "Cook 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local CookTab = Window:CreateTab({ Name = "Cooking", Icon = "chef-hat" })
+local MainBox = CookTab:CreateGroupbox({ Name = "Auto cook", Side = "Left" })
+local StatusBox = CookTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+
+MainBox:CreateToggle({
+	Name = "Auto cook",
+	Desc = "Fridge, grill and Finish - all on foot",
+	Flag = "AutoCook",
+	CurrentValue = false,
+	Callback = function(on)
+		state.auto = on
+		if on then
+			-- Only one job at a time.
+			if shelfState.auto then
+				shelfState.auto = false
+				setFlag("ShelfStocking", false)
+			end
+			state.startedAt = os.clock()
+			state.sessionCash = money() or 0
+			log("<Success>Auto cook started</Success>")
+		else
+			log("<Muted>Auto cook stopped</Muted>")
+		end
+	end,
+})
+
+MainBox:CreateSlider({
+	Name = "Press margin",
+	Desc = "How far into the green zone the Finish press lands",
+	Range = { 0, 25 },
+	Increment = 1,
+	Suffix = "",
+	CurrentValue = 10,
+	Flag = "PressMarginPercent",
+	Callback = function(value)
+		setFlag("PressMargin", value / 1000)
+	end,
+})
+
+MainBox:CreateDivider()
+MainBox:CreateToggle({
+	Name = "Require the cook job",
+	Desc = "Do not start without the Steakhouse Cook job",
+	Flag = "RequireJob",
+	CurrentValue = true,
+})
+MainBox:CreateToggle({
+	Name = "Stop when job is lost",
+	Flag = "StopWithoutJob",
+	CurrentValue = true,
+	DependsOn = "RequireJob",
+})
+MainBox:CreateDivider()
+MainBox:CreateButton({
+	Name = "Stop and stand still",
+	Desc = "Stop the loop and cancel the current walk",
+	Callback = function()
+		state.auto = false
+		setFlag("AutoCook", false)
+		local _, humanoid, root = character()
+		if humanoid and root then
+			humanoid:MoveTo(root.Position)
+		end
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.4,
+	Update = function()
+		return "<Accent>" .. state.phase .. "</Accent>"
+	end,
+})
+StatusBox:CreateStatus({
+	Name = "Steaks",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>sold, %d burnt</Muted>", state.perfect, state.failed)
+	end,
+})
+StatusBox:CreateStatus({
+	Name = "Earned",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Success>$%d</Success> <Muted>this session</Muted>", state.earned)
+	end,
+})
+StatusBox:CreateStatus({
+	Name = "Last press",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if state.lastPress <= 0 then
+			return "<Muted>none yet</Muted>"
+		end
+		return string.format("<Muted>bar %.3f, grill %d</Muted>", state.lastPress, state.lastGrill)
+	end,
+})
+StatusBox:CreateStatus({
+	Name = "Result",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return "<Text>" .. state.lastResult .. "</Text>"
+	end,
+})
+StatusBox:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local current = money()
+		return current and string.format("<Success>$%d</Success>", current) or "<Muted>unknown</Muted>"
+	end,
+})
+
+Log = StatusBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 200,
+	MaxRows = 9,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+local ShelfTab = Window:CreateTab({ Name = "Shelf Stocker", Icon = "package" })
+local ShelfBox = ShelfTab:CreateGroupbox({ Name = "Auto stock", Side = "Left" })
+local ShelfInfoBox = ShelfTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+
+ShelfBox:CreateToggle({
+	Name = "Shelf stocking",
+	Desc = "Boxes from the back room to the shop shelves, all on foot",
+	Flag = "ShelfStocking",
+	CurrentValue = false,
+	Callback = function(on)
+		shelfState.auto = on
+		if on then
+			-- The two jobs cannot run at once; this one wins.
+			if state.auto then
+				state.auto = false
+				setFlag("AutoCook", false)
+			end
+			shelfLog("<Success>Shelf stocking started</Success>")
+		else
+			shelfLog("<Muted>Shelf stocking stopped</Muted>")
+		end
+	end,
+})
+ShelfBox:CreateDivider()
+ShelfBox:CreateToggle({
+	Name = "Require the shelf job",
+	Desc = "Do not start without the Shelf Stocker job",
+	Flag = "ShelfRequireJob",
+	CurrentValue = true,
+})
+ShelfBox:CreateToggle({
+	Name = "Stop when job is lost",
+	Flag = "ShelfStopWithoutJob",
+	CurrentValue = true,
+	DependsOn = "ShelfRequireJob",
+})
+ShelfBox:CreateDivider()
+ShelfBox:CreateButton({
+	Name = "Stop and stand still",
+	Callback = function()
+		shelfState.auto = false
+		setFlag("ShelfStocking", false)
+		local _, humanoid, root = character()
+		if humanoid and root then
+			humanoid:MoveTo(root.Position)
+		end
+	end,
+})
+
+ShelfInfoBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.4,
+	Update = function()
+		return "<Accent>" .. shelfState.phase .. "</Accent>"
+	end,
+})
+ShelfInfoBox:CreateStatus({
+	Name = "Boxes",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>stocked, %d failed</Muted>", shelfState.placed, shelfState.failed)
+	end,
+})
+ShelfInfoBox:CreateStatus({
+	Name = "Earned",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Success>$%d</Success> <Muted>this session</Muted>", shelfState.earned)
+	end,
+})
+
+ShelfLog = ShelfInfoBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 200,
+	MaxRows = 10,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+local EspTab = Window:CreateTab({ Name = "ESP", Icon = "eye" })
+local EspPlayersBox = EspTab:CreateGroupbox({ Name = "Players", Side = "Left" })
+local EspWorldBox = EspTab:CreateGroupbox({ Name = "World", Side = "Right" })
+
+EspPlayersBox:CreateToggle({
+	Name = "Player ESP",
+	Desc = "Off by default, turn it on when you need eyes",
+	Flag = "PlayerESP",
+	CurrentValue = false,
+})
+EspPlayersBox:CreateToggle({ Name = "Name", Flag = "PlayerName", CurrentValue = true, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Job", Flag = "PlayerJob", CurrentValue = true, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Health", Flag = "PlayerHealth", CurrentValue = true, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Distance", Flag = "PlayerDistance", CurrentValue = true, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Level", Flag = "PlayerLevel", CurrentValue = true, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Chams", Flag = "Chams", CurrentValue = true, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Box", Flag = "PlayerBox", CurrentValue = false, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateToggle({ Name = "Tracer", Flag = "PlayerTracer", CurrentValue = false, DependsOn = "PlayerESP" })
+EspPlayersBox:CreateDivider()
+EspPlayersBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>players</Muted>", Esp.stats.players)
+	end,
+})
+
+EspWorldBox:CreateToggle({
+	Name = "Dropped items",
+	Desc = "Money and loot left on the ground",
+	Flag = "DropESP",
+	CurrentValue = false,
+})
+EspWorldBox:CreateToggle({ Name = "Source", Flag = "DropSource", CurrentValue = true, DependsOn = "DropESP" })
+EspWorldBox:CreateToggle({ Name = "Distance", Flag = "DropDistance", CurrentValue = true, DependsOn = "DropESP" })
+EspWorldBox:CreateToggle({ Name = "Chams", Flag = "DropChams", CurrentValue = true, DependsOn = "DropESP" })
+EspWorldBox:CreateDivider()
+EspWorldBox:CreateToggle({
+	Name = "Vehicles",
+	Desc = "Cars with a driver seat",
+	Flag = "VehicleESP",
+	CurrentValue = false,
+})
+EspWorldBox:CreateToggle({ Name = "Driver", Flag = "VehicleDriver", CurrentValue = true, DependsOn = "VehicleESP" })
+EspWorldBox:CreateToggle({ Name = "Box", Flag = "VehicleBox", CurrentValue = false, DependsOn = "VehicleESP" })
+EspWorldBox:CreateToggle({ Name = "Tracer", Flag = "VehicleTracer", CurrentValue = false, DependsOn = "VehicleESP" })
+EspWorldBox:CreateDivider()
+EspWorldBox:CreateToggle({ Name = "Shops", Flag = "NpcESP", CurrentValue = false })
+EspWorldBox:CreateToggle({ Name = "Pumpkins", Flag = "PumpkinESP", CurrentValue = false })
+EspWorldBox:CreateToggle({ Name = "Airdrops", Flag = "AirdropESP", CurrentValue = false })
+EspWorldBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>objects</Muted>", Esp.stats.objects)
+	end,
+})
+
+local EspStyleTab = Window:CreateTab({ Name = "ESP Style", Icon = "palette" })
+local EspColorBox = EspStyleTab:CreateGroupbox({ Name = "Colors", Side = "Left" })
+local EspRangeBox = EspStyleTab:CreateGroupbox({ Name = "Range", Side = "Right" })
+
+EspColorBox:CreateColorPicker({ Name = "Player", Color = Color3.fromRGB(90, 214, 255), Flag = "PlayerColor" })
+EspColorBox:CreateColorPicker({ Name = "In combat", Color = Color3.fromRGB(255, 78, 122), Flag = "CombatColor" })
+EspColorBox:CreateDivider()
+EspColorBox:CreateColorPicker({ Name = "Money", Color = Color3.fromRGB(94, 255, 132), Flag = "MoneyColor" })
+EspColorBox:CreateColorPicker({ Name = "Loot", Color = Color3.fromRGB(255, 196, 64), Flag = "LootColor" })
+EspColorBox:CreateDivider()
+EspColorBox:CreateColorPicker({ Name = "Vehicle", Color = Color3.fromRGB(176, 124, 255), Flag = "VehicleColor" })
+EspColorBox:CreateColorPicker({ Name = "Shop NPC", Color = Color3.fromRGB(141, 141, 153), Flag = "NpcColor" })
+EspColorBox:CreateColorPicker({ Name = "Pumpkin", Color = Color3.fromRGB(255, 159, 67), Flag = "PumpkinColor" })
+EspColorBox:CreateColorPicker({ Name = "Airdrop", Color = Color3.fromRGB(255, 215, 0), Flag = "AirdropColor" })
+
+EspRangeBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 100, 4000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 2000,
+	Flag = "RenderDistance",
+})
+EspRangeBox:CreateSlider({
+	Name = "Text size",
+	Range = { 10, 22 },
+	Increment = 1,
+	CurrentValue = 14,
+	Flag = "TextSize",
+})
+EspRangeBox:CreateDropdown({
+	Name = "Distance from",
+	Options = { "Camera", "Character" },
+	CurrentOption = "Camera",
+	Flag = "DistanceFrom",
+})
+EspRangeBox:CreateButton({
+	Name = "Clear ESP",
+	Desc = "Remove every highlight and label",
+	Callback = function()
+		Esp.Clear()
+		Window:Notify({ Title = "Cleared", Content = "All ESP objects removed", Type = "Info" })
+	end,
+})
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local LockBox = CombatTab:CreateGroupbox({ Name = "Lock-on", Side = "Left" })
+local LockHintBox = CombatTab:CreateGroupbox({ Name = "Controls", Side = "Right" })
+
+LockBox:CreateToggle({
+	Name = "Lock on",
+	Desc = "Holds the player closest to the crosshair",
+	Flag = "LockOn",
+	CurrentValue = false,
+})
+LockBox:CreateToggle({
+	Name = "Force lock",
+	Desc = "Aimbot style: snaps the camera, ignores the crosshair, re-grabs on loss",
+	Flag = "ForceLock",
+	CurrentValue = false,
+	DependsOn = "LockOn",
+})
+LockBox:CreateDropdown({
+	Name = "Key",
+	Desc = "Press it again to release",
+	Options = { "Middle mouse", "Q", "Tab", "F", "G" },
+	CurrentOption = "Middle mouse",
+	Flag = "LockKey",
+	DependsOn = "LockOn",
+})
+LockBox:CreateSlider({
+	Name = "Range",
+	Range = { 20, 400 },
+	Increment = 10,
+	Suffix = " studs",
+	CurrentValue = 250,
+	Flag = "LockRange",
+	DependsOn = "LockOn",
+})
+LockBox:CreateToggle({
+	Name = "Turn camera",
+	Desc = "Keeps the target in the centre of the screen",
+	Flag = "LockCamera",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+LockBox:CreateSlider({
+	Name = "Camera speed",
+	Range = { 4, 30 },
+	Increment = 1,
+	CurrentValue = 14,
+	Flag = "LockCameraSpeed",
+	DependsOn = { Flag = "LockCamera", Value = true },
+})
+LockBox:CreateToggle({
+	Name = "Face target",
+	Desc = "Turns the body toward the target, paused while auto cooking",
+	Flag = "LockTurnCharacter",
+	CurrentValue = false,
+	DependsOn = "LockOn",
+})
+LockBox:CreateToggle({
+	Name = "Ring indicator",
+	Flag = "LockIndicator",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+LockBox:CreateToggle({
+	Name = "Wheel switches target",
+	Flag = "LockSwitch",
+	CurrentValue = true,
+	DependsOn = "LockOn",
+})
+
+LockHintBox:CreateParagraph({
+	Title = "How to use",
+	Content = "Press the lock key to hold the player nearest to the crosshair, press it again to release. The mouse wheel moves to the next target while the lock is held. The lock drops by itself when the target dies or leaves the range.",
+})
+LockHintBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.3,
+	Update = function()
+		if not lockState.active or not lockState.target then
+			return "<Muted>not locked</Muted>"
+		end
+		local part = lockFocusPart(lockState.target.player)
+		if not part then
+			return "<Muted>not locked</Muted>"
+		end
+		local camera = workspace.CurrentCamera
+		local distance = camera and (part.Position - camera.CFrame.Position).Magnitude or 0
+		return string.format("<Accent>%s</Accent> <Muted>%dm</Muted>", lockState.target.player.Name, math.floor(distance))
+	end,
+})
+LockHintBox:CreateButton({
+	Name = "Release lock",
+	Callback = function()
+		releaseLock()
+	end,
+})
+
+local MapTab = Window:CreateTab({ Name = "Map", Icon = "map" })
+local MapBox = MapTab:CreateGroupbox({ Name = "City map", Side = "Left" })
+local MapInfoBox = MapTab:CreateGroupbox({ Name = "Navigation", Side = "Right" })
+
+MapBox:CreateButton({
+	Name = "Open map window",
+	Desc = "Loads the map script and shows the city plan with your position",
+	Style = "Primary",
+	Callback = function()
+		local module, reason = openMap()
+		if not module then
+			Window:Notify({
+				Title = "Map",
+				Content = reason == "file" and "BlockSpinMap.lua not found in the executor workspace" or ("Could not start the map: " .. tostring(reason)),
+				Type = "Error",
+			})
+		else
+			-- The hub sits on top otherwise; hide it so the plan is visible.
+			pcall(function()
+				Window:Toggle(false)
+			end)
+			Window:Notify({ Title = "Map", Content = "Map opened, press M to close it", Type = "Success" })
+		end
+	end,
+})
+MapBox:CreateButton({
+	Name = "Close map",
+	Callback = function()
+		local module = getgenv().RobScriptMap
+		if type(module) == "table" then
+			pcall(function()
+				module.Close()
+			end)
+		end
+	end,
+})
+MapBox:CreateDivider()
+MapBox:CreateButton({
+	Name = "Waypoint: Steakhouse",
+	Desc = "Puts a marker on the restaurant you cook in",
+	Callback = function()
+		local module = openMap()
+		if not module then
+			return
+		end
+		local house = findKitchen()
+		local ok, frame = pcall(function()
+			return house:GetBoundingBox()
+		end)
+		if ok and frame then
+			pcall(function()
+				module.SetWaypoint(frame.Position, "Steakhouse")
+			end)
+		end
+	end,
+})
+MapBox:CreateButton({
+	Name = "Clear waypoint",
+	Callback = function()
+		local module = getgenv().RobScriptMap
+		if type(module) == "table" then
+			pcall(function()
+				module.ClearWaypoint()
+			end)
+		end
+	end,
+})
+
+MapInfoBox:CreateStatus({
+	Name = "Map",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local module = getgenv().RobScriptMap
+		if type(module) ~= "table" then
+			return "<Muted>not loaded</Muted>"
+		end
+		local ok, state = pcall(function()
+			return module.GetState()
+		end)
+		if not ok or not state then
+			return "<Muted>not loaded</Muted>"
+		end
+		return state.open and "<Success>open</Success>" or "<Muted>loaded, closed</Muted>"
+	end,
+})
+MapInfoBox:CreateStatus({
+	Name = "Waypoint",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local module = getgenv().RobScriptMap
+		if type(module) ~= "table" then
+			return "<Muted>none</Muted>"
+		end
+		local ok, state = pcall(function()
+			return module.GetState()
+		end)
+		if not ok or not state or not state.waypoint then
+			return "<Muted>none</Muted>"
+		end
+		local _, _, rootPart = character()
+		local distance = rootPart and (state.waypoint - rootPart.Position).Magnitude or 0
+		return string.format("<Accent>%s</Accent> <Muted>%dm</Muted>", tostring(state.waypointName), math.floor(distance))
+	end,
+})
+MapInfoBox:CreateParagraph({
+	Title = "Hotkeys",
+	Content = "M opens or closes the map, N clears the waypoint, the mouse wheel changes the lock target. The map remembers nothing between reloads: press Scan after the city streams in.",
+})
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----- Runtime -----
+
+resetFlagCache()
+
+local espConnection = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	local ok, err = pcall(Esp.Update, deltaTime)
+	if not ok then
+		Esp.lastError = tostring(err)
+	end
+end)
+
+-- RenderStepped, not Heartbeat: the camera has to be written after the default
+-- camera script, otherwise the game overwrites the lock every frame.
+local lockConnection = RunService.RenderStepped:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	if flag("LockOn", false) then
+		pcall(updateLock, deltaTime)
+	elseif lockState.active then
+		pcall(releaseLock)
+	end
+end)
+
+local lockInput = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running or not flag("LockOn", false) then
+		return
+	end
+	local expected = LOCK_KEYS[flag("LockKey", "Middle mouse")]
+	if expected and (input.UserInputType == expected or input.KeyCode == expected) then
+		pcall(toggleLock)
+	end
+end)
+
+local lockWheel = UserInputService.InputChanged:Connect(function(input)
+	if not running or not lockState.active or not flag("LockSwitch", true) then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		pcall(cycleLock, input.Position.Z > 0 and 1 or -1)
+	end
+end)
+
+local workerThread = task.spawn(function()
+	pcall(worker)
+end)
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			state.auto = false
+			setFlag("AutoCook", false)
+			local _, humanoid, root = character()
+			if humanoid and root then
+				humanoid:MoveTo(root.Position)
+			end
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	state.auto = false
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	pcall(function()
+		espConnection:Disconnect()
+	end)
+	pcall(function()
+		lockConnection:Disconnect()
+	end)
+	pcall(function()
+		lockInput:Disconnect()
+	end)
+	pcall(function()
+		lockWheel:Disconnect()
+	end)
+	pcall(releaseLock)
+	pcall(Esp.Clear)
+	local _, humanoid, root = character()
+	if humanoid and root then
+		pcall(function()
+			humanoid:MoveTo(root.Position)
+		end)
+	end
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptCook then
+		getgenv().RobScriptCook = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptCook = {
+	Version = "1.0",
+	Start = function()
+		state.auto = true
+		setFlag("AutoCook", true)
+	end,
+	Stop = function()
+		state.auto = false
+		setFlag("AutoCook", false)
+	end,
+	ShelfStart = function()
+		shelfState.auto = true
+		state.auto = false
+		setFlag("AutoCook", false)
+		setFlag("ShelfStocking", true)
+	end,
+	ShelfStop = function()
+		shelfState.auto = false
+		setFlag("ShelfStocking", false)
+	end,
+	GetShelfState = function()
+		return {
+			auto = shelfState.auto,
+			phase = shelfState.phase,
+			placed = shelfState.placed,
+			failed = shelfState.failed,
+			earned = shelfState.earned,
+			ticks = shelfState.ticks,
+			lastError = shelfState.lastError,
+		}
+	end,
+	GetState = function()
+		return {
+			phase = state.phase,
+			auto = state.auto,
+			perfect = state.perfect,
+			failed = state.failed,
+			earned = state.earned,
+			lastPress = state.lastPress,
+			lastGrill = state.lastGrill,
+			result = state.lastResult,
+			ticks = state.ticks,
+			lastError = state.lastError,
+			seenAuto = state.seenAuto,
+			trace = state.trace,
+			stateId = tostring(state),
+		}
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	GetEsp = function()
+		local list = {}
+		for model, target in pairs(Esp.targets) do
+			list[#list + 1] = {
+				name = (target.player and target.player.Name) or model.Name,
+				kind = target.kind,
+				visible = target.hasVisual,
+				billboard = target.billboard ~= nil and target.billboard.Enabled or false,
+				chams = target.highlight ~= nil,
+				box = target.lines ~= nil and target.lines[1] ~= nil and target.lines[1].Visible or false,
+				tracer = target.tracer ~= nil and target.tracer.Visible or false,
+			}
+		end
+		return {
+			players = Esp.stats.players,
+			objects = Esp.stats.objects,
+			targets = list,
+			error = Esp.lastError,
+		}
+	end,
+	ClearEsp = function()
+		Esp.Clear()
+	end,
+	OpenMap = function()
+		local module, reason = openMap()
+		return module ~= nil, reason
+	end,
+	GetMap = function()
+		local module = getgenv().RobScriptMap
+		if type(module) ~= "table" then
+			return nil
+		end
+		local ok, state = pcall(function()
+			return module.GetState()
+		end)
+		return ok and state or nil
+	end,
+	GetLock = function()
+		return {
+			active = lockState.active,
+			name = lockState.target and lockState.target.player and lockState.target.player.Name or nil,
+			indicator = lockState.indicator ~= nil,
+			candidates = #lockCandidates(),
+		}
+	end,
+	ToggleLock = function()
+		return toggleLock()
+	end,
+	CycleLock = function(direction)
+		return cycleLock(direction or 1)
+	end,
+	ReleaseLock = function()
+		releaseLock()
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+-- Previous instances (or a crashed reload) can leave lock rings on players.
+for _, stray in ipairs(workspace:GetDescendants()) do
+	if stray.Name == "RSP_Lock" then
+		pcall(function()
+			stray:Destroy()
+		end)
+	end
+end
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+Window:Notify({ Title = "Robscript Team", Content = "Steakhouse cook is ready", Type = "Success" })
+
+return getgenv().RobScriptCook
