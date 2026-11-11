@@ -1,0 +1,2185 @@
+-- Robscript Team - PLS DONATE Director
+-- Booth text engine, donation analytics and a small show for visitors.
+--
+-- Credits: stand claiming, walk-to-booth routine and the donation signal were
+-- studied in the open-source szze autofarm (tzechco / tvk1308). Those credits are
+-- kept on purpose; the rest of the hub is written for Robscript.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local TextChatService = game:GetService("TextChatService")
+
+local PLACE_MAIN = 8737602449
+local PLACE_VOICE = 8943844393
+
+if game.PlaceId ~= PLACE_MAIN and game.PlaceId ~= PLACE_VOICE then
+	return warn("[Robscript PD] PLS DONATE was not detected")
+end
+
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	return warn("[Robscript PD] Airflow UI could not be loaded")
+end
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+Airflow:AddLanguage("ru", {
+	Name = "Русский",
+	Flag = "ru",
+	Strings = {
+		["booth, show, stats, server"] = "стенд, шоу, статистика, сервер",
+		["Booth"] = "Стенд",
+		["Show"] = "Шоу",
+		["Stats"] = "Статистика",
+		["Server"] = "Сервер",
+		["Alerts"] = "Оповещения",
+		["Settings"] = "Настройки",
+		["Automation"] = "Автоматизация",
+		["Booth text"] = "Текст стенда",
+		["State"] = "Состояние",
+		["Slot"] = "Слот",
+		["Stand"] = "Позиция",
+		["Auto stand"] = "Авто-стенд",
+		["Claims a free booth and holds the spot"] = "Занимает свободный стенд и держит место",
+		["Go to my booth"] = "Идти к своему стенду",
+		["Claim nearest booth"] = "Занять ближайший стенд",
+		["No booth"] = "Стенда нет",
+		["Standing"] = "Стоим",
+		["Claiming"] = "Занимаем",
+		["Not claimed"] = "Не занят",
+		["Booth claimed"] = "Стенд занят",
+		["Free booths"] = "Свободные стенды",
+		["Template"] = "Шаблон",
+		["Evolution"] = "Эволюция",
+		["Goal"] = "Цель",
+		["Custom"] = "Свой",
+		["Simple"] = "Простой",
+		["Sign text"] = "Текст вывески",
+		["Tokens: $RAISED $GOAL $LEFT $DONORS $RPH $STAGE $DONOR"] = "Токены: $RAISED $GOAL $LEFT $DONORS $RPH $STAGE $DONOR",
+		["Live booth text"] = "Живой текст стенда",
+		["Rewrites the sign when money arrives"] = "Переписывает вывеску, когда приходят деньги",
+		["Refresh every"] = "Обновлять каждые",
+		[" s"] = " с",
+		["Apply text now"] = "Применить текст сейчас",
+		["Mirror text on my own sign"] = "Показывать текст на своей вывеске",
+		["Save text through the editor"] = "Сохранять текст через редактор",
+		["The game keeps text written through its own editor panel"] = "Игра сохраняет текст, введённый в её редакторе",
+		["The game never refreshes your own sign, this mirrors it locally"] = "Игра не обновляет вашу вывеску сама, это локальное зеркало",
+		["Text saved"] = "Текст сохранён",
+		["Text cannot be saved right now"] = "Текст сейчас не сохраняется",
+		["No booth claimed yet"] = "Стенд ещё не занят",
+		["Donation show"] = "Шоу за донат",
+		["Spin the character"] = "Крутить персонажа",
+		["Jump for every Robux"] = "Прыжок за каждый Robux",
+		["Lower gravity on donation"] = "Уменьшать гравитацию за донат",
+		["Dance after a donation"] = "Танцевать после доната",
+		["Spin speed per Robux"] = "Скорость вращения за Robux",
+		["Thanks in chat"] = "Спасибо в чате",
+		["Send a short thanks to the donor"] = "Короткое спасибо донатеру",
+		["Living booth"] = "Живой стенд",
+		["The sign evolves as the total grows"] = "Вывеска меняется по мере роста суммы",
+		["Stage"] = "Стадия",
+		["To next stage"] = "До следующей стадии",
+		["Amount"] = "Сумма",
+		["Test donation"] = "Тестовый донат",
+		["Runs the whole pipeline without Robux"] = "Прогоняет весь конвейер без Robux",
+		["Simulate"] = "Симулировать",
+		["Session"] = "Сессия",
+		["Raised this session"] = "Собрано за сессию",
+		["Per hour"] = "В час",
+		["Donations"] = "Донаты",
+		["Best donation"] = "Лучший донат",
+		["Average"] = "Средний",
+		["Last donation"] = "Последний донат",
+		["Visitors near the booth"] = "Посетителей у стенда",
+		["Donated"] = "Донат",
+		["No donations yet"] = "Донатов пока нет",
+		["Reset session"] = "Сбросить сессию",
+		["Copy summary"] = "Скопировать сводку",
+		["DONORS"] = "ДОНАТЕРЫ",
+		["All time"] = "За всё время",
+		["Server activity"] = "Активность сервера",
+		["Auto hop"] = "Авто-переход",
+		["Leaves when the server looks dead"] = "Уходит, когда сервер выглядит мёртвым",
+		["Hop below"] = "Уходить ниже",
+		["Check every"] = "Проверять каждые",
+		["Hop now"] = "Перейти сейчас",
+		["Players"] = "Игроки",
+		["Booths taken"] = "Занято стендов",
+		["Money on server"] = "Денег на сервере",
+		["Near you"] = "Рядом с вами",
+		["Chat"] = "Чат",
+		["Available"] = "Доступен",
+		["Unavailable"] = "Недоступен",
+		["About"] = "О скрипте",
+		["Configs"] = "Конфиги",
+		["Theme"] = "Тема",
+		["Robscript"] = "Robscript",
+		["Director is ready"] = "Director готов",
+		["Loaded"] = "Загружено",
+		["Standing by"] = "Ожидание",
+		["Working"] = "Работает",
+		["Stopped"] = "Остановлено",
+		["Started"] = "Запущено",
+		["Hop is not available"] = "Переход недоступен",
+		["No free booth"] = "Свободных стендов нет",
+		["Donation"] = "Донат",
+		["from"] = "от",
+		["unknown donor"] = "неизвестный донатер",
+		["Stage up"] = "Новая стадия",
+		["Session reset"] = "Сессия сброшена",
+		["Summary copied"] = "Сводка скопирована",
+		["Clipboard is unavailable"] = "Буфер обмена недоступен",
+		["Total"] = "Всего",
+		["Goal"] = "Цель",
+		["Left"] = "Осталось",
+		["Session time"] = "Время сессии",
+		["Tokens"] = "Токены",
+		["days"] = "дн.",
+		["After a hop"] = "После перехода",
+		["Loader URL"] = "Ссылка загрузчика",
+		["The hub reloads itself after a server hop"] = "Хаб перезапускается сам после перехода",
+		["Paste the raw link you load the hub from"] = "Вставь прямую ссылку, с которой запускаешь хаб",
+		["Discord webhook"] = "Discord-вебхук",
+		["Webhook URL"] = "Ссылка вебхука",
+		["Donations and hops go here"] = "Сюда уходят донаты и переходы",
+		["Send alerts"] = "Отправлять оповещения",
+		["Donation cards and hop notices"] = "Карточки донатов и уведомления о переходе",
+		["Ping above"] = "Пинговать выше",
+		["Mentions everyone above this amount"] = "Упоминает всех, если сумма выше",
+		["Test webhook"] = "Проверить вебхук",
+		["Last alert"] = "Последнее оповещение",
+		["Nothing yet"] = "Пока ничего",
+		["ago"] = "назад",
+		["Test sent"] = "Тест отправлен",
+		["Webhook is not set"] = "Вебхук не задан",
+		["A test card works without a real donation"] = "Тестовая карточка работает без настоящего доната",
+		["Bot-like booths"] = "Стенды-боты",
+		["Voice servers"] = "Голосовые серверы",
+		["Hops into the voice chat world when the account allows it"] = "Переходит в мир с голосовым чатом, если аккаунт позволяет",
+		["Font"] = "Шрифт",
+		["Text colour"] = "Цвет текста",
+		["Your own sign is redrawn by the game only after a rejoin"] = "Свою вывеску игра перерисовывает только после перезахода",
+	},
+})
+
+local previous = getgenv().RobscriptPD
+if previous then
+	if type(previous.connections) == "table" then
+		for _, connection in ipairs(previous.connections) do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+	end
+	if previous.Window then
+		pcall(function()
+			previous.Window:Destroy()
+		end)
+	end
+end
+
+local connections = {}
+
+local function track(connection)
+	if connection and typeof(connection) == "RBXScriptConnection" then
+		connections[#connections + 1] = connection
+	end
+	return connection
+end
+
+----- services and game handles -----
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui", 30)
+
+local okRemotes, Remotes = pcall(function()
+	return require(ReplicatedStorage:WaitForChild("Remotes", 20))
+end)
+if not okRemotes or type(Remotes) ~= "table" then
+	return warn("[Robscript PD] game network layer is unavailable")
+end
+
+local function remote(kind, name)
+	local ok, instance = pcall(Remotes[kind], name)
+	if ok then
+		return instance
+	end
+	return nil
+end
+
+local setCustomization = remote("Event", "SetCustomization")
+local claimBoothRemote = remote("Event", "ClaimBooth")
+local createVfx = ReplicatedStorage:FindFirstChild("VFXObjects")
+createVfx = createVfx and createVfx:FindFirstChild("CreateVfx")
+
+local raisedValue = LocalPlayer:WaitForChild("leaderstats", 30)
+raisedValue = raisedValue and raisedValue:WaitForChild("Raised", 10)
+
+local boothInteractions = workspace:WaitForChild("BoothInteractions", 30)
+
+local function mapContainer()
+	local container = playerGui:FindFirstChild("MapUIContainer")
+	return container and container:FindFirstChild("MapUI")
+end
+
+local function boothUi(slot)
+	local mapUi = mapContainer()
+	local booths = mapUi and mapUi:FindFirstChild("BoothUI")
+	return booths and booths:FindFirstChild("BoothUI" .. tostring(slot))
+end
+
+----- small helpers -----
+
+local function escape(text)
+	text = tostring(text or "")
+	text = text:gsub("&", "&amp;")
+	text = text:gsub("<", "&lt;")
+	text = text:gsub(">", "&gt;")
+	return text
+end
+
+local function shortNumber(value)
+	value = tonumber(value) or 0
+	if value >= 1000000 then
+		return string.format("%.1fM", value / 1000000)
+	elseif value >= 1000 then
+		return string.format("%.1fk", value / 1000)
+	end
+	return tostring(math.floor(value))
+end
+
+local function clock(seconds)
+	seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+	if seconds >= 3600 then
+		return string.format("%dh %02dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+	elseif seconds >= 60 then
+		return string.format("%dm %02ds", math.floor(seconds / 60), seconds % 60)
+	end
+	return seconds .. "s"
+end
+
+local function chatAvailable()
+	local ok, allowed = pcall(function()
+		return TextChatService:CanUserChatAsync(LocalPlayer.UserId)
+	end)
+	return ok and allowed == true
+end
+
+local function sendChat(message)
+	if not chatAvailable() then
+		return false
+	end
+	local channels = TextChatService:FindFirstChild("TextChannels")
+	local general = channels and channels:FindFirstChild("RBXGeneral")
+	if not general then
+		return false
+	end
+	local ok = pcall(function()
+		general:SendAsync(message)
+	end)
+	return ok
+end
+
+local function httpRequest(options)
+	local requestFunction = (syn and syn.request) or request or http_request or (http and http.request)
+	if not requestFunction then
+		return nil
+	end
+	local ok, response = pcall(requestFunction, options)
+	if ok then
+		return response
+	end
+	return nil
+end
+
+local queueOnTeleport = (syn and syn.queue_on_teleport)
+	or queue_on_teleport
+	or (fluxus and fluxus.queue_on_teleport)
+	or nil
+
+----- stages of the living booth -----
+
+local STAGES = {
+	{ total = 0, name = "NOOB" },
+	{ total = 15, name = "ROOKIE" },
+	{ total = 40, name = "KNIGHT" },
+	{ total = 80, name = "CHAMPION" },
+	{ total = 150, name = "HERO" },
+	{ total = 250, name = "LEGEND" },
+	{ total = 400, name = "TITAN" },
+	{ total = 600, name = "FINAL BOSS" },
+}
+
+local function stageOf(total)
+	local index = 1
+	for position, stage in ipairs(STAGES) do
+		if total >= stage.total then
+			index = position
+		end
+	end
+	return index
+end
+
+----- persistent data -----
+
+local STORE_FILE = "RobscriptPDDirector.json"
+
+local SESSION = {
+	startedAt = os.time(),
+	raised = 0,
+	donations = 0,
+	best = 0,
+	lastAt = nil,
+	lastDonor = nil,
+	visitors = {},
+	visitorCount = 0,
+	samples = {},
+}
+
+local PROFILE = {
+	sessions = {},
+	donors = {},
+	totalRaised = 0,
+}
+
+local function loadProfile()
+	if type(readfile) ~= "function" or type(isfile) ~= "function" then
+		return
+	end
+	if not isfile(STORE_FILE) then
+		return
+	end
+	local ok, raw = pcall(readfile, STORE_FILE)
+	if not ok or type(raw) ~= "string" then
+		return
+	end
+	local decoded = nil
+	pcall(function()
+		decoded = HttpService:JSONDecode(raw)
+	end)
+	if type(decoded) ~= "table" then
+		return
+	end
+	if type(decoded.sessions) == "table" then
+		PROFILE.sessions = decoded.sessions
+	end
+	if type(decoded.donors) == "table" then
+		PROFILE.donors = decoded.donors
+	end
+	PROFILE.totalRaised = tonumber(decoded.totalRaised) or 0
+end
+
+local function saveProfile()
+	if type(writefile) ~= "function" then
+		return
+	end
+	local payload = {
+		sessions = PROFILE.sessions,
+		donors = PROFILE.donors,
+		totalRaised = PROFILE.totalRaised,
+	}
+	pcall(function()
+		writefile(STORE_FILE, HttpService:JSONEncode(payload))
+	end)
+end
+
+loadProfile()
+
+----- booth logic -----
+
+local state = {
+	slot = nil,
+	text = "",
+	lastWrite = 0,
+	pendingText = nil,
+	pendingAmount = nil,
+	pendingDonor = nil,
+	lastStage = 1,
+	busy = false,
+}
+
+local function myBoothSlot()
+	if not boothInteractions then
+		return nil
+	end
+	for _, part in ipairs(boothInteractions:GetChildren()) do
+		local owner = part:GetAttribute("BoothOwner")
+		local slot = part:GetAttribute("BoothSlot")
+		if slot and owner == LocalPlayer.UserId then
+			return slot
+		end
+	end
+	return nil
+end
+
+local function boothPart(slot)
+	if not boothInteractions then
+		return nil
+	end
+	for _, part in ipairs(boothInteractions:GetChildren()) do
+		if part:GetAttribute("BoothSlot") == slot then
+			return part
+		end
+	end
+	return nil
+end
+
+local function freeBooths()
+	local list = {}
+	if not boothInteractions then
+		return list
+	end
+	for _, part in ipairs(boothInteractions:GetChildren()) do
+		local slot = part:GetAttribute("BoothSlot")
+		if slot and part:GetAttribute("BoothOwner") == nil then
+			list[#list + 1] = { slot = slot, part = part }
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.slot < b.slot
+	end)
+	return list
+end
+
+local function nearestFreeBooth()
+	local list = freeBooths()
+	if #list == 0 then
+		return nil
+	end
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return list[1]
+	end
+	local best, bestDistance = nil, math.huge
+	for _, entry in ipairs(list) do
+		local distance = (entry.part.Position - root.Position).Magnitude
+		if distance < bestDistance then
+			best, bestDistance = entry, distance
+		end
+	end
+	return best
+end
+
+local function claimBooth(slot)
+	if not claimBoothRemote then
+		return false
+	end
+	local ok = pcall(function()
+		claimBoothRemote:InvokeServer(slot)
+	end)
+	if not ok then
+		return false
+	end
+	task.wait(0.7)
+	return myBoothSlot() == slot
+end
+
+local function walkToBooth(slot)
+	local part = boothPart(slot)
+	local character = LocalPlayer.Character
+	if not part or not character then
+		return
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		return
+	end
+	local goal = part.Position
+	if (root.Position - goal).Magnitude > 60 then
+		root.CFrame = CFrame.new(goal + Vector3.new(0, 4, 0))
+		task.wait(0.6)
+	end
+	humanoid.WalkSpeed = 26
+	humanoid:MoveTo(goal)
+	local reached = false
+	local connection = humanoid.MoveToFinished:Connect(function()
+		reached = true
+	end)
+	local deadline = os.clock() + 20
+	while not reached and os.clock() < deadline and humanoid.Health > 0 do
+		task.wait(0.2)
+	end
+	connection:Disconnect()
+	humanoid.WalkSpeed = 16
+	root.CFrame = CFrame.new(goal + Vector3.new(0, 3.4, 0))
+end
+
+----- booth text -----
+
+local function signFont()
+	local name = Airflow.Flags.SignFont and tostring(Airflow.Flags.SignFont:Get()) or "GothamBold"
+	local font = Enum.Font[name]
+	return font or Enum.Font.GothamBold
+end
+
+local function signColour()
+	local colour = Airflow.Flags.SignColor and Airflow.Flags.SignColor:Get()
+	if typeof(colour) == "Color3" then
+		return colour
+	end
+	if type(colour) == "string" and colour:find("#") then
+		local ok, parsed = pcall(Color3.fromHex, colour)
+		if ok then
+			return parsed
+		end
+	end
+	return Color3.fromRGB(255, 59, 127)
+end
+
+local function buildPayload(text, colour)
+	return {
+		textFont = signFont(),
+		richText = true,
+		strokeColor = Color3.fromRGB(0, 0, 0),
+		strokeOpacity = 0.35,
+		textColor = colour or signColour(),
+		buttonStrokeColor = Color3.fromRGB(0, 0, 0),
+		buttonTextColor = Color3.fromRGB(0, 0, 0),
+		buttonTextFont = Enum.Font.GothamBlack,
+		buttonColor = Color3.fromRGB(0, 255, 17),
+		buttonHoverColor = Color3.fromRGB(0, 255, 17),
+		buttonLayout = "",
+		transfers = true,
+		text = text,
+	}
+end
+
+local function totalRaised()
+	return tonumber(raisedValue and raisedValue.Value) or 0
+end
+
+local function goalValue()
+	local raw = Airflow.Flags.BoothGoal and tonumber(Airflow.Flags.BoothGoal:Get())
+	return math.max(tonumber(raw) or 500, 1)
+end
+
+local function renderTemplate(template)
+	local goal = goalValue()
+	local raised = totalRaised()
+	local sessionRaised = SESSION.raised
+	local hours = math.max((os.time() - SESSION.startedAt) / 3600, 2 / 60)
+	local perHour = math.floor(sessionRaised / hours)
+	local stageIndex = stageOf(raised)
+	local stage = STAGES[stageIndex]
+	local nextStage = STAGES[stageIndex + 1]
+	local toNext = nextStage and math.max(nextStage.total - raised, 0) or 0
+
+	local text = tostring(template or "")
+
+	-- Longer tokens first, otherwise $STAGE eats the head of $STAGENAME.
+	local values = {
+		["$STAGENAME"] = stage and stage.name or "",
+		["$RAISED"] = shortNumber(raised),
+		["$DONORS"] = tostring(SESSION.donations),
+		["$DONOR"] = SESSION.lastDonor or "?",
+		["$STAGE"] = tostring(stageIndex),
+		["$GOAL"] = shortNumber(goal),
+		["$LEFT"] = shortNumber(math.max(goal - raised, 0)),
+		["$NEXT"] = nextStage and shortNumber(toNext) or "-",
+		["$RPH"] = shortNumber(perHour),
+	}
+	local tokens = {}
+	for token in pairs(values) do
+		tokens[#tokens + 1] = token
+	end
+	table.sort(tokens, function(a, b)
+		return #a > #b
+	end)
+	for _, token in ipairs(tokens) do
+		local value = values[token]
+		text = text:gsub(token:gsub("%$", "%%$"), function()
+			return value
+		end)
+	end
+	return text
+end
+
+local function currentTemplate()
+	local mode = Airflow.Flags.TextTemplate and Airflow.Flags.TextTemplate:Get() or "Goal"
+	if mode == "Evolution" then
+		local stageIndex = stageOf(totalRaised())
+		local stage = STAGES[stageIndex]
+		local nextStage = STAGES[stageIndex + 1]
+		if nextStage then
+			return string.format("LEVEL %d - %s\n$RAISED / $GOAL R$\n$NEXT R$ TO EVOLVE",
+				stageIndex, stage and stage.name or "")
+		end
+		return string.format("FINAL FORM - %s\n$RAISED R$ RAISED\nTHANK YOU", stage and stage.name or "")
+	elseif mode == "Simple" then
+		return "$RAISED R$ RAISED\nTHANK YOU FOR EVERY DONATION"
+	elseif mode == "Custom" then
+		local custom = Airflow.Flags.SignText and Airflow.Flags.SignText:Get() or ""
+		if custom ~= "" then
+			return custom
+		end
+		return "$RAISED / $GOAL R$\n$DONORS DONORS"
+	end
+	return "$RAISED / $GOAL R$\n$LEFT R$ LEFT\n$RPH R$/H"
+end
+
+local function mirrorSign(text)
+	local slot = state.slot
+	if not slot then
+		return
+	end
+	if not (Airflow.Flags.MirrorLocal and Airflow.Flags.MirrorLocal:Get()) then
+		return
+	end
+	local ui = boothUi(slot)
+	local sign = ui and ui:FindFirstChild("Sign")
+	local label = sign and sign:FindFirstChild("TextLabel")
+	if label then
+		label.Text = text
+	end
+end
+
+----- text delivery through the game's own editor -----
+-- The server keeps booth text that was written through the in-game editor.
+-- A bare SetCustomization call changes colours and fonts but the text may be
+-- dropped, so the hub can drive the editor panel itself.
+
+local function clickButton(button)
+	if not button then
+		return false
+	end
+	local ok, list = pcall(getconnections, button.Activated)
+	if not ok or type(list) ~= "table" or #list == 0 then
+		return false
+	end
+	for _, connection in ipairs(list) do
+		local handler = connection.Function or connection.func
+		if handler then
+			pcall(handler, "MouseButton1", 1)
+		end
+	end
+	return true
+end
+
+local function writeTextThroughEditor(text)
+	local gui = playerGui:FindFirstChild("MainGUI")
+	local editBooth = gui and gui:FindFirstChild("EditBooth")
+	local textSetting = editBooth and editBooth:FindFirstChild("TextSetting", true)
+	local editButton = textSetting and textSetting:FindFirstChild("Edit")
+	if not editButton then
+		return false
+	end
+	clickButton(editButton)
+	task.wait(0.9)
+	local panel = gui:FindFirstChild("EditBoothText")
+	local textBox = panel and panel:FindFirstChild("TextBox", true)
+	if not textBox then
+		return false
+	end
+	pcall(function()
+		textBox:CaptureFocus()
+	end)
+	task.wait(0.15)
+	textBox.Text = text
+	task.wait(0.25)
+	local virtualInput = game:GetService("VirtualInputManager")
+	pcall(function()
+		virtualInput:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+		virtualInput:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+	end)
+	task.wait(0.4)
+	pcall(function()
+		textBox:ReleaseFocus(true)
+	end)
+	task.wait(0.4)
+	clickButton(panel:FindFirstChild("Close", true))
+	task.wait(0.2)
+	clickButton(editBooth:FindFirstChild("Close", true))
+	return true
+end
+
+local editorQueue = nil
+local editorBusy = false
+
+function queueEditorWrite(text)
+	editorQueue = text
+	if editorBusy then
+		return
+	end
+	editorBusy = true
+	task.spawn(function()
+		while editorQueue do
+			local nextText = editorQueue
+			editorQueue = nil
+			pcall(writeTextThroughEditor, nextText:sub(1, 200))
+			-- Closing the game editor pushes its own colours back, so the hub
+			-- re-applies the chosen font and colour right after the text is saved.
+			task.wait(0.45)
+			if setCustomization and state.slot then
+				pcall(function()
+					setCustomization:FireServer(buildPayload(nextText), "booth")
+				end)
+			end
+			task.wait(0.6)
+		end
+		editorBusy = false
+	end)
+end
+
+local function applyBoothText(force)
+	if not state.slot then
+		return false
+	end
+	if not setCustomization then
+		return false
+	end
+	local text = renderTemplate(currentTemplate())
+	if text == state.text and not force then
+		mirrorSign(text)
+		return true
+	end
+	local now = os.clock()
+	if not force and now - state.lastWrite < 10 then
+		state.pendingText = text
+		return false
+	end
+	state.lastWrite = now
+	state.text = text
+	local ok = pcall(function()
+		setCustomization:FireServer(buildPayload(text), "booth")
+	end)
+	if ok then
+		mirrorSign(text)
+		if Airflow.Flags.UseEditor and Airflow.Flags.UseEditor:Get() then
+			queueEditorWrite(text)
+		end
+	end
+	return ok
+end
+
+task.spawn(function()
+	while task.wait(1) do
+		if state.pendingText and os.clock() - state.lastWrite >= 10 then
+			local pending = state.pendingText
+			state.pendingText = nil
+			if pending ~= state.text then
+				state.text = ""
+				applyBoothText(true)
+			end
+		end
+	end
+end)
+
+----- analytics -----
+
+local function recomputeVisitorCount()
+	local now = os.time()
+	local count = 0
+	for _, seenAt in pairs(SESSION.visitors) do
+		if now - seenAt < 300 then
+			count += 1
+		end
+	end
+	SESSION.visitorCount = count
+end
+
+local function recordDonation(amount, donor)
+	amount = math.max(1, math.floor(tonumber(amount) or 1))
+	SESSION.raised += amount
+	SESSION.donations += 1
+	SESSION.lastAt = os.time()
+	SESSION.lastDonor = donor
+	if amount > SESSION.best then
+		SESSION.best = amount
+	end
+	PROFILE.totalRaised += amount
+	local entry = PROFILE.donors[tostring(donor or "?")] or { amount = 0, count = 0 }
+	entry.amount += amount
+	entry.count += 1
+	PROFILE.donors[tostring(donor or "?")] = entry
+	saveProfile()
+end
+
+local function perHour()
+	local hours = math.max((os.time() - SESSION.startedAt) / 3600, 2 / 60)
+	return math.floor(SESSION.raised / hours)
+end
+
+local function summary()
+	return table.concat({
+		"PLS DONATE Director - session summary",
+		"raised: " .. SESSION.raised .. " R$",
+		"donations: " .. SESSION.donations,
+		"best: " .. SESSION.best .. " R$",
+		"per hour: " .. perHour() .. " R$",
+		"time: " .. clock(os.time() - SESSION.startedAt),
+		"all time: " .. PROFILE.totalRaised .. " R$",
+	}, "\n")
+end
+
+----- discord webhook -----
+
+local function webhookUrl()
+	local url = Airflow.Flags.WebhookUrl and tostring(Airflow.Flags.WebhookUrl:Get() or "") or ""
+	url = url:gsub("%s", "")
+	if url == "" or not url:find("http") then
+		return nil
+	end
+	return url
+end
+
+local function webhookSend(embed, content)
+	local url = webhookUrl()
+	if not url then
+		return false
+	end
+	if not (Airflow.Flags.WebhookOn and Airflow.Flags.WebhookOn:Get()) then
+		return false
+	end
+	local payload = { username = "PLS DONATE Director", embeds = { embed } }
+	if content and content ~= "" then
+		payload.content = content
+	end
+	local response = httpRequest({
+		Url = url,
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode(payload),
+	})
+	return response ~= nil
+end
+
+local function donationEmbed(amount, donor, speed)
+	return {
+		title = string.format("+%d R$ from %s", amount, tostring(donor)),
+		color = 3066993,
+		description = table.concat({
+			string.format("Session: **%d R$** in **%d** donations", SESSION.raised, SESSION.donations),
+			string.format("Per hour: **%d R$**", speed),
+			string.format("Total on booth: **%d R$**", totalRaised()),
+			string.format("Stage: **%d/%d %s**", stageOf(totalRaised()), #STAGES, (STAGES[stageOf(totalRaised())] or {}).name or ""),
+		}, "\n"),
+		footer = { text = "Robscript - PLS DONATE Director" },
+		timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+	}
+end
+
+local function pingThreshold()
+	local value = Airflow.Flags.PingAbove and tonumber(Airflow.Flags.PingAbove:Get())
+	return tonumber(value) or 100
+end
+
+local lastWebhookAt = 0
+
+----- donation pipeline -----
+
+local lastRaised = totalRaised()
+
+local Window -- assigned when the window is built
+local stageLog -- assigned when the show tab is built
+local donationLog -- assigned when the stats tab is built
+
+local function nearestOtherPlayer(limit)
+	limit = limit or 30
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return nil
+	end
+	local best, bestDistance = nil, limit
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local otherRoot = player.Character:FindFirstChild("HumanoidRootPart")
+			if otherRoot then
+				local distance = (otherRoot.Position - root.Position).Magnitude
+				if distance < bestDistance then
+					best, bestDistance = player, distance
+				end
+			end
+		end
+	end
+	return best
+end
+
+local onDonation -- forward declaration
+
+-- The game announces real donations to the recipient through this event, with the
+-- donor name and the amount. It is the only exact donor source the client gets.
+local function hookDonationAnnouncement()
+	if type(Remotes.OnClientEvent) ~= "function" then
+		return
+	end
+	pcall(function()
+		track(Remotes.OnClientEvent("DonationReceived", function(donorName, amount)
+			if typeof(donorName) == "Instance" then
+				donorName = donorName.Name
+			end
+			if type(donorName) ~= "string" or donorName == "" then
+				return
+			end
+			state.announcedDonor = donorName
+			state.announcedAt = os.time()
+			if typeof(amount) == "number" and amount > 0 then
+				state.announcedAmount = amount
+			end
+		end))
+	end)
+end
+
+local function hookDonations()
+	if raisedValue then
+		track(raisedValue:GetPropertyChangedSignal("Value"):Connect(function()
+			local current = tonumber(raisedValue.Value) or 0
+			local delta = current - lastRaised
+			lastRaised = current
+			if delta > 0 then
+				onDonation(delta, nil)
+			end
+		end))
+	end
+	if createVfx then
+		track(createVfx.OnClientEvent:Connect(function(action, _, character, amount)
+			if action ~= "GiveCurrency" and action ~= "GiveGiftbux" then
+				return
+			end
+			if character and character ~= LocalPlayer.Character then
+				return
+			end
+			if typeof(amount) == "number" and amount > 0 then
+				state.pendingAmount = amount
+			end
+			if character then
+				for _, player in ipairs(Players:GetPlayers()) do
+					if player.Character == character and player ~= LocalPlayer then
+						state.pendingDonor = player.Name
+					end
+				end
+			end
+		end))
+	end
+	hookDonationAnnouncement()
+end
+
+local donationLog
+
+onDonation = function(amount, donorOverride)
+	if state.busy then
+		return
+	end
+	state.busy = true
+	task.spawn(function()
+		local donor = donorOverride
+		if not donor and state.announcedDonor and state.announcedAt and os.time() - state.announcedAt <= 5 then
+			donor = state.announcedDonor
+		end
+		if not donor then
+			donor = state.pendingDonor
+		end
+		if not donor then
+			local near = nearestOtherPlayer(40)
+			donor = near and near.Name or nil
+		end
+		if not donor and LocalPlayer.Character then
+			donor = "unknown donor"
+		end
+		state.pendingDonor = nil
+		state.pendingAmount = nil
+		state.announcedDonor = nil
+
+		recordDonation(amount, donor)
+
+		local hours = math.max((os.time() - SESSION.startedAt) / 3600, 2 / 60)
+		local speed = math.floor(SESSION.raised / hours)
+		if donationLog then
+			donationLog:Push(string.format("<Success>+%d R$</Success> <Muted>%s</Muted> <Accent>%d R$/h</Accent>",
+				amount, escape(donor or "?"), speed))
+		end
+
+		task.spawn(function()
+			local ping = amount >= pingThreshold() and "@everyone" or nil
+			if webhookSend(donationEmbed(amount, donor, speed), ping) then
+				lastWebhookAt = os.time()
+			end
+		end)
+
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			applyBoothText(true)
+		end
+
+		local stageIndex = stageOf(totalRaised())
+		if stageIndex ~= state.lastStage then
+			state.lastStage = stageIndex
+			local stage = STAGES[stageIndex]
+			if stageLog then
+				stageLog:Push(string.format("<Accent>%s</Accent> <Muted>%d R$</Muted>", stage and stage.name or "?", stage and stage.total or 0))
+			end
+			if Airflow.Flags.LivingBooth and Airflow.Flags.LivingBooth:Get() then
+				applyBoothText(true)
+				if stage and stageIndex >= 4 then
+					Window:Notify({
+						Title = Airflow:T("Stage up"),
+						Content = stage.name,
+						Type = "Success",
+					})
+				end
+			end
+		end
+
+		if Airflow.Flags.ThanksDonor and Airflow.Flags.ThanksDonor:Get() and donor and donor ~= "unknown donor" then
+			task.spawn(function()
+				task.wait(2)
+				sendChat(string.format("thank you %s for %d R$", donor, amount))
+			end)
+		end
+
+		if Airflow.Flags.SpinOnDonation and Airflow.Flags.SpinOnDonation:Get() then
+			task.spawn(spinOnce, amount)
+		end
+		if Airflow.Flags.JumpOnDonation and Airflow.Flags.JumpOnDonation:Get() then
+			task.spawn(jumpFor, amount)
+		end
+		if Airflow.Flags.GravityOnDonation and Airflow.Flags.GravityOnDonation:Get() then
+			task.spawn(gravityDip, amount)
+		end
+		if Airflow.Flags.DanceOnDonation and Airflow.Flags.DanceOnDonation:Get() then
+			task.spawn(function()
+				task.wait(0.5)
+				pcall(function()
+					Players:Chat("/e dance")
+				end)
+			end)
+		end
+
+		state.busy = false
+	end)
+end
+
+----- show routines -----
+
+function spinOnce(amount)
+	local character = LocalPlayer.Character
+	if not character then
+		return
+	end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	root.Anchored = true
+	local perRobux = Airflow.Flags.SpinPerRobux and tonumber(Airflow.Flags.SpinPerRobux:Get()) or 1
+	local turns = math.clamp(amount * perRobux, 1, 6)
+	local duration = math.clamp(turns * 0.45, 0.5, 3)
+	local info = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+	local spin = TweenService:Create(root, info, {
+		CFrame = root.CFrame * CFrame.Angles(0, math.rad(360 * turns), 0),
+	})
+	spin:Play()
+	task.wait(duration + 0.1)
+	root.Anchored = false
+end
+
+function jumpFor(amount)
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+	local jumps = math.clamp(amount, 1, 10)
+	for _ = 1, jumps do
+		if humanoid.Health <= 0 then
+			return
+		end
+		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		local waited = 0
+		repeat
+			task.wait(0.1)
+			waited += 0.1
+		until humanoid:GetState() == Enum.HumanoidStateType.Landed or waited > 2
+	end
+end
+
+function gravityDip(amount)
+	local original = workspace.Gravity
+	workspace.Gravity = math.max(20, original - math.clamp(amount, 1, 120))
+	task.wait(3)
+	workspace.Gravity = original
+end
+
+----- anti afk -----
+
+track(LocalPlayer.Idled:Connect(function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end))
+
+----- auto stand -----
+
+local function holdStand()
+	if state.slot then
+		return
+	end
+	local slot = myBoothSlot()
+	if slot then
+		state.slot = slot
+		return
+	end
+	if not (Airflow.Flags.AutoStand and Airflow.Flags.AutoStand:Get()) then
+		return
+	end
+	local free = nearestFreeBooth()
+	if not free then
+		return
+	end
+	if claimBooth(free.slot) then
+		state.slot = free.slot
+		walkToBooth(free.slot)
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			applyBoothText(true)
+		end
+	end
+end
+
+task.spawn(function()
+	while task.wait(2) do
+		pcall(holdStand)
+		pcall(recomputeVisitorCount)
+	end
+end)
+
+local function trackVisitors()
+	local slot = state.slot
+	if not slot then
+		return
+	end
+	local part = boothPart(slot)
+	if not part then
+		return
+	end
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local root = player.Character:FindFirstChild("HumanoidRootPart")
+			if root and (root.Position - part.Position).Magnitude < 26 then
+				SESSION.visitors[player.UserId] = os.time()
+			end
+		end
+	end
+end
+
+task.spawn(function()
+	while task.wait(3) do
+		pcall(trackVisitors)
+	end
+end)
+
+----- server scout -----
+
+local BOT_WORDS = { "spin", "jump", "1r$", "+1 speed", "helicopter", "auto", "webhook", "script", "1 r$ = " }
+
+local function countBotBooths()
+	local counter = 0
+	local mapUi = mapContainer()
+	local booths = mapUi and mapUi:FindFirstChild("BoothUI")
+	if not booths then
+		return 0
+	end
+	for _, booth in ipairs(booths:GetChildren()) do
+		local sign = booth:FindFirstChild("Sign")
+		local label = sign and sign:FindFirstChild("TextLabel")
+		if label and label.Text ~= "" then
+			local lower = label.Text:lower()
+			for _, word in ipairs(BOT_WORDS) do
+				if lower:find(word, 1, true) then
+					counter += 1
+					break
+				end
+			end
+		end
+	end
+	return counter
+end
+
+local cachedBots = 0
+
+task.spawn(function()
+	while true do
+		pcall(function()
+			cachedBots = countBotBooths()
+		end)
+		task.wait(20)
+	end
+end)
+
+local function serverMetrics()
+	local players = Players:GetPlayers()
+	local botBooths = cachedBots
+	local taken, raisedSum, withMoney = 0, 0, 0
+	if boothInteractions then
+		for _, part in ipairs(boothInteractions:GetChildren()) do
+			if part:GetAttribute("BoothSlot") and part:GetAttribute("BoothOwner") then
+				taken += 1
+			end
+		end
+	end
+	for _, player in ipairs(players) do
+		local stats = player:FindFirstChild("leaderstats")
+		local raised = stats and stats:FindFirstChild("Raised")
+		if raised then
+			raisedSum += tonumber(raised.Value) or 0
+			if (tonumber(raised.Value) or 0) > 0 then
+				withMoney += 1
+			end
+		end
+	end
+	local near = 0
+	local slot = state.slot
+	local part = slot and boothPart(slot)
+	if part then
+		for _, player in ipairs(players) do
+			if player ~= LocalPlayer and player.Character then
+				local root = player.Character:FindFirstChild("HumanoidRootPart")
+				if root and (root.Position - part.Position).Magnitude < 26 then
+					near += 1
+				end
+			end
+		end
+	end
+	local score = 0
+	score += math.min(#players * 2.2, 38)
+	score += math.min(taken * 2.4, 22)
+	score += math.min(raisedSum / 30, 20)
+	score += math.min(near * 2, 12)
+	score += math.min(withMoney * 1.5, 8)
+	score -= math.min(botBooths * 2.5, 18)
+	return {
+		players = #players,
+		taken = taken,
+		raisedSum = raisedSum,
+		withMoney = withMoney,
+		near = near,
+		botBooths = botBooths,
+		score = math.clamp(math.floor(score), 0, 100),
+	}
+end
+
+local voiceAvailable = false
+
+task.spawn(function()
+	pcall(function()
+		voiceAvailable = game:GetService("VoiceChatService"):IsVoiceEnabledForUserIdAsync(LocalPlayer.UserId) == true
+	end)
+end)
+
+local function hopServer()
+	local placeId = PLACE_MAIN
+	if voiceAvailable and Airflow.Flags.VoiceServers and Airflow.Flags.VoiceServers:Get() then
+		placeId = PLACE_VOICE
+	end
+
+	local response = httpRequest({
+		Url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
+		Method = "GET",
+	})
+	if not response or not response.Body then
+		return false
+	end
+	local decoded = nil
+	pcall(function()
+		decoded = HttpService:JSONDecode(response.Body)
+	end)
+	if type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+		return false
+	end
+	local candidates = {}
+	for _, server in ipairs(decoded.data) do
+		local playing = tonumber(server.playing)
+		if playing and server.id ~= game.JobId and playing >= 10 and playing <= 26 then
+			candidates[#candidates + 1] = server.id
+		end
+	end
+	if #candidates == 0 then
+		return false
+	end
+	local target = candidates[math.random(#candidates)]
+
+	local loaderUrl = Airflow.Flags.LoaderUrl and tostring(Airflow.Flags.LoaderUrl:Get() or "") or ""
+	loaderUrl = loaderUrl:gsub("%s", "")
+	if loaderUrl ~= "" and type(queueOnTeleport) == "function" then
+		pcall(queueOnTeleport, string.format('loadstring(game:HttpGet("%s"))()', loaderUrl))
+	end
+
+	task.spawn(function()
+		if webhookSend({
+			title = "Server hop",
+			color = 10181046,
+			description = string.format("Left a server with score **%d**. Session raised: **%d R$** in **%s**.",
+				serverMetrics().score, SESSION.raised, clock(os.time() - SESSION.startedAt)),
+			footer = { text = "Robscript - PLS DONATE Director" },
+			timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+		}) then
+			lastWebhookAt = os.time()
+		end
+	end)
+
+	local ok = pcall(function()
+		TeleportService:TeleportToPlaceInstance(placeId, target, LocalPlayer)
+	end)
+	return ok
+end
+
+task.spawn(function()
+	while task.wait(tonumber(Airflow.Flags.HopCheck and Airflow.Flags.HopCheck:Get()) or 30) do
+		local metrics = serverMetrics()
+		local threshold = Airflow.Flags.HopBelow and tonumber(Airflow.Flags.HopBelow:Get()) or 30
+		if Airflow.Flags.AutoHop and Airflow.Flags.AutoHop:Get() and metrics.score < threshold then
+			if os.time() - SESSION.startedAt > 120 then
+				if hopServer() then
+					break
+				end
+			end
+		end
+	end
+end)
+
+----- window -----
+
+Window = Airflow:CreateWindow({
+	Name = "Robscript - PLS DONATE Director",
+	LoadingSubtitle = "booth, show, stats, server",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobscriptPD" },
+	Home = {
+		Title = "PLS DONATE Director",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- stand tab -----
+
+local StandTab = Window:CreateTab({ Name = "Booth", Icon = "store" })
+local StandBox = StandTab:CreateGroupbox({ Name = "Automation", Side = "Left" })
+local TextBoxGroup = StandTab:CreateGroupbox({ Name = "Booth text", Side = "Right" })
+
+StandBox:CreateStatus({
+	Name = "Booth",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 1,
+	Update = function()
+		local slot = state.slot or myBoothSlot()
+		if slot then
+			return string.format("<Success>#%d</Success>", slot)
+		end
+		return "<Muted>" .. Airflow:T("No booth") .. "</Muted>"
+	end,
+})
+
+StandBox:CreateStatus({
+	Name = "Free booths",
+	Style = "Row",
+	UpdateRate = 3,
+	Update = function()
+		return tostring(#freeBooths())
+	end,
+})
+
+local AutoStand = StandBox:CreateToggle({
+	Name = "Auto stand",
+	Desc = "Claims a free booth and holds the spot",
+	Flag = "AutoStand",
+	CurrentValue = true,
+	Callback = function(on)
+		if on then
+			task.spawn(holdStand)
+		end
+	end,
+})
+
+StandBox:CreateButton({
+	Name = "Go to my booth",
+	Icon = "map-pin",
+	Callback = function()
+		local slot = state.slot or myBoothSlot()
+		if slot then
+			task.spawn(walkToBooth, slot)
+		end
+	end,
+})
+
+StandBox:CreateButton({
+	Name = "Claim nearest booth",
+	Icon = "hand",
+	Callback = function()
+		task.spawn(function()
+			local free = nearestFreeBooth()
+			if not free then
+				Window:Notify({ Title = Airflow:T("Booth"), Content = Airflow:T("No free booth"), Type = "Warning" })
+				return
+			end
+			if claimBooth(free.slot) then
+				state.slot = free.slot
+				walkToBooth(free.slot)
+				if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+					applyBoothText(true)
+				end
+			end
+		end)
+	end,
+})
+
+TextBoxGroup:CreateDropdown({
+	Name = "Template",
+	Options = { "Goal", "Evolution", "Simple", "Custom" },
+	CurrentOption = "Goal",
+	Flag = "TextTemplate",
+	Callback = function()
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			applyBoothText(true)
+		end
+	end,
+})
+
+TextBoxGroup:CreateInput({
+	Name = "Goal",
+	PlaceholderText = "100",
+	Numeric = true,
+	CurrentValue = "100",
+	Flag = "BoothGoal",
+	Callback = function()
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			applyBoothText(true)
+		end
+	end,
+})
+
+local SignInput = TextBoxGroup:CreateInput({
+	Name = "Sign text",
+	PlaceholderText = "$RAISED / $GOAL R$",
+	CurrentValue = "",
+	Flag = "SignText",
+	Callback = function()
+		if Airflow.Flags.TextTemplate and Airflow.Flags.TextTemplate:Get() == "Custom" then
+			applyBoothText(true)
+		end
+	end,
+})
+
+TextBoxGroup:CreateDropdown({
+	Name = "Font",
+	Options = {
+		"GothamBold", "GothamBlack", "GothamMedium", "Bangers", "SciFi", "Arcade",
+		"Creepster", "FredokaOne", "LuckiestGuy", "Michroma", "Sarpanch",
+		"SpecialElite", "Antique", "Cartoon", "Fantasy", "Code",
+	},
+	CurrentOption = "GothamBold",
+	Searchable = true,
+	Flag = "SignFont",
+	Callback = function()
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			applyBoothText(true)
+		end
+	end,
+})
+
+TextBoxGroup:CreateColorPicker({
+	Name = "Text colour",
+	Color = Color3.fromRGB(255, 59, 127),
+	Flag = "SignColor",
+	Callback = function()
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			applyBoothText(true)
+		end
+	end,
+})
+
+TextBoxGroup:CreateLabel({ Text = "<Muted>" .. Airflow:T("Tokens: $RAISED $GOAL $LEFT $DONORS $RPH $STAGE $DONOR") .. "</Muted>" })
+
+TextBoxGroup:CreateToggle({
+	Name = "Live booth text",
+	Desc = "Rewrites the sign when money arrives",
+	Flag = "LiveText",
+	CurrentValue = true,
+	Callback = function(on)
+		if on then
+			applyBoothText(true)
+		end
+	end,
+})
+
+TextBoxGroup:CreateSlider({
+	Name = "Refresh every",
+	Range = { 15, 180 },
+	Increment = 5,
+	Suffix = " s",
+	CurrentValue = 60,
+	Flag = "RefreshEvery",
+})
+
+TextBoxGroup:CreateToggle({
+	Name = "Mirror text on my own sign",
+	Desc = "The game never refreshes your own sign, this mirrors it locally",
+	Flag = "MirrorLocal",
+	CurrentValue = true,
+})
+
+TextBoxGroup:CreateToggle({
+	Name = "Save text through the editor",
+	Desc = "The game keeps text written through its own editor panel",
+	Flag = "UseEditor",
+	CurrentValue = true,
+})
+
+TextBoxGroup:CreateButton({
+	Name = "Apply text now",
+	Icon = "send",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			if not state.slot then
+				state.slot = myBoothSlot()
+			end
+			if not state.slot then
+				Window:Notify({ Title = Airflow:T("Booth"), Content = Airflow:T("No booth claimed yet"), Type = "Warning" })
+				return
+			end
+			if applyBoothText(true) then
+				Window:Notify({ Title = Airflow:T("Booth text"), Content = Airflow:T("Text saved"), Type = "Success" })
+			else
+				Window:Notify({ Title = Airflow:T("Booth text"), Content = Airflow:T("Text cannot be saved right now"), Type = "Error" })
+			end
+		end)
+	end,
+})
+
+----- show tab -----
+
+local ShowTab = Window:CreateTab({ Name = "Show", Icon = "sparkles" })
+local EffectsBox = ShowTab:CreateGroupbox({ Name = "Donation show", Side = "Left" })
+local StageBox = ShowTab:CreateGroupbox({ Name = "Living booth", Side = "Right" })
+
+EffectsBox:CreateToggle({
+	Name = "Spin the character",
+	Flag = "SpinOnDonation",
+	CurrentValue = true,
+})
+
+EffectsBox:CreateSlider({
+	Name = "Spin speed per Robux",
+	Range = { 0.5, 6 },
+	Increment = 0.5,
+	CurrentValue = 1.5,
+	Flag = "SpinPerRobux",
+})
+
+EffectsBox:CreateToggle({
+	Name = "Jump for every Robux",
+	Flag = "JumpOnDonation",
+	CurrentValue = false,
+	DependsOn = "SpinOnDonation",
+	DependsMode = "Disable",
+})
+
+EffectsBox:CreateToggle({
+	Name = "Lower gravity on donation",
+	Flag = "GravityOnDonation",
+	CurrentValue = false,
+})
+
+EffectsBox:CreateToggle({
+	Name = "Dance after a donation",
+	Flag = "DanceOnDonation",
+	CurrentValue = false,
+})
+
+EffectsBox:CreateToggle({
+	Name = "Thanks in chat",
+	Desc = "Send a short thanks to the donor",
+	Flag = "ThanksDonor",
+	CurrentValue = false,
+})
+
+EffectsBox:CreateStatus({
+	Name = "Chat",
+	Style = "Row",
+	UpdateRate = 10,
+	Update = function()
+		if chatAvailable() then
+			return "<Success>" .. Airflow:T("Available") .. "</Success>"
+		end
+		return "<Warning>" .. Airflow:T("Unavailable") .. "</Warning>"
+	end,
+})
+
+StageBox:CreateToggle({
+	Name = "Living booth",
+	Desc = "The sign evolves as the total grows",
+	Flag = "LivingBooth",
+	CurrentValue = true,
+	Callback = function(on)
+		if on then
+			if Airflow.Flags.TextTemplate then
+				Airflow.Flags.TextTemplate:Set("Evolution", true)
+			end
+			applyBoothText(true)
+		end
+	end,
+})
+
+StageBox:CreateStatus({
+	Name = "Stage",
+	Style = "Stat",
+	UpdateRate = 1,
+	Update = function()
+		local index = stageOf(totalRaised())
+		local stage = STAGES[index]
+		return string.format("%d/%d %s", index, #STAGES, stage and stage.name or "")
+	end,
+})
+
+local stageProgress = StageBox:CreateProgress({
+	Name = "To next stage",
+	CurrentValue = 0,
+	Color = THEME.Accent,
+})
+
+local function stageFill()
+	local index = stageOf(totalRaised())
+	local nextStage = STAGES[index + 1]
+	if not nextStage then
+		return 1
+	end
+	local previous = STAGES[index]
+	local span = math.max(nextStage.total - (previous and previous.total or 0), 1)
+	return math.clamp((totalRaised() - (previous and previous.total or 0)) / span, 0, 1)
+end
+
+task.spawn(function()
+	while task.wait(1) do
+		pcall(function()
+			stageProgress:Set(stageFill())
+		end)
+	end
+end)
+
+stageLog = StageBox:CreateLog({
+	Name = "Stages",
+	MaxEntries = 60,
+	MaxRows = 8,
+	Timestamps = true,
+	EmptyText = "No stages yet",
+})
+
+StageBox:CreateInput({
+	Name = "Amount",
+	PlaceholderText = "10",
+	Numeric = true,
+	CurrentValue = "10",
+	Flag = "TestAmount",
+})
+
+StageBox:CreateButton({
+	Name = "Test donation",
+	Desc = "Runs the whole pipeline without Robux",
+	Icon = "flask-conical",
+	Callback = function()
+		if not raisedValue then
+			return
+		end
+		local amount = Airflow.Flags.TestAmount and tonumber(Airflow.Flags.TestAmount:Get()) or 10
+		amount = math.clamp(tonumber(amount) or 10, 1, 500)
+		raisedValue.Value = (tonumber(raisedValue.Value) or 0) + amount
+	end,
+})
+
+----- stats tab -----
+
+local StatsTab = Window:CreateTab({ Name = "Stats", Icon = "chart-column" })
+local SessionBox = StatsTab:CreateGroupbox({ Name = "Session", Side = "Left" })
+local LogBox = StatsTab:CreateGroupbox({ Name = "Donations", Side = "Right" })
+
+local profileInfo = {}
+
+task.spawn(function()
+	while true do
+		local okRemote, infoRemote = pcall(Remotes.Function, "PlayerInfo")
+		if okRemote and infoRemote then
+			local okInfo, info = pcall(function()
+				return infoRemote:InvokeServer(LocalPlayer)
+			end)
+			if okInfo and type(info) == "table" then
+				profileInfo = info
+			end
+		end
+		task.wait(30)
+	end
+end)
+
+SessionBox:CreateStatus({
+	Name = "Raised this session",
+	Style = "Stat",
+	UpdateRate = 1,
+	Update = function()
+		return SESSION.raised .. " R$"
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Per hour",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		local value = perHour()
+		if value > 0 then
+			return "<Success>" .. value .. " R$/h</Success>"
+		end
+		return "<Muted>0 R$/h</Muted>"
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Donations",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local average = SESSION.donations > 0 and math.floor(SESSION.raised / SESSION.donations) or 0
+		return string.format("%d <Muted>(%s %d R$)</Muted>", SESSION.donations, Airflow:T("Average"), average)
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Best donation",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		return SESSION.best .. " R$"
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Last donation",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if not SESSION.lastAt then
+			return "<Muted>" .. Airflow:T("No donations yet") .. "</Muted>"
+		end
+		return clock(os.time() - SESSION.lastAt) .. " <Muted>" .. escape(SESSION.lastDonor or "") .. "</Muted>"
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Visitors near the booth",
+	Style = "Row",
+	UpdateRate = 3,
+	Update = function()
+		return tostring(SESSION.visitorCount)
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "All time",
+	Style = "Row",
+	UpdateRate = 5,
+	Update = function()
+		return PROFILE.totalRaised .. " R$"
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Profile",
+	Style = "Row",
+	UpdateRate = 5,
+	Update = function()
+		local tags = {}
+		if profileInfo.isVerified then
+			tags[#tags + 1] = "verified"
+		end
+		if profileInfo.isVIP then
+			tags[#tags + 1] = "VIP"
+		end
+		if profileInfo.hasPremium then
+			tags[#tags + 1] = "premium"
+		end
+		local streak = tonumber(profileInfo.streak) or 0
+		local tail = #tags > 0 and (" <Muted>" .. table.concat(tags, " ") .. "</Muted>") or ""
+		return string.format("%d %s%s", streak, Airflow:T("days"), tail)
+	end,
+})
+
+SessionBox:CreateButtonRow({
+	{
+		Name = "Reset session",
+		Callback = function()
+			SESSION.raised = 0
+			SESSION.donations = 0
+			SESSION.best = 0
+			SESSION.lastAt = nil
+			SESSION.lastDonor = nil
+			SESSION.startedAt = os.time()
+			SESSION.visitors = {}
+			SESSION.visitorCount = 0
+			if donationLog then
+				donationLog:Push("<Muted>" .. Airflow:T("Session reset") .. "</Muted>")
+			end
+		end,
+	},
+	{
+		Name = "Copy summary",
+		Style = "Primary",
+		Callback = function()
+			if type(setclipboard) ~= "function" then
+				Window:Notify({ Title = Airflow:T("Stats"), Content = Airflow:T("Clipboard is unavailable"), Type = "Warning" })
+				return
+			end
+			pcall(setclipboard, summary())
+			Window:Notify({ Title = Airflow:T("Stats"), Content = Airflow:T("Summary copied"), Type = "Success" })
+		end,
+	},
+})
+
+donationLog = LogBox:CreateLog({
+	Name = "Donations",
+	MaxEntries = 200,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "No donations yet",
+})
+
+----- server tab -----
+
+local ServerTab = Window:CreateTab({ Name = "Server", Icon = "radar" })
+local ScoreBox = ServerTab:CreateGroupbox({ Name = "Server activity", Side = "Left" })
+local HopBox = ServerTab:CreateGroupbox({ Name = "Automation", Side = "Right" })
+
+local cachedMetrics = { players = 0, taken = 0, raisedSum = 0, withMoney = 0, near = 0, score = 0 }
+
+task.spawn(function()
+	while task.wait(5) do
+		local ok, metrics = pcall(serverMetrics)
+		if ok and type(metrics) == "table" then
+			cachedMetrics = metrics
+		end
+	end
+end)
+
+ScoreBox:CreateStatus({
+	Name = "Score",
+	Style = "Stat",
+	Max = 100,
+	UpdateRate = 1,
+	Update = function()
+		local score = cachedMetrics.score
+		if score >= 60 then
+			return string.format("<Success>%d / 100</Success>", score)
+		elseif score >= 30 then
+			return string.format("<Warning>%d / 100</Warning>", score)
+		end
+		return string.format("<Error>%d / 100</Error>", score)
+	end,
+})
+
+ScoreBox:CreateStatus({
+	Name = "Players",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		return tostring(cachedMetrics.players)
+	end,
+})
+
+ScoreBox:CreateStatus({
+	Name = "Booths taken",
+	Style = "Row",
+	UpdateRate = 3,
+	Update = function()
+		return tostring(cachedMetrics.taken)
+	end,
+})
+
+ScoreBox:CreateStatus({
+	Name = "Money on server",
+	Style = "Row",
+	UpdateRate = 3,
+	Update = function()
+		return shortNumber(cachedMetrics.raisedSum) .. " R$"
+	end,
+})
+
+ScoreBox:CreateStatus({
+	Name = "Near you",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		return tostring(cachedMetrics.near)
+	end,
+})
+
+ScoreBox:CreateStatus({
+	Name = "Bot-like booths",
+	Style = "Row",
+	UpdateRate = 5,
+	Update = function()
+		local count = cachedBots
+		if count >= 6 then
+			return string.format("<Error>%d</Error>", count)
+		elseif count >= 3 then
+			return string.format("<Warning>%d</Warning>", count)
+		end
+		return string.format("<Success>%d</Success>", count)
+	end,
+})
+
+HopBox:CreateToggle({
+	Name = "Auto hop",
+	Desc = "Leaves when the server looks dead",
+	Flag = "AutoHop",
+	CurrentValue = false,
+})
+
+HopBox:CreateSlider({
+	Name = "Hop below",
+	Range = { 5, 80 },
+	Increment = 5,
+	CurrentValue = 30,
+	Flag = "HopBelow",
+	DependsOn = "AutoHop",
+})
+
+HopBox:CreateSlider({
+	Name = "Check every",
+	Range = { 15, 180 },
+	Increment = 15,
+	Suffix = " s",
+	CurrentValue = 30,
+	Flag = "HopCheck",
+	DependsOn = "AutoHop",
+})
+
+HopBox:CreateInput({
+	Name = "Loader URL",
+	Desc = "The hub reloads itself after a server hop",
+	PlaceholderText = "https://.../script.lua",
+	CurrentValue = "",
+	Flag = "LoaderUrl",
+})
+
+HopBox:CreateLabel({
+	Text = "<Muted>" .. Airflow:T("Paste the raw link you load the hub from") .. "</Muted>",
+})
+
+HopBox:CreateToggle({
+	Name = "Voice servers",
+	Desc = "Hops into the voice chat world when the account allows it",
+	Flag = "VoiceServers",
+	CurrentValue = false,
+})
+
+HopBox:CreateButton({
+	Name = "Hop now",
+	Icon = "shuffle",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			if not hopServer() then
+				Window:Notify({ Title = Airflow:T("Server"), Content = Airflow:T("Hop is not available"), Type = "Warning" })
+			end
+		end)
+	end,
+})
+
+----- alerts tab -----
+
+local AlertsTab = Window:CreateTab({ Name = "Alerts", Icon = "webhook" })
+local WebhookBox = AlertsTab:CreateGroupbox({ Name = "Discord webhook", Side = "Left" })
+local AlertInfoBox = AlertsTab:CreateGroupbox({ Name = "State", Side = "Right" })
+
+WebhookBox:CreateInput({
+	Name = "Webhook URL",
+	Desc = "Donations and hops go here",
+	PlaceholderText = "https://discord.com/api/webhooks/...",
+	CurrentValue = "",
+	Flag = "WebhookUrl",
+})
+
+WebhookBox:CreateToggle({
+	Name = "Send alerts",
+	Desc = "Donation cards and hop notices",
+	Flag = "WebhookOn",
+	CurrentValue = true,
+})
+
+WebhookBox:CreateInput({
+	Name = "Ping above",
+	Desc = "Mentions everyone above this amount",
+	PlaceholderText = "100",
+	Numeric = true,
+	CurrentValue = "100",
+	Flag = "PingAbove",
+})
+
+WebhookBox:CreateButton({
+	Name = "Test webhook",
+	Icon = "send",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			local sent = webhookSend({
+				title = "PLS DONATE Director is connected",
+				color = 3447003,
+				description = string.format("Booth slot: **%s**\nSession: **%d R$** in **%d** donations",
+					tostring(state.slot or "none"), SESSION.raised, SESSION.donations),
+				footer = { text = "Robscript - PLS DONATE Director" },
+				timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+			})
+			if sent then
+				lastWebhookAt = os.time()
+				Window:Notify({ Title = Airflow:T("Alerts"), Content = Airflow:T("Test sent"), Type = "Success" })
+			else
+				Window:Notify({ Title = Airflow:T("Alerts"), Content = Airflow:T("Webhook is not set"), Type = "Warning" })
+			end
+		end)
+	end,
+})
+
+AlertInfoBox:CreateStatus({
+	Name = "Last alert",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		if lastWebhookAt == 0 then
+			return "<Muted>" .. Airflow:T("Nothing yet") .. "</Muted>"
+		end
+		return clock(os.time() - lastWebhookAt) .. " " .. Airflow:T("ago")
+	end,
+})
+
+AlertInfoBox:CreateLabel({
+	Text = "<Muted>" .. Airflow:T("A test card works without a real donation") .. "</Muted>",
+})
+
+----- settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
+AboutBox:CreateParagraph({
+	Title = "Robscript - PLS DONATE Director",
+	Content = table.concat({
+		"Booth text engine, donation analytics and a show for visitors.",
+		"",
+		"Tokens: $RAISED $GOAL $LEFT $DONORS $RPH $STAGE $STAGENAME $NEXT $DONOR",
+		"",
+		"Your own sign is redrawn by the game only after a rejoin. The hub mirrors it locally so you can see it.",
+		"",
+		"Stand routines and the donation signal are based on the open-source szze autofarm (tzechco / tvk1308).",
+	}, "\n"),
+})
+
+----- start -----
+
+Window:LoadAutoload()
+
+state.slot = myBoothSlot()
+state.lastStage = stageOf(totalRaised())
+
+hookDonations()
+
+if state.slot and Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+	task.spawn(function()
+		task.wait(1)
+		applyBoothText(true)
+	end)
+end
+
+task.spawn(function()
+	while true do
+		local interval = math.max(tonumber(Airflow.Flags.RefreshEvery and Airflow.Flags.RefreshEvery:Get()) or 60, 15)
+		task.wait(interval)
+		if Airflow.Flags.LiveText and Airflow.Flags.LiveText:Get() then
+			pcall(applyBoothText)
+		end
+	end
+end)
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(3)
+	state.slot = state.slot or myBoothSlot()
+	if state.slot then
+		pcall(walkToBooth, state.slot)
+	end
+end))
+
+task.spawn(function()
+	task.wait(1)
+	local slot = state.slot
+	if slot then
+		donationLog:Push(string.format("<Muted>%s %d</Muted>", Airflow:T("Booth claimed"), slot))
+	end
+end)
+
+Window:Notify({ Title = Airflow:T("Robscript"), Content = Airflow:T("Director is ready"), Type = "Success" })
+
+getgenv().RobscriptPD = {
+	Window = Window,
+	airflow = Airflow,
+	flags = Airflow.Flags,
+	state = state,
+	session = SESSION,
+	profile = PROFILE,
+	stageOf = stageOf,
+	applyBoothText = applyBoothText,
+	serverMetrics = serverMetrics,
+	hopServer = hopServer,
+	writeTextThroughEditor = writeTextThroughEditor,
+	connections = connections,
+	tabs = {
+		Stand = StandTab,
+		Show = ShowTab,
+		Stats = StatsTab,
+		Server = ServerTab,
+		Alerts = AlertsTab,
+		Settings = SettingsTab,
+	},
+	webhookSend = webhookSend,
+	countBotBooths = countBotBooths,
+	version = "1.0.0",
+}
