@@ -205,6 +205,40 @@ local RU_STRINGS = {
 	["All ESP objects removed"] = "Все метки ESP убраны",
 	["Infected Lands survival hub is ready"] = "Хаб Infected Lands готов",
 	["infected lands - survival"] = "infected lands - выживание",
+
+	-- combat
+	["Combat"] = "Бой",
+	["Lock-on"] = "Захват",
+	["Target"] = "Цель",
+	["Aimlock"] = "Аимлок",
+	["Locks the player nearest to the crosshair"] = "Держит игрока ближе всех к прицелу",
+	["Method"] = "Метод",
+	["Camera FOV"] = "Камера по FOV",
+	["BlockSpin lock"] = "Захват BlockSpin",
+	["Camera FOV is this hub's own; BlockSpin lock is ported from BlockSpin"] = "Camera FOV — свой метод хаба, BlockSpin lock — перенос из BlockSpin",
+	["Activation"] = "Активация",
+	["Hold"] = "Удержание",
+	["Toggle"] = "Переключение",
+	["Aim key"] = "Клавиша аима",
+	["Press and hold, or press once in toggle mode"] = "Держите, либо нажмите один раз в режиме переключения",
+	["Aim bone"] = "Точка прицела",
+	["Head"] = "Голова",
+	["Torso"] = "Торс",
+	["Root part"] = "Корень",
+	["Aim range"] = "Дальность аима",
+	["Smoothing"] = "Плавность",
+	["20 snaps the camera instantly"] = "20 — мгновенный срыв камеры",
+	["Target filter"] = "Фильтр цели",
+	["Wall check"] = "Проверка стен",
+	["Drops the lock behind walls and cars"] = "Снимает захват за стенами и машинами",
+	["Force lock"] = "Жёсткий захват",
+	["BlockSpin mode: snaps the camera and re-grabs the closest body"] = "Режим BlockSpin: срывает камеру и перехватывает ближайшего",
+	["Turn body"] = "Поворот тела",
+	["Indicator"] = "Индикатор",
+	["FOV circle"] = "Круг FOV",
+	["Wheel switches target"] = "Колесо меняет цель",
+	["not locked"] = "нет захвата",
+	["Enable Aimlock, bind a key and hold it while shooting. In toggle mode the same key turns the lock on and off. The wheel switches the target while armed; the lock drops by itself when the target dies or leaves the range."] = "Включите аимлок, назначьте клавишу и держите её во время стрельбы. В режиме переключения та же клавиша включает и выключает захват. Колесо меняет цель, пока захват активен; сам он снимается, когда цель умерла или вышла из радиуса.",
 	["Survival 1.0"] = "Выживание 1.0",
 	["studs"] = "стадов",
 	["Guns"] = "Оружие",
@@ -1752,6 +1786,532 @@ local function refreshMapMarkers()
 end
 
 
+----- Aim -----
+
+-- Two lock implementations behind one switch:
+--   Camera FOV     - this hub's own: picks the target closest to the crosshair
+--                    in screen pixels, keeps it while it stays near, smooths.
+--   BlockSpin lock - ported from BlockSpin: sorts by angle to the camera, has a
+--                    hard snap mode and re-grabs the nearest body on loss.
+-- Both are written in RenderStepped: the game's camera script runs first and
+-- would overwrite a lock written in Heartbeat.
+
+local AIM_METHOD_FOV = "Camera FOV"
+local AIM_METHOD_BLOCKSPIN = "BlockSpin lock"
+
+local AIM_BONES = {
+	["Head"] = "Head",
+	["Torso"] = "Torso",
+	["Root part"] = "HumanoidRootPart",
+}
+
+local aimState = {
+	holding = false,
+	toggled = false,
+	player = nil,
+	part = nil,
+	indicator = nil,
+	circle = nil,
+	circleFrame = nil,
+}
+
+local function aimKeyName()
+	local value = flag("AimKey", "Q")
+	if typeof(value) == "EnumItem" then
+		return value
+	end
+	if type(value) == "string" then
+		return Enum.KeyCode[value] or Enum.KeyCode.Q
+	end
+	return Enum.KeyCode.Q
+end
+
+local function aimEngaged()
+	if not flag("Aimlock", false) then
+		return false
+	end
+	if flag("AimActivation", "Hold") == "Toggle" then
+		return aimState.toggled
+	end
+	return aimState.holding
+end
+
+local function aimBoneName()
+	return AIM_BONES[flag("AimBone", "Head")] or "Head"
+end
+
+local function aimRange()
+	return number(flag("AimRange", 500), 500)
+end
+
+local function aimFovPixels()
+	return number(flag("AimFov", 120), 120)
+end
+
+local function aimFocusPart(player)
+	local character = player and player.Character
+	if not character then
+		return nil
+	end
+	local part = character:FindFirstChild(aimBoneName())
+		or character:FindFirstChild("Head")
+		or character:FindFirstChild("HumanoidRootPart")
+	return part
+end
+
+local function aimFilterAllows(player)
+	local filter = flag("AimFilter", "Everyone")
+	if filter == "Everyone" then
+		return true
+	end
+	local infected = player:GetAttribute("Infected") == true
+	if filter == "Infected only" then
+		return infected
+	end
+	return not infected
+end
+
+-- Raycast between the camera and the target; a wall or a car cancels the lock.
+local function aimVisible(part)
+	if not flag("AimWallCheck", false) then
+		return true
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return false
+	end
+	local params = RaycastParams.new()
+	local ok = pcall(function()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+	end)
+	if not ok then
+		pcall(function()
+			params.FilterType = Enum.RaycastFilterType.Blacklist
+		end)
+	end
+	local ignored = { part.Parent }
+	local character = LocalPlayer.Character
+	if character then
+		ignored[#ignored + 1] = character
+	end
+	params.FilterDescendantsInstances = ignored
+	local result = workspace:Raycast(camera.CFrame.Position, part.Position - camera.CFrame.Position, params)
+	return result == nil
+end
+
+local function aimedAngle(position)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local offset = position - camera.CFrame.Position
+	if offset.Magnitude < 0.5 then
+		return nil
+	end
+	return math.deg(math.acos(math.clamp(camera.CFrame.LookVector:Dot(offset.Unit), -1, 1)))
+end
+
+-- Own method: candidates scored by pixels from the crosshair, not by angle.
+local function fovCandidates()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return {}
+	end
+	local viewport = camera.ViewportSize
+	local center = Vector2.new(viewport.X / 2, viewport.Y / 2)
+	local fov = aimFovPixels()
+	local range = aimRange()
+	local origin = camera.CFrame.Position
+	local list = {}
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and aimFilterAllows(player) then
+			local part = aimFocusPart(player)
+			local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+			if part and humanoid and humanoid.Health > 0 then
+				local distance = (part.Position - origin).Magnitude
+				if distance <= range and aimVisible(part) then
+					local point = camera:WorldToViewportPoint(part.Position)
+					if point.Z > 0 then
+						local offset = Vector2.new(point.X, point.Y) - center
+						local screen = offset.Magnitude
+						if screen <= fov then
+							list[#list + 1] = { player = player, part = part, distance = distance, screen = screen }
+						end
+					end
+				end
+			end
+		end
+	end
+	return list
+end
+
+-- BlockSpin method: front-first sort by angle, distance as the tiebreak.
+local function angleCandidates()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return {}
+	end
+	local origin = camera.CFrame.Position
+	local range = aimRange()
+	local list = {}
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and aimFilterAllows(player) then
+			local part = aimFocusPart(player)
+			local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+			if part and humanoid and humanoid.Health > 0 then
+				local distance = (part.Position - origin).Magnitude
+				if distance <= range then
+					local angle = aimedAngle(part.Position)
+					if angle then
+						list[#list + 1] = { player = player, part = part, angle = angle, distance = distance }
+					end
+				end
+			end
+		end
+	end
+
+	if flag("AimForceLock", false) then
+		table.sort(list, function(a, b)
+			return a.distance < b.distance
+		end)
+		return list
+	end
+
+	table.sort(list, function(a, b)
+		local aFront = a.angle <= 60
+		local bFront = b.angle <= 60
+		if aFront ~= bFront then
+			return aFront
+		end
+		if aFront then
+			return a.angle < b.angle
+		end
+		return a.distance < b.distance
+	end)
+	return list
+end
+
+local function clearAimIndicator()
+	if aimState.indicator then
+		pcall(function()
+			aimState.indicator:Destroy()
+		end)
+		aimState.indicator = nil
+	end
+end
+
+local function buildAimIndicator(part)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ESP_Lock"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(56, 56)
+	billboard.StudsOffset = Vector3.new(0, 0.6, 0)
+
+	local ring = Instance.new("Frame")
+	ring.Name = "Ring"
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Position = UDim2.fromScale(0.5, 0.5)
+	ring.Size = UDim2.fromOffset(30, 30)
+	ring.BackgroundTransparency = 1
+	ring.Parent = billboard
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = ring
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = flag("InfectedColor", COLOR_INFECTED)
+	stroke.Thickness = 2
+	stroke.Transparency = 0.05
+	stroke.Parent = ring
+
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromScale(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(4, 4)
+	dot.BackgroundColor3 = flag("InfectedColor", COLOR_INFECTED)
+	dot.BorderSizePixel = 0
+	dot.Parent = billboard
+
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = dot
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard
+end
+
+local function updateAimIndicator(part)
+	if not flag("AimIndicator", true) then
+		clearAimIndicator()
+		return
+	end
+	local indicator = aimState.indicator
+	if not indicator or indicator.Adornee ~= part or not indicator.Parent then
+		clearAimIndicator()
+		aimState.indicator = buildAimIndicator(part)
+	end
+end
+
+local function buildAimCircle()
+	if aimState.circle then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RobScriptIL_Aim"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 70
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Fov"
+	frame.AnchorPoint = Vector2.new(0.5, 0.5)
+	frame.Position = UDim2.fromScale(0.5, 0.5)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Name = "Ring"
+	stroke.Color = flag("Accent", THEME.Accent)
+	stroke.Thickness = 1
+	stroke.Transparency = 0.35
+	stroke.Parent = frame
+
+	local ok = pcall(function()
+		gui.Parent = hudParent()
+	end)
+	if not ok or not gui.Parent then
+		local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		if playerGui then
+			gui.Parent = playerGui
+		end
+	end
+
+	aimState.circle = gui
+	aimState.circleFrame = frame
+end
+
+local function updateAimCircle(visible)
+	if not flag("AimCircle", true) then
+		visible = false
+	end
+	if not visible then
+		if aimState.circle then
+			aimState.circle.Enabled = false
+		end
+		return
+	end
+	buildAimCircle()
+	if not aimState.circleFrame then
+		return
+	end
+	if aimState.circle then
+		aimState.circle.Enabled = true
+	end
+	local fov = aimFovPixels()
+	aimState.circleFrame.Size = UDim2.fromOffset(fov * 2, fov * 2)
+end
+
+local function releaseAim()
+	aimState.player = nil
+	aimState.part = nil
+	clearAimIndicator()
+end
+
+local function applyCameraLock(deltaTime, part, snap)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local desired = CFrame.lookAt(camera.CFrame.Position, part.Position)
+	if snap then
+		camera.CFrame = desired
+		return
+	end
+	local speed = number(flag("AimSmoothing", 12), 12)
+	if speed >= 20 then
+		camera.CFrame = desired
+		return
+	end
+	local alpha = 1 - math.exp(-(deltaTime or 0.016) * speed)
+	camera.CFrame = camera.CFrame:Lerp(desired, alpha)
+end
+
+local function applyBodyTurn(deltaTime, part)
+	if not flag("AimTurnBody", false) then
+		return
+	end
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	local flat = Vector3.new(part.Position.X, root.Position.Y, part.Position.Z)
+	local alpha = 1 - math.exp(-(deltaTime or 0.016) * 12)
+	root.CFrame = root.CFrame:Lerp(CFrame.lookAt(root.Position, flat), alpha)
+end
+
+-- The lock is kept by angle, not by pixels: with slow smoothing the camera lags
+-- behind the target, and a pixel test would drop the lock mid-turn.
+local function keepAimTarget()
+	local player = aimState.player
+	if not player or not aimFilterAllows(player) then
+		return nil
+	end
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local part = aimFocusPart(player)
+	if not character or not humanoid or humanoid.Health <= 0 or not part then
+		return nil
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local offset = part.Position - camera.CFrame.Position
+	if offset.Magnitude > aimRange() or not aimVisible(part) then
+		return nil
+	end
+	local angle = math.deg(math.acos(math.clamp(camera.CFrame.LookVector:Dot(offset.Unit), -1, 1)))
+	if angle > 45 then
+		return nil
+	end
+	return part
+end
+
+local function updateFovAim(deltaTime)
+	local kept = keepAimTarget()
+	if kept then
+		aimState.part = kept
+		applyCameraLock(deltaTime, kept, false)
+		updateAimIndicator(kept)
+		return
+	end
+
+	local list = fovCandidates()
+	if #list == 0 then
+		releaseAim()
+		return
+	end
+
+	table.sort(list, function(a, b)
+		return a.screen < b.screen
+	end)
+	local best = list[1]
+	aimState.player = best.player
+	aimState.part = best.part
+	applyCameraLock(deltaTime, best.part, false)
+	updateAimIndicator(best.part)
+end
+
+local function updateBlockSpinAim(deltaTime)
+	local force = flag("AimForceLock", false)
+	local list = angleCandidates()
+	if #list == 0 then
+		releaseAim()
+		return
+	end
+
+	local chosen = nil
+	if aimState.player then
+		for _, entry in ipairs(list) do
+			if entry.player == aimState.player then
+				chosen = entry
+				break
+			end
+		end
+	end
+
+	-- Force mode never lets go on its own: if the body disappears or runs off,
+	-- the next closest one is grabbed instead of dropping the lock.
+	if not chosen then
+		if aimState.player and not force then
+			releaseAim()
+		end
+		chosen = list[1]
+	end
+
+	if chosen.distance > aimRange() * 1.4 then
+		if force then
+			chosen = list[1]
+		else
+			releaseAim()
+			return
+		end
+	end
+
+	aimState.player = chosen.player
+	aimState.part = chosen.part
+	applyCameraLock(deltaTime, chosen.part, force)
+	applyBodyTurn(deltaTime, chosen.part)
+	updateAimIndicator(chosen.part)
+end
+
+local function updateAim(deltaTime)
+	if not running then
+		return
+	end
+	if not aimEngaged() then
+		if aimState.part then
+			releaseAim()
+		end
+		updateAimCircle(false)
+		return
+	end
+	updateAimCircle(true)
+	if flag("AimMethod", AIM_METHOD_FOV) == AIM_METHOD_BLOCKSPIN then
+		updateBlockSpinAim(deltaTime)
+	else
+		updateFovAim(deltaTime)
+	end
+end
+
+local function aimCycle(direction)
+	local method = flag("AimMethod", AIM_METHOD_FOV)
+	local list = method == AIM_METHOD_BLOCKSPIN and angleCandidates() or fovCandidates()
+	if #list == 0 then
+		return
+	end
+	local index = 1
+	for i, entry in ipairs(list) do
+		if entry.player == aimState.player then
+			index = i
+			break
+		end
+	end
+	index = index + (direction or 1)
+	if index > #list then
+		index = 1
+	end
+	if index < 1 then
+		index = #list
+	end
+	aimState.player = list[index].player
+	aimState.part = list[index].part
+end
+
+local function aimStatus()
+	if not flag("Aimlock", false) then
+		return nil
+	end
+	if not aimState.part or not aimState.player then
+		return nil
+	end
+	local camera = workspace.CurrentCamera
+	local distance = camera and (aimState.part.Position - camera.CFrame.Position).Magnitude or 0
+	return aimState.player.Name, distance
+end
+
 ----- Interface -----
 
 local Window = Airflow:CreateWindow({
@@ -2074,6 +2634,139 @@ WorldBox:CreateToggle({
 })
 WorldBox:CreateToggle({ Name = "Chams", Flag = "AirdropChams", CurrentValue = true, DependsOn = "AirdropESP" })
 
+----- Combat tab -----
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local LockBox = CombatTab:CreateGroupbox({ Name = "Lock-on", Side = "Left" })
+local AimTargetBox = CombatTab:CreateGroupbox({ Name = "Target", Side = "Right" })
+
+LockBox:CreateToggle({
+	Name = "Aimlock",
+	Desc = "Locks the player nearest to the crosshair",
+	Flag = "Aimlock",
+	CurrentValue = false,
+})
+LockBox:CreateDropdown({
+	Name = "Method",
+	Desc = "Camera FOV is this hub's own; BlockSpin lock is ported from BlockSpin",
+	Options = { AIM_METHOD_FOV, AIM_METHOD_BLOCKSPIN },
+	CurrentOption = AIM_METHOD_FOV,
+	Flag = "AimMethod",
+	DependsOn = "Aimlock",
+})
+LockBox:CreateDropdown({
+	Name = "Activation",
+	Options = { "Hold", "Toggle" },
+	CurrentOption = "Hold",
+	Flag = "AimActivation",
+	DependsOn = "Aimlock",
+})
+LockBox:CreateKeybind({
+	Name = "Aim key",
+	Desc = "Press and hold, or press once in toggle mode",
+	CurrentKeybind = Enum.KeyCode.Q,
+	Flag = "AimKey",
+	DependsOn = "Aimlock",
+})
+LockBox:CreateDropdown({
+	Name = "Aim bone",
+	Options = { "Head", "Torso", "Root part" },
+	CurrentOption = "Head",
+	Flag = "AimBone",
+	DependsOn = "Aimlock",
+})
+LockBox:CreateSlider({
+	Name = "FOV",
+	Range = { 40, 400 },
+	Increment = 10,
+	Suffix = " px",
+	CurrentValue = 120,
+	Flag = "AimFov",
+	DependsOn = "Aimlock",
+})
+LockBox:CreateSlider({
+	Name = "Aim range",
+	Range = { 50, 1500 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 500,
+	Flag = "AimRange",
+	DependsOn = "Aimlock",
+})
+LockBox:CreateSlider({
+	Name = "Smoothing",
+	Range = { 1, 20 },
+	Increment = 1,
+	CurrentValue = 12,
+	Flag = "AimSmoothing",
+	Desc = "20 snaps the camera instantly",
+	DependsOn = "Aimlock",
+})
+
+AimTargetBox:CreateDropdown({
+	Name = "Target filter",
+	Options = { "Everyone", "Infected only", "Clean only" },
+	CurrentOption = "Everyone",
+	Flag = "AimFilter",
+	DependsOn = "Aimlock",
+})
+AimTargetBox:CreateToggle({
+	Name = "Wall check",
+	Desc = "Drops the lock behind walls and cars",
+	Flag = "AimWallCheck",
+	CurrentValue = false,
+	DependsOn = "Aimlock",
+})
+AimTargetBox:CreateToggle({
+	Name = "Force lock",
+	Desc = "BlockSpin mode: snaps the camera and re-grabs the closest body",
+	Flag = "AimForceLock",
+	CurrentValue = false,
+	DependsOn = { Flag = "AimMethod", Value = AIM_METHOD_BLOCKSPIN },
+})
+AimTargetBox:CreateToggle({
+	Name = "Turn body",
+	Flag = "AimTurnBody",
+	CurrentValue = false,
+	DependsOn = "Aimlock",
+})
+AimTargetBox:CreateToggle({
+	Name = "Indicator",
+	Flag = "AimIndicator",
+	CurrentValue = true,
+	DependsOn = "Aimlock",
+})
+AimTargetBox:CreateToggle({
+	Name = "FOV circle",
+	Flag = "AimCircle",
+	CurrentValue = true,
+	DependsOn = "Aimlock",
+})
+AimTargetBox:CreateToggle({
+	Name = "Wheel switches target",
+	Flag = "AimWheel",
+	CurrentValue = true,
+	DependsOn = "Aimlock",
+})
+AimTargetBox:CreateDivider()
+AimTargetBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.3,
+	Update = function()
+		local name, distance = aimStatus()
+		if not name then
+			return string.format("<Muted>%s</Muted>", T("not locked"))
+		end
+		return string.format("<Accent>%s</Accent> <Muted>%s</Muted>", escapeRichText(name), formatDistance(distance))
+	end,
+})
+AimTargetBox:CreateParagraph({
+	Title = "How to use",
+	Content = "Enable Aimlock, bind a key and hold it while shooting. In toggle mode the same key turns the lock on and off. The wheel switches the target while armed; the lock drops by itself when the target dies or leaves the range.",
+})
+
 ----- Style tab -----
 
 local StyleTab = Window:CreateTab({ Name = "Style", Icon = "palette" })
@@ -2248,6 +2941,7 @@ SettingsTab:CreateParagraph({
 
 tabs.Status = StatusTab
 tabs.Visuals = VisualsTab
+tabs.Combat = CombatTab
 tabs.Style = StyleTab
 tabs.Map = MapTab
 tabs.Settings = SettingsTab
@@ -2309,11 +3003,59 @@ local inputConnection = UserInputService.InputBegan:Connect(function(input, proc
 			setFlag("CorpseESP", false)
 			setFlag("AirdropESP", false)
 			setFlag("HudEnabled", false)
+			setFlag("Aimlock", false)
 			clearVisuals()
+			releaseAim()
+			updateAimCircle(false)
 			if hud.gui then
 				hud.gui.Enabled = false
 			end
 		end)
+	elseif input.KeyCode == aimKeyName() then
+		pcall(function()
+			if not flag("Aimlock", false) then
+				return
+			end
+			if flag("AimActivation", "Hold") == "Toggle" then
+				aimState.toggled = not aimState.toggled
+			else
+				aimState.holding = true
+			end
+		end)
+	end
+end)
+
+local aimReleaseConnection = UserInputService.InputEnded:Connect(function(input)
+	if not running then
+		return
+	end
+	if input.KeyCode == aimKeyName() and flag("AimActivation", "Hold") == "Hold" then
+		aimState.holding = false
+	end
+end)
+
+local aimWheelConnection = UserInputService.InputChanged:Connect(function(input)
+	if not running or not flag("AimWheel", true) then
+		return
+	end
+	if input.UserInputType ~= Enum.UserInputType.MouseWheel then
+		return
+	end
+	if not aimEngaged() then
+		return
+	end
+	pcall(aimCycle, input.Position.Z > 0 and 1 or -1)
+end)
+
+-- RenderStepped, not Heartbeat: the camera has to be written after the default
+-- camera script, otherwise the game overwrites the lock every frame.
+local aimConnection = RunService.RenderStepped:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	local ok, err = pcall(updateAim, deltaTime)
+	if not ok then
+		releaseAim()
 	end
 end)
 
@@ -2330,9 +3072,26 @@ local function destroy()
 	pcall(function()
 		inputConnection:Disconnect()
 	end)
+	pcall(function()
+		aimReleaseConnection:Disconnect()
+	end)
+	pcall(function()
+		aimWheelConnection:Disconnect()
+	end)
+	pcall(function()
+		aimConnection:Disconnect()
+	end)
 	clearVisuals()
 	destroyHud()
 	destroyMapLayer()
+	pcall(releaseAim)
+	if aimState.circle then
+		pcall(function()
+			aimState.circle:Destroy()
+		end)
+		aimState.circle = nil
+		aimState.circleFrame = nil
+	end
 	pcall(function()
 		Window:Destroy()
 	end)
@@ -2345,7 +3104,7 @@ end
 ----- Public interface -----
 
 getgenv().RobScriptIL = {
-	Version = "1.1",
+	Version = "1.2",
 	Actions = {
 		Refresh = collect,
 		Clear = clearVisuals,
@@ -2458,6 +3217,33 @@ getgenv().RobScriptIL = {
 			spanZ = MAP.spanZ,
 			northIsNegativeZ = MAP.northIsNegativeZ,
 		}
+	end,
+	GetAim = function()
+		local name, distance = aimStatus()
+		return {
+			enabled = flag("Aimlock", false),
+			engaged = aimEngaged(),
+			method = flag("AimMethod", AIM_METHOD_FOV),
+			activation = flag("AimActivation", "Hold"),
+			bone = flag("AimBone", "Head"),
+			target = name,
+			distance = distance,
+			part = aimState.part and aimState.part:GetFullName() or nil,
+		}
+	end,
+	SetAimPressed = function(pressed)
+		if flag("AimActivation", "Hold") == "Toggle" then
+			aimState.toggled = pressed == true
+		else
+			aimState.holding = pressed == true
+		end
+		return true
+	end,
+	ReleaseAim = function()
+		aimState.holding = false
+		aimState.toggled = false
+		pcall(releaseAim)
+		pcall(updateAimCircle, false)
 	end,
 	Uptime = function()
 		return os.clock() - sessionStart
