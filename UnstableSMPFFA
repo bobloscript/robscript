@@ -1,0 +1,4891 @@
+--!nonstrict
+--[[
+	RobScript.com - Unstable SMP
+
+	A client-side hub for "Unstable SMP" (Minecraft-style kit PvP).
+
+	Features: kill aura, auto mace smash, wind charge movement, pearls and web,
+	camera lock, triggerbot, ESP, hitboxes and the usual movement set.
+
+	UI: Robly Airflow (https://github.com/bobloscript/Robly_Airflow) with the
+	Robscript theme. Press RightControl to hide the menu.
+
+	Usage: loadstring(game:HttpGet("<raw url>"))()
+]]
+
+----- Executor environment -----
+local Environment = (typeof(getgenv) == "function" and getgenv()) or _G
+
+local IdentifyExecutor = (typeof(identifyexecutor) == "function" and identifyexecutor) or function()
+	return "Unknown"
+end
+
+-- Stop a previous copy of this hub before a new one starts.
+if typeof(Environment.UnstableSMPShutdown) == "function" then
+	pcall(Environment.UnstableSMPShutdown)
+	Environment.UnstableSMPShutdown = nil
+end
+if Environment.UnstableSMPWindow then
+	pcall(function()
+		Environment.UnstableSMPWindow:Destroy()
+	end)
+	Environment.UnstableSMPWindow = nil
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+getfenv().PP_SCRAMBLE_NUM = function(...) return ... end
+getfenv().PP_SCRAMBLE_STR = function(...) return ... end
+getfenv().PP_SCRAMBLE_RE_NUM = function(...) return ... end
+
+local Unstable = { running = false }
+
+-- Filled in by the menu: Settings key -> control, so values can move both ways.
+local Airflow
+local Window
+local FLAGS = {}
+local BINDS = {}
+local buildHub
+local shutdown
+
+local safeRef = cloneref or function(instance)
+	return instance
+end
+
+-- Services.
+local playersService = safeRef(game:GetService("Players"))
+local runService = safeRef(game:GetService("RunService"))
+local userInputService = safeRef(game:GetService("UserInputService"))
+local tweenService = safeRef(game:GetService("TweenService"))
+local teleportService = safeRef(game:GetService("TeleportService"))
+local httpService = safeRef(game:GetService("HttpService"))
+local guiService = safeRef(game:GetService("GuiService"))
+local textService = safeRef(game:GetService("TextService"))
+local lighting = safeRef(game:GetService("Lighting"))
+local virtualUser = safeRef(game:GetService("VirtualUser"))
+
+-- Not every environment exposes VirtualInputManager.
+local vimLoaded, vimService = pcall(game.GetService, game, "VirtualInputManager")
+local virtualInputManager = vimLoaded and safeRef(vimService) or nil
+
+-- Constants.
+-- Constants live in one table so they don't use up the main chunk's 200 local slots.
+local Const = {}
+Const.HUB_NAME = "RobScript.com - Unstable SMP"
+Const.VERSION = "1.0.0"
+Const.CONFIG_FOLDER = "RobScriptUnstableSMP"
+Const.CONFIG_PATH = "RobScriptUnstableSMP/config.json"
+
+-- Robscript palette, shared with the other RobScript.com hubs.
+Const.THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+Const.ACCENT = Const.THEME.Accent
+Const.ACCENT_ALT = Color3.fromHex("#FF7AA8")
+Const.BACKGROUND = Const.THEME.Background
+Const.CARD = Const.THEME.Surface
+Const.TRACK = Const.THEME.Surface3
+Const.TEXT = Const.THEME.Text
+Const.SUBTEXT = Const.THEME.Muted
+Const.WHITE = Color3.new(1, 1, 1)
+Const.FONT = Enum.Font.GothamBold
+Const.BODY_FONT = Enum.Font.GothamMedium
+Const.TAB_NAMES = { "Combat", "Items", "Assist", "Move", "World", "Misc" }
+Const.CAMERA_BIND = "UnstableCameraFov"
+Const.AIM_BIND = "UnstableAimbot"
+Const.AURA_BIND = "UnstableAuraCamera"
+Const.LOOK_BIND = "UnstableLookOverride"
+Const.AIM_PART = "Head"
+Const.TRIGGER_DISTANCE = 1000
+Const.HITBOX_TRANSPARENCY = 0.8
+Const.CONTROL_RESCAN = 3
+Const.CLICK_HOLD = 0.06
+Const.SLOT_SWITCH_DELAY = 0.1
+Const.EQUIP_TIMEOUT = 0.35
+Const.LOOK_SETTLE_FRAMES = 2
+Const.EAT_DURATION = 1.8
+Const.GAPPLE_COOLDOWN = 4
+Const.WIND_COOLDOWN = 2.5
+Const.WIND_THROW_DELAY = 0.06
+Const.WIND_JUMP_TIMEOUT = 0.3
+Const.MACE_LEAD = 0.08
+Const.AIR_BOOST_APEX = 3
+Const.AIR_BOOST_TIMEOUT = 1.5
+Const.DASH_TILT = 2.6
+Const.AUTO_JUMP_PROBE = 2.4
+Const.SAFE_WALK_AHEAD = 2
+Const.SAFE_WALK_DROP = 6
+Const.WIND_JUMP_AFTER_THROW = 0.05
+Const.WIND_ORDERS = { "Throw, then Jump", "Jump, then Throw" }
+Const.MACE_RETRY = 0.2
+Const.MACE_LANDING_LOOKAHEAD = 0.15
+Const.CRIT_TIMEOUT = 0.6
+Const.ESCAPE_COOLDOWN = 6
+Const.ESCAPE_PITCH = math.rad(35)
+Const.ESCAPE_PROBE = 30
+Const.ESCAPE_ANGLES = { 0, 35, -35, 70, -70 }
+Const.PEARL_CHASE_COOLDOWN = 8
+Const.PEARL_CHASE_MAX = 60
+Const.PEARL_ARC = 0.15
+Const.WEB_COOLDOWN = 5
+Const.HIT_WINDOW = 0.25
+Const.VOID_DROP = 60
+Const.SPIDER_SPEED = 22
+Const.KILL_CREDIT_TIME = 4
+Const.REMOTE_LOG_TIME = 6
+Const.REMOTE_LOG_CALLS = 3
+Const.ESP_TEXT_RATE = 0.1
+Const.WATERMARK_RATE = 0.5
+Const.AUTOSAVE_DELAY = 1
+Const.AURA_AIM_TOLERANCE = math.rad(12)
+Const.AURA_AIM_TIMEOUT = 0.35
+Const.SLOT_SCAN_RATE = 2
+Const.ITEM_SCAN_DELAY = 0.25
+Const.ITEM_RESCAN_DELAY = 2.5
+Const.LAUNCH_CHECK_TIME = 0.6
+Const.LAUNCH_MIN_RISE = 12
+-- Literal constants are folded by the compiler, so they don't use up local registers.
+Const.SEQUENCE_ABORT = "UnstableSequenceAbort"
+Const.SEQUENCE_TIMEOUT = 8
+Const.HEAL_SETTLE = 1.5
+Const.GAPPLE_REGEN_TIME = 8
+Const.KIT_CHANGE_SLOTS = 3
+Const.KIT_RESCAN_COOLDOWN = 10
+Const.SCAN_BACKOFF = 7
+Const.SMASH_TAP_DEBOUNCE = 0.35
+Const.CHAIN_WINDOW = 1.5
+Const.WIND_AIM_TOLERANCE = 0.35
+Const.WIND_AIM_WAIT = 0.25
+Const.ROUTE_PROBE_TIME = 0.5
+Const.ROUTE_PROBE_RANGE = 4.5
+Const.ROUTE_MISS_LIMIT = 6
+Const.TOAST_REPEAT = 1.5
+Const.FLY_JUMP_HOLD = 0.2
+Const.INPUT_MODES = { "Auto", "Button Signals", "Virtual Click", "Tool Activate", "Global Touch", "Real Touch" }
+Const.CAMERA_MODES = { "Only During SMASH", "Flick On Hit", "Always Follow" }
+Const.SLOT_KEYWORDS = {
+	swordSlot = { "sword" },
+	maceSlot = { "mace" },
+	windSlot = { "wind" },
+	gappleSlot = { "golden", "gapple", "apple" },
+	pearlSlot = { "pearl" },
+	webSlot = { "cobweb", "web" },
+}
+Const.DATA2CODE_URL = "https://raw.githubusercontent.com/Awakenchan/GcViewerV2/refs/heads/main/Utility/Data2Code%40Amity.lua"
+Const.CONTROL_SIGNALS = { "InputBegan", "InputEnded", "MouseButton1Down", "MouseButton1Up", "MouseButton1Click", "Activated" }
+Const.SLOT_KEYS = {
+	Enum.KeyCode.One,
+	Enum.KeyCode.Two,
+	Enum.KeyCode.Three,
+	Enum.KeyCode.Four,
+	Enum.KeyCode.Five,
+	Enum.KeyCode.Six,
+	Enum.KeyCode.Seven,
+	Enum.KeyCode.Eight,
+	Enum.KeyCode.Nine,
+}
+Const.MODULES = {
+	{ "killAura", "Kill Aura" },
+	{ "autoMace", "Auto Mace" },
+	{ "windLaunch", "Wind Launch" },
+	{ "autoGapple", "Auto Eat" },
+	{ "pearlEscape", "Pearl Escape" },
+	{ "windEscape", "Wind Escape" },
+	{ "pearlChase", "Pearl Chase" },
+	{ "webTrap", "Web Trap" },
+	{ "criticals", "Criticals" },
+	{ "targetStrafe", "Target Strafe" },
+	{ "antiKnockback", "Velocity" },
+	{ "jumpReset", "Jump Reset" },
+	{ "aimbot", "Camera Lock" },
+	{ "triggerbot", "Triggerbot" },
+	{ "hitboxExpander", "Hitboxes" },
+	{ "esp", "ESP" },
+	{ "tracers", "Tracers" },
+	{ "speedBoost", "Speed" },
+	{ "highJump", "High Jump" },
+	{ "airJump", "Air Jump" },
+	{ "spider", "Spider" },
+	{ "antiVoid", "Anti Void" },
+	{ "fly", "Fly" },
+	{ "autoJump", "Auto Jump" },
+	{ "bunnyHop", "Bunny Hop" },
+	{ "safeWalk", "Safe Walk" },
+	{ "longJump", "Long Jump" },
+	{ "airControl", "Air Control" },
+	{ "maceDive", "Mace Dive" },
+	{ "smashChain", "Smash Chain" },
+	{ "smashAssist", "Smash Assist" },
+	{ "fullbright", "Fullbright" },
+	{ "noFog", "No Fog" },
+}
+Const.MODULE_LABELS = {}
+for _, module in ipairs(Const.MODULES) do
+	Const.MODULE_LABELS[module[1]] = module[2]
+end
+Const.DUMMY_SIGNAL = {
+	Connect = function()
+		return { Disconnect = function() end }
+	end,
+}
+Const.FULLBRIGHT = {
+	Brightness = 2,
+	ClockTime = 14,
+	GlobalShadows = false,
+	Ambient = Color3.fromRGB(180, 180, 180),
+	OutdoorAmbient = Color3.fromRGB(180, 180, 180),
+}
+
+-- Settings.
+local Settings = {
+	fullbright = false,
+	noFog = false,
+	cameraFovEnabled = false,
+	cameraFov = 90,
+	antiAfk = true,
+	killAura = false,
+	killAuraRange = 10,
+	killAuraDelay = 0.1,
+	killAuraFace = true,
+	targetNpcs = true,
+	auraDragSpeed = 8,
+	auraAimHead = false,
+	auraSwitch = false,
+	auraFocusLowest = false,
+	criticals = false,
+	autoWeapon = false,
+	targetStrafe = false,
+	strafeRadius = 6,
+	prediction = 0,
+	jumpReset = false,
+	antiKnockback = false,
+	knockbackKeep = 0,
+	pearlEscape = false,
+	windEscape = false,
+	escapeHealth = 30,
+	pearlChase = false,
+	webTrap = false,
+	autoMace = false,
+	maceMinFall = 8,
+	maceSteer = true,
+	maceHeadLock = true,
+	smashRadius = 24,
+	smashBurst = true,
+	smashFollowUp = true,
+	headLockSpeed = 45,
+	windOrder = 1,
+	windLaunch = false,
+	autoGapple = false,
+	gappleHealth = 50,
+	swordSlot = 1,
+	maceSlot = 2,
+	windSlot = 7,
+	gappleSlot = 8,
+	pearlSlot = 9,
+	webSlot = 6,
+	aimbot = false,
+	aimbotHold = not (userInputService.TouchEnabled and not userInputService.MouseEnabled),
+	showFov = true,
+	aimbotFov = 120,
+	aimbotSmoothness = 3,
+	triggerbot = false,
+	hitboxExpander = false,
+	hitboxSize = 8,
+	esp = false,
+	teamCheck = false,
+	wallCheck = true,
+	tracers = false,
+	targetHud = true,
+	reachCircle = false,
+	enemyAlert = false,
+	alertRange = 40,
+	lowHealthWarning = true,
+	speedBoost = false,
+	speedAmount = 8,
+	highJump = false,
+	highJumpPower = 70,
+	airJump = false,
+	spider = false,
+	fly = false,
+	flySpeed = 50,
+	autoJump = false,
+	bunnyHop = false,
+	safeWalk = false,
+	longJump = false,
+	longJumpPower = 40,
+	airControl = false,
+	quickButtons = userInputService.TouchEnabled,
+	airBoostCharges = 0,
+	maceDive = false,
+	diveSpeed = 70,
+	fallMeter = true,
+	antiVoid = false,
+	arraylist = true,
+	watermark = true,
+	autoSave = true,
+	inputMode = 1,
+	autoSlots = true,
+	cameraSync = true,
+	cameraMode = 1,
+	smashButton = userInputService.TouchEnabled,
+	debugInfo = true,
+	uiSounds = true,
+	swipeAim = true,
+	smashChain = false,
+	smashAssist = false,
+	buttonPositions = {},
+	binds = {},
+	testedRoutes = {},
+}
+
+-- State.
+local localPlayer = playersService.LocalPlayer
+local currentCamera = workspace.CurrentCamera
+local guiRoot = gethui and gethui() or safeRef(game:GetService("CoreGui"))
+local connections = {}
+local animators = {}
+local lightingCache = {}
+local atmosphereCache = {}
+local hitboxCache = {}
+local espObjects = {}
+local npcModels = {}
+local controlCache = {}
+local controlScans = {}
+local fakeInputs = {}
+local remoteLog = {}
+local recentHits = {}
+local alerted = {}
+local tracerFrames = {}
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+raycastParams.IgnoreWater = true
+local State = {
+	open = false,
+	uiScale = 1,
+	layoutOrder = 0,
+	originalCameraFov = nil,
+	aimTarget = nil,
+	teamsMatter = false,
+	teamCheckedAt = -math.huge,
+	lastSwing = 0,
+	auraIndex = 0,
+	auraRotate = false,
+	maceFalling = false,
+	comboSequence = false,
+	smashFollow = nil,
+	maceStepAt = nil,
+	auraTarget = nil,
+	auraEngaged = false,
+	critJumpAt = -math.huge,
+	lastEscape = 0,
+	lastChase = 0,
+	lastWeb = 0,
+	lastHealth = nil,
+	hitAt = -math.huge,
+	wasJumping = false,
+	safeCFrame = nil,
+	kills = 0,
+	lastGapple = 0,
+	lastWind = 0,
+	fallPeak = nil,
+	maceArmed = false,
+	maceSwung = false,
+	steerDir = nil,
+	lookFn = nil,
+	currentSlot = nil,
+	busy = false,
+	logging = false,
+	namecallHooked = false,
+	hotbarSlots = nil,
+	hotbarScan = -math.huge,
+	data2Code = nil,
+	espTextAt = 0,
+	fps = 60,
+	fpsFrames = 0,
+	fpsTime = 0,
+	listening = nil,
+	saveToken = 0,
+	cameraDriver = nil,
+	calib = nil,
+	calibBuiltAt = -math.huge,
+	calibNotified = false,
+	cameraWrittenAt = -math.huge,
+	cameraDrivenAt = -math.huge,
+	auraAimTarget = nil,
+	auraAimSince = 0,
+	slotScanAt = -math.huge,
+	lastDispatch = {},
+	badChannels = {},
+	itemLabel = nil,
+	comboUntil = 0,
+	maceTarget = nil,
+	maceSwungAt = 0,
+	launchWarnedAt = -math.huge,
+	hotbarNames = {},
+	lastTargetCount = 0,
+	driveStartAt = 0,
+	driveStartError = 0,
+	seqId = 0,
+	seqCharacter = nil,
+	busySince = 0,
+	useHeld = false,
+	healAt = -math.huge,
+	missingItems = {},
+	hotbarIcons = nil,
+	kitCheckAt = -math.huge,
+	kitChangedAt = nil,
+	lastKitScan = -math.huge,
+	smashTapAt = -math.huge,
+	lastSmashAt = -math.huge,
+	hitProbe = nil,
+	routeMisses = 0,
+	routeIndex = 0,
+	routeLocked = false,
+	learnedRoute = nil,
+	forcedRoute = nil,
+	healthLabels = setmetatable({}, { __mode = "k" }),
+	aimMethod = "direct",
+	swipeFailed = false,
+	swipeVim = true,
+	fallbackAimAt = -math.huge,
+	fallbackStartAt = 0,
+	fallbackStartError = 0,
+	calibBackoff = 15,
+	hudRatio = nil,
+	jumpHeldAt = -math.huge,
+	lastToast = nil,
+	lastToastAt = -math.huge,
+}
+local hubGui, fovCircle, espFolder
+local targetHud, hudName, hudInfo, hudFill, healthVignette, reachRing
+local watermark, watermarkLabel, smashButton
+local dashButton, flyButton, fallLabel
+Const.UI_SOUND = "rbxasset://sounds/electronicpingshort.wav"
+Const.TOAST_TIME = 2.6
+Const.TOAST_LIMIT = 5
+
+---Track a connection for cleanup.
+local function track(connection)
+	table.insert(connections, connection)
+	return connection
+end
+
+---Run fn every frame while owner stays parented.
+local function addAnimator(owner, fn)
+	table.insert(animators, { owner = owner, fn = fn })
+end
+
+local function tween(instance, properties, duration, style, direction)
+	local info = TweenInfo.new(duration or 0.25, style or Enum.EasingStyle.Quint, direction or Enum.EasingDirection.Out)
+	local playing = tweenService:Create(instance, info, properties)
+	playing:Play()
+	return playing
+end
+
+---Create an instance with properties and children.
+local function create(className, properties, children)
+	local instance = Instance.new(className)
+	for key, value in pairs(properties or {}) do
+		if key ~= "Parent" then
+			instance[key] = value
+		end
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = instance
+	end
+	if properties and properties.Parent then
+		instance.Parent = properties.Parent
+	end
+	return instance
+end
+
+local function corner(radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius or 10) })
+end
+
+local function round()
+	return create("UICorner", { CornerRadius = UDim.new(1, 0) })
+end
+
+local function gradient(colors, rotation)
+	local keypoints = {}
+	for index, color in ipairs(colors) do
+		table.insert(keypoints, ColorSequenceKeypoint.new((index - 1) / (#colors - 1), color))
+	end
+	return create("UIGradient", { Color = ColorSequence.new(keypoints), Rotation = rotation or 0 })
+end
+
+---Stroke whose accent gradient spins forever.
+local function animatedStroke(thickness)
+	local stroke = create("UIStroke", { Color = Const.WHITE, Thickness = thickness or 1.5 })
+	local strokeGradient = gradient({ Const.ACCENT, Const.ACCENT_ALT, Const.BACKGROUND, Const.ACCENT })
+	strokeGradient.Parent = stroke
+	addAnimator(stroke, function(_, deltaTime)
+		strokeGradient.Rotation = (strokeGradient.Rotation + deltaTime * 60) % 360
+	end)
+	return stroke
+end
+
+local function label(properties)
+	properties.BackgroundTransparency = 1
+	properties.Font = properties.Font or Const.BODY_FONT
+	properties.TextColor3 = properties.TextColor3 or Const.TEXT
+	return create("TextLabel", properties)
+end
+
+---Short UI blip; pitch tells actions apart (higher = on / confirm).
+---@param pitch number?
+---@param volume number?
+local function playUiSound(pitch, volume)
+	if not (Settings.uiSounds and hubGui) then return end
+	local sound = create("Sound", { SoundId = Const.UI_SOUND, Volume = volume or 0.3, PlaybackSpeed = pitch or 1, Parent = hubGui })
+	sound:Play()
+	task.delay(2, function()
+		sound:Destroy()
+	end)
+end
+
+---Say something through the menu (console before the menu exists).
+---@param text string
+local function notify(text)
+	local message = tostring(text)
+	if Window and typeof(Window.Notify) == "function" then
+		local ok = pcall(function()
+			Window:Notify({ Title = "Unstable SMP", Content = message, Type = "Info" })
+		end)
+		if ok then return end
+	end
+	print("[RobScript] " .. message)
+end
+
+---FPS, ping and kills in the top right.
+local function updateWatermark()
+	if not watermark then return end
+	-- Buttons first: they must follow their toggles even with the watermark hidden.
+	if smashButton then
+		smashButton.Visible = Settings.smashButton
+	end
+	if dashButton then
+		dashButton.Visible = Settings.quickButtons
+		flyButton.Visible = Settings.quickButtons
+	end
+	watermark.Visible = Settings.watermark
+	if not Settings.watermark then return end
+
+	local okPing, ping = pcall(localPlayer.GetNetworkPing, localPlayer)
+	local text = string.format("RobScript  •  %d fps  •  %d ms  •  %d kills", math.floor(State.fps + 0.5), okPing and math.floor(ping * 1000) or 0, State.kills)
+	if Settings.debugInfo then
+		local label = State.itemLabel
+		local held = label and label.Parent and label.ContentText ~= "" and label.ContentText or "?"
+		text ..= string.format("\ncam %s  •  targets %d  •  hit %s  •  %s", State.cameraDriver and "synced" or State.aimMethod, State.lastTargetCount, State.lastDispatch.Attack or "-", held)
+	end
+	watermarkLabel.Text = text
+	watermark.Size = UDim2.fromOffset(watermarkLabel.TextBounds.X + 16, watermarkLabel.TextBounds.Y + 10)
+end
+
+---Push the current settings into the menu controls.
+local function refreshAll()
+	for key, entry in pairs(FLAGS) do
+		local value = Settings[key]
+		if entry.toFlag then
+			value = entry.toFlag(value)
+		end
+		if value ~= nil then
+			pcall(function()
+				entry.handle:Set(value, true)
+			end)
+		end
+	end
+end
+
+---Copy what the menu shows back into Settings (config load, manual edits).
+local function syncFromFlags()
+	pcall(function()
+		for key, entry in pairs(FLAGS) do
+			local value = entry.handle.Value
+			if value ~= nil then
+				if entry.fromFlag then
+					value = entry.fromFlag(value)
+				end
+				if value ~= nil then
+					Settings[key] = value
+				end
+			end
+		end
+		for action, handle in pairs(BINDS) do
+			local value = handle.Value
+			if typeof(value) == "EnumItem" then
+				value = value.Name
+			end
+			if type(value) == "string" and value ~= "" then
+				Settings.binds[action] = value
+			end
+		end
+	end)
+end
+
+---Kept for the call sites: the menu stores the values itself.
+local function markDirty() end
+
+---Apply fullbright / no fog and restore anything turned off.
+local function applyLighting()
+	local wanted = {}
+	if Settings.fullbright then
+		for property, value in pairs(Const.FULLBRIGHT) do
+			wanted[property] = value
+		end
+	end
+	if Settings.noFog then
+		wanted.FogEnd = 1e6
+		wanted.FogStart = 1e6
+	end
+
+	for property, value in pairs(wanted) do
+		if lightingCache[property] == nil then
+			lightingCache[property] = lighting[property]
+		end
+		if lighting[property] ~= value then
+			lighting[property] = value
+		end
+	end
+	for property, original in pairs(lightingCache) do
+		if wanted[property] == nil then
+			lighting[property] = original
+			lightingCache[property] = nil
+		end
+	end
+
+	-- Atmosphere ignores FogEnd, so it needs thinning separately.
+	if Settings.noFog then
+		for _, atmosphere in ipairs(lighting:GetChildren()) do
+			if not atmosphere:IsA("Atmosphere") then continue end
+			if not atmosphereCache[atmosphere] then
+				atmosphereCache[atmosphere] = { density = atmosphere.Density, haze = atmosphere.Haze }
+			end
+			atmosphere.Density = 0
+			atmosphere.Haze = 0
+		end
+		return
+	end
+
+	for atmosphere, original in pairs(atmosphereCache) do
+		if atmosphere.Parent then
+			atmosphere.Density = original.density
+			atmosphere.Haze = original.haze
+		end
+		atmosphereCache[atmosphere] = nil
+	end
+end
+
+---Runs after the camera step so game FOV changes don't override ours.
+local function updateCameraFov()
+	if not currentCamera then return end
+	if Settings.cameraFovEnabled then
+		State.originalCameraFov = State.originalCameraFov or currentCamera.FieldOfView
+		if currentCamera.FieldOfView ~= Settings.cameraFov then
+			currentCamera.FieldOfView = Settings.cameraFov
+		end
+	elseif State.originalCameraFov then
+		currentCamera.FieldOfView = State.originalCameraFov
+		State.originalCameraFov = nil
+	end
+end
+
+---Cursor position, or screen centre on touch-only devices.
+---@return Vector2
+local function getAimOrigin()
+	if userInputService.TouchEnabled and not userInputService.MouseEnabled then
+		return currentCamera.ViewportSize / 2
+	end
+	return userInputService:GetMouseLocation()
+end
+
+---Team check only applies when someone is actually on another team; FFA games often put everyone on one.
+---@return boolean
+local function teamsMatter()
+	local now = os.clock()
+	if now - State.teamCheckedAt < 1 then return State.teamsMatter end
+	State.teamCheckedAt = now
+
+	local myTeam = localPlayer.Team
+	State.teamsMatter = false
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if myTeam and player.Team ~= myTeam then
+			State.teamsMatter = true
+			break
+		end
+	end
+	return State.teamsMatter
+end
+
+---Health and max health from a Humanoid, or from Health / HP attributes for custom health systems.
+---@param model Model
+---@return number?, number?
+local function getModelHealth(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		return humanoid.Health, humanoid.MaxHealth
+	end
+	for _, name in ipairs({ "Health", "HP", "health" }) do
+		local value = model:GetAttribute(name)
+		if typeof(value) == "number" then
+			local maxValue = model:GetAttribute("MaxHealth") or model:GetAttribute("MaxHP")
+			return value, typeof(maxValue) == "number" and maxValue or value
+		end
+	end
+
+	-- Last resort: a nametag like "Dummy 200 HP". The label is cached; misses are rechecked every few seconds.
+	local cache = State.healthLabels[model]
+	if cache == nil or (cache.label == nil and os.clock() - cache.at > 3) then
+		cache = { at = os.clock() }
+		for _, descendant in ipairs(model:GetDescendants()) do
+			if descendant:IsA("TextLabel") and string.match(string.upper(descendant.ContentText), "[%d%.]+%s*HP") then
+				cache.label = descendant
+				break
+			end
+		end
+		State.healthLabels[model] = cache
+	end
+	local label = cache.label
+	if label and label.Parent then
+		local value = tonumber(string.match(string.upper(label.ContentText), "([%d%.]+)%s*HP"))
+		if value then
+			cache.max = math.max(cache.max or value, value)
+			return value, cache.max
+		end
+	end
+	return nil, nil
+end
+
+---Return a player's character and humanoid (if any) when they are an alive enemy.
+---@param player Player
+---@return Model?, Humanoid?
+local function getEnemyCharacter(player)
+	if player == localPlayer then return end
+	if Settings.teamCheck and player.Team and player.Team == localPlayer.Team and teamsMatter() then return end
+
+	local character = player.Character
+	if not character then return end
+	local health = getModelHealth(character)
+	if health and health <= 0 then return end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not (humanoid or character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart) then return end
+	return character, humanoid
+end
+
+---Return the part to aim at, falling back to the root.
+---@param character Model
+---@return BasePart?
+local function getAimPart(character)
+	return character:FindFirstChild(Const.AIM_PART) or character:FindFirstChild("HumanoidRootPart")
+end
+
+---Whether a point has line of sight to a part.
+---@param origin Vector3
+---@param part BasePart
+---@param character Model
+---@return boolean
+local function hasLineOfSight(origin, part, character)
+	raycastParams.FilterDescendantsInstances = { currentCamera, localPlayer.Character }
+	local result = workspace:Raycast(origin, part.Position - origin, raycastParams)
+	return not result or result.Instance:IsDescendantOf(character)
+end
+
+---Whether the camera has line of sight to a part.
+---@param part BasePart
+---@param character Model
+---@return boolean
+local function isVisible(part, character)
+	return hasLineOfSight(currentCamera.CFrame.Position, part, character)
+end
+
+---Lead a moving target by its velocity so strafers stay under the crosshair.
+---@param part BasePart
+---@param character Model
+---@return Vector3
+local function getPredictedPosition(part, character)
+	if Settings.prediction <= 0 then return part.Position end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	local velocity = (root or part).AssemblyLinearVelocity
+	return part.Position + velocity * (Settings.prediction / 1000)
+end
+
+---Wrap an angle into [-pi, pi].
+---@param angle number
+---@return number
+local function wrapAngle(angle)
+	return (angle + math.pi) % (2 * math.pi) - math.pi
+end
+
+---Readable name for where a camera value lives.
+---@param fn function
+---@return string
+local function describeFunction(fn)
+	local ok, source, line = pcall(debug.info, fn, "sl")
+	return ok and string.format("%s:%s", tostring(source), tostring(line)) or tostring(fn)
+end
+
+local stepCameraSync, aimCamera, getAimError, swipeAim
+-- Camera sync lives in its own block so its helpers don't use up top-level locals.
+do
+
+	local CAMERA_WRITE_QUIET = 0.15
+	local CALIBRATE_CHUNK = 8
+	local CALIBRATE_MIN_CHUNKS = 4
+	local CALIBRATE_GIVE_UP = 60
+	local CALIBRATE_ACCEPT = 0.35
+	local CALIBRATE_REBUILD = 3
+	local CALIBRATE_MAX_CANDIDATES = 4000
+	local CALIBRATE_MAX_KEYS = 300
+	local CALIBRATE_DEPTH = 3
+	local CALIBRATE_SCALES = { 1, -1, math.pi / 180, -math.pi / 180 }
+	local CAMERA_FIELDS = { "Yaw", "yaw", "Pitch", "pitch", "RotX", "RotY", "rotX", "rotY", "AngleX", "AngleY", "angleX", "angleY", "XAngle", "YAngle", "Rotation", "rotation" }
+
+	---Collect every number the game's camera / input code can reach: upvalues of render-step and input callbacks,
+	---and fields of the tables they hold. One of these is the camera's own yaw / pitch.
+	---@return {table}
+	local function collectCameraCandidates()
+		local candidates, seen = {}, {}
+		local scanFunction, scanTable
+
+		local function addChannel(get, set, label)
+			if #candidates >= CALIBRATE_MAX_CANDIDATES then return end
+			table.insert(candidates, { get = get, set = set, label = label })
+		end
+
+		-- Numbers are one channel; Vector2 / Vector3 give one channel per axis.
+		local function scanValue(value, get, set, label, depth)
+			local kind = typeof(value)
+			if kind == "number" then
+				addChannel(get, set, label)
+			elseif kind == "Vector2" or kind == "Vector3" then
+				for _, axis in ipairs(kind == "Vector2" and { "X", "Y" } or { "X", "Y", "Z" }) do
+					addChannel(function()
+						return get()[axis]
+					end, function(number)
+						local current = get()
+						if kind == "Vector2" then
+							set(Vector2.new(axis == "X" and number or current.X, axis == "Y" and number or current.Y))
+						else
+							set(Vector3.new(axis == "X" and number or current.X, axis == "Y" and number or current.Y, axis == "Z" and number or current.Z))
+						end
+					end, label .. "." .. axis)
+				end
+			elseif kind == "table" then
+				scanTable(value, label, depth + 1)
+			elseif kind == "function" then
+				scanFunction(value, depth + 1)
+			end
+		end
+
+		function scanTable(tbl, label, depth)
+			if depth > CALIBRATE_DEPTH or seen[tbl] or #candidates >= CALIBRATE_MAX_CANDIDATES then return end
+			seen[tbl] = true
+
+			local keys = 0
+			for key, value in next, tbl do
+				keys += 1
+				if keys > CALIBRATE_MAX_KEYS then break end
+				scanValue(value, function()
+					return rawget(tbl, key)
+				end, function(newValue)
+					tbl[key] = newValue
+				end, string.format("%s[%s]", label, tostring(key)), depth)
+			end
+		end
+		function scanFunction(fn, depth)
+			if depth > CALIBRATE_DEPTH or seen[fn] or #candidates >= CALIBRATE_MAX_CANDIDATES then return end
+			seen[fn] = true
+			if iscclosure and iscclosure(fn) then return end
+			if isexecutorclosure and isexecutorclosure(fn) then return end
+
+			local ok, upvalues = pcall(debug.getupvalues, fn)
+			if not (ok and typeof(upvalues) == "table") then return end
+
+			local name = describeFunction(fn)
+			for index, value in pairs(upvalues) do
+				scanValue(value, function()
+					return debug.getupvalue(fn, index)
+				end, function(newValue)
+					debug.setupvalue(fn, index, newValue)
+				end, string.format("%s upvalue %d", name, index), depth)
+			end
+		end
+
+		-- Render-step bindings and input callbacks are where custom cameras keep their rotation.
+		if getrendersteppedlist then
+			local ok, list = pcall(getrendersteppedlist)
+			for _, entry in ipairs(ok and list or {}) do
+				if typeof(entry.Function) == "function" then
+					scanFunction(entry.Function, 0)
+				end
+			end
+		end
+
+		if getconnections then
+			local signals = { runService.RenderStepped, runService.Heartbeat, userInputService.InputChanged, userInputService.TouchMoved, userInputService.TouchPan }
+			for _, signal in ipairs(signals) do
+				local ok, list = pcall(getconnections, signal)
+				for _, connection in ipairs(ok and list or {}) do
+					local fn = connection.Function
+					if typeof(fn) == "function" then
+						scanFunction(fn, 0)
+					end
+				end
+			end
+		end
+
+		-- Camera modules often keep their angles in plainly named fields on some table.
+		if getgc then
+			local ok, objects = pcall(getgc, true)
+			for _, object in ipairs(ok and objects or {}) do
+				if #candidates >= CALIBRATE_MAX_CANDIDATES then break end
+				if typeof(object) ~= "table" or seen[object] then continue end
+				for _, field in ipairs(CAMERA_FIELDS) do
+					if typeof(rawget(object, field)) == "number" then
+						scanTable(object, "gc", CALIBRATE_DEPTH)
+						break
+					end
+				end
+			end
+		end
+
+		return candidates
+	end
+
+	---Fresh per-scale accumulators.
+	local function newScaleTable()
+		return { 0, 0, 0, 0 }
+	end
+
+	---Pick the candidate whose movement best matches the camera's movement on one axis.
+	---@param calib table
+	---@param axis string
+	---@param exclude table?
+	---@return table?, number?, number
+	local function bestCandidate(calib, axis, exclude)
+		local total = calib.total[axis]
+		local best, bestScale, bestRatio = nil, nil, math.huge
+		if total <= 0 then return nil, nil, bestRatio end
+
+		for _, candidate in ipairs(calib.candidates) do
+			if candidate.dead or candidate == exclude or State.badChannels[candidate.label] then continue end
+			for index, scale in ipairs(CALIBRATE_SCALES) do
+				local ratio = candidate.err[axis][index] / total
+				if ratio < bestRatio then
+					best, bestScale, bestRatio = candidate, scale, ratio
+				end
+			end
+		end
+		return best, bestScale, bestRatio
+	end
+
+	---Turn a matched candidate into a drivable channel with its unit scale and zero offset.
+	---@param candidate table
+	---@param scale number
+	---@param angle number
+	---@return table
+	local function makeChannel(candidate, scale, angle)
+		local value = candidate.get()
+		return {
+			get = candidate.get,
+			set = candidate.set,
+			label = candidate.label,
+			scale = scale,
+			offset = wrapAngle(angle - value * scale),
+		}
+	end
+
+	---Learn which game values hold the camera's yaw and pitch by watching them move with the camera.
+	stepCameraSync = LPH_NO_VIRTUALIZE(function()
+		if not (Settings.cameraSync and currentCamera) then return end
+		local now = os.clock()
+		local pitch, yaw = currentCamera.CFrame:ToEulerAnglesYXZ()
+		local driver = State.cameraDriver
+
+		-- Keep the zero point of a synced camera honest while nobody is overriding it.
+		if driver then
+			if now - State.cameraDrivenAt < CAMERA_WRITE_QUIET or now - State.cameraWrittenAt < CAMERA_WRITE_QUIET then return end
+			for axis, angle in pairs({ yaw = yaw, pitch = pitch }) do
+				local channel = driver[axis]
+				if not channel then continue end
+				local ok, value = pcall(channel.get)
+				if not ok or typeof(value) ~= "number" then
+					State.cameraDriver = nil
+					return notify("Camera sync lost, move the camera to re-sync")
+				end
+				channel.offset = wrapAngle(angle - value * channel.scale)
+			end
+			return
+		end
+
+		local calib = State.calib
+		if not calib then
+			if now - State.calibBuiltAt < CALIBRATE_REBUILD then return end
+			State.calibBuiltAt = now
+
+			local candidates = collectCameraCandidates()
+			if #candidates == 0 then
+				-- Scanning the heap is a lag spike on phones, so wait longer after each empty scan.
+				State.calibBuiltAt = now + State.calibBackoff
+				State.calibBackoff = math.min(State.calibBackoff * 2, 120)
+				return
+			end
+			for _, candidate in ipairs(candidates) do
+				local ok, value = pcall(candidate.get)
+				candidate.last = ok and value or nil
+				candidate.dead = typeof(candidate.last) ~= "number"
+				candidate.sum = { yaw = newScaleTable(), pitch = newScaleTable() }
+				candidate.err = { yaw = newScaleTable(), pitch = newScaleTable() }
+			end
+			State.calib = {
+				candidates = candidates,
+				lastYaw = yaw,
+				lastPitch = pitch,
+				frames = 0,
+				chunks = 0,
+				chunk = { yaw = 0, pitch = 0 },
+				total = { yaw = 0, pitch = 0 },
+			}
+			return
+		end
+
+		local deltaYaw = wrapAngle(yaw - calib.lastYaw)
+		local deltaPitch = pitch - calib.lastPitch
+		calib.lastYaw, calib.lastPitch = yaw, pitch
+
+		for _, candidate in ipairs(calib.candidates) do
+			if candidate.dead then continue end
+			local ok, value = pcall(candidate.get)
+			if not ok or typeof(value) ~= "number" then
+				candidate.dead = true
+				continue
+			end
+			candidate.delta = value - candidate.last
+			candidate.last = value
+		end
+
+		-- Frames where we moved the camera ourselves, or nothing moved, teach nothing.
+		if now - State.cameraWrittenAt < CAMERA_WRITE_QUIET then return end
+		if math.abs(deltaYaw) < 0.002 and math.abs(deltaPitch) < 0.002 then return end
+
+		calib.frames += 1
+		calib.chunk.yaw += deltaYaw
+		calib.chunk.pitch += deltaPitch
+		for _, candidate in ipairs(calib.candidates) do
+			if candidate.dead then continue end
+			for index, scale in ipairs(CALIBRATE_SCALES) do
+				local moved = wrapAngle(candidate.delta * scale)
+				candidate.sum.yaw[index] += moved
+				candidate.sum.pitch[index] += moved
+			end
+		end
+		if calib.frames % CALIBRATE_CHUNK ~= 0 then return end
+
+		-- Compare in chunks so cameras that smooth their rotation still match.
+		for _, candidate in ipairs(calib.candidates) do
+			if candidate.dead then continue end
+			for index = 1, #CALIBRATE_SCALES do
+				candidate.err.yaw[index] += math.abs(candidate.sum.yaw[index] - calib.chunk.yaw)
+				candidate.err.pitch[index] += math.abs(candidate.sum.pitch[index] - calib.chunk.pitch)
+				candidate.sum.yaw[index], candidate.sum.pitch[index] = 0, 0
+			end
+		end
+		calib.total.yaw += math.abs(calib.chunk.yaw)
+		calib.total.pitch += math.abs(calib.chunk.pitch)
+		calib.chunk.yaw, calib.chunk.pitch = 0, 0
+		calib.chunks += 1
+
+		-- Drop values that clearly don't follow the camera on either axis; they only cost frame time.
+		if calib.chunks == 2 and calib.total.yaw > 0.5 and calib.total.pitch > 0.3 then
+			for _, candidate in ipairs(calib.candidates) do
+				if candidate.dead then continue end
+				local yawBest, pitchBest = math.huge, math.huge
+				for index = 1, #CALIBRATE_SCALES do
+					yawBest = math.min(yawBest, candidate.err.yaw[index] / calib.total.yaw)
+					pitchBest = math.min(pitchBest, candidate.err.pitch[index] / calib.total.pitch)
+				end
+				candidate.dead = yawBest > 0.95 and pitchBest > 0.95
+			end
+		end
+		if calib.chunks < CALIBRATE_MIN_CHUNKS then return end
+
+		local yawCandidate, yawScale, yawRatio = bestCandidate(calib, "yaw")
+		calib.yawRatio = yawRatio
+		if yawCandidate and calib.total.yaw > 0.5 and yawRatio < CALIBRATE_ACCEPT then
+			local pitchCandidate, pitchScale, pitchRatio = bestCandidate(calib, "pitch", yawCandidate)
+			calib.pitchRatio = pitchRatio
+			local pitchFound = pitchCandidate and calib.total.pitch > 0.3 and pitchRatio < CALIBRATE_ACCEPT
+
+			State.cameraDriver = {
+				yaw = makeChannel(yawCandidate, yawScale, yaw),
+				pitch = pitchFound and makeChannel(pitchCandidate, pitchScale, pitch) or nil,
+			}
+			State.calib = nil
+			return notify(pitchFound and "Camera synced" or "Camera synced (turn only, look up/down to finish)")
+		end
+
+		-- The values may not exist yet; rescan after a while.
+		if calib.chunks >= CALIBRATE_GIVE_UP then
+			State.calib = nil
+			State.calibBuiltAt = now + State.calibBackoff
+			State.calibBackoff = math.min(State.calibBackoff * 2, 120)
+			if not State.calibNotified then
+				State.calibNotified = true
+				notify("Couldn't sync camera, using direct aim")
+			end
+		end
+	end)
+
+	---Move one synced camera axis to an angle, taking the short way round.
+	---@param channel table?
+	---@param angle number
+	local function driveChannel(channel, angle)
+		if not channel then return end
+		local ok, value = pcall(channel.get)
+		if not ok or typeof(value) ~= "number" then
+			State.cameraDriver = nil
+			return
+		end
+		local current = value * channel.scale + channel.offset
+		pcall(channel.set, value + wrapAngle(angle - current) / channel.scale)
+	end
+
+	---Point the camera at a world position. Uses the game's own yaw/pitch once synced, so its camera
+	---(and anything it aims with) follows; otherwise snaps Camera.CFrame directly.
+	---@param goal Vector3
+	---@param alpha number
+	function aimCamera(goal, alpha)
+		if not currentCamera then return end
+		local cframe = currentCamera.CFrame
+		local position = cframe.Position
+		goal += Vector3.new(0.01, 0, 0)
+		if (goal - position).Magnitude < 0.1 then return end
+
+		local driver = State.cameraDriver
+		if driver then
+			local now = os.clock()
+			local direction = (goal - position).Unit
+			local aimError = math.acos(math.clamp(cframe.LookVector:Dot(direction), -1, 1))
+
+			-- If driving the synced values doesn't actually turn the camera, they were the wrong ones.
+			if now - State.cameraDrivenAt > 0.3 then
+				State.driveStartAt, State.driveStartError = now, aimError
+			elseif now - State.driveStartAt > 0.5 and State.driveStartError > 0.2 and aimError > State.driveStartError * 0.8 then
+				State.badChannels[driver.yaw.label] = true
+				State.cameraDriver, State.calib, State.calibBuiltAt = nil, nil, -math.huge
+				notify("Camera sync was wrong, re-syncing")
+				return
+			end
+
+			local currentPitch, currentYaw = cframe:ToEulerAnglesYXZ()
+			local goalPitch, goalYaw = CFrame.lookAt(position, goal):ToEulerAnglesYXZ()
+			State.cameraDrivenAt = now
+			driveChannel(driver.yaw, currentYaw + wrapAngle(goalYaw - currentYaw) * alpha)
+			driveChannel(driver.pitch, currentPitch + (goalPitch - currentPitch) * alpha)
+			if driver.pitch then return end
+		end
+
+		-- Unsynced: write Camera.CFrame, and if the game keeps putting its own view back, swipe instead.
+		local now = os.clock()
+		local aimError = math.acos(math.clamp(cframe.LookVector:Dot((goal - position).Unit), -1, 1))
+		if now - State.fallbackAimAt > 0.3 then
+			State.fallbackStartAt, State.fallbackStartError = now, aimError
+		elseif now - State.fallbackStartAt > 0.5 and State.fallbackStartError > 0.2 and aimError > State.fallbackStartError * 0.8 then
+			if State.aimMethod == "swipe" and State.swipeVim and virtualInputManager then
+				-- Real touches did nothing; try feeding the game's touch listeners directly.
+				State.swipeVim = false
+			elseif State.aimMethod == "swipe" then
+				State.aimMethod, State.swipeFailed = "direct", true
+				notify("Swipe aim didn't turn the camera, using direct aim")
+			elseif Settings.swipeAim and not State.swipeFailed and swipeAim and userInputService.TouchEnabled then
+				State.aimMethod = "swipe"
+				notify("Camera ignores direct aim, switching to swipe aim")
+			end
+			State.fallbackStartAt, State.fallbackStartError = now, aimError
+		end
+		State.fallbackAimAt = now
+
+		if State.aimMethod == "swipe" and Settings.swipeAim then
+			local currentPitch, currentYaw = cframe:ToEulerAnglesYXZ()
+			local goalPitch, goalYaw = CFrame.lookAt(position, goal):ToEulerAnglesYXZ()
+			if swipeAim(wrapAngle(goalYaw - currentYaw) * alpha, (goalPitch - currentPitch) * alpha, currentYaw, currentPitch) then return end
+		end
+
+		-- Custom cameras reset a partial lerp every frame, so the fallback always snaps.
+		State.cameraWrittenAt = now
+		currentCamera.CFrame = CFrame.lookAt(position, goal)
+	end
+
+	---Angle between where the camera looks and a point.
+	---@param point Vector3
+	---@return number
+	function getAimError(point)
+		local cframe = currentCamera.CFrame
+		local direction = point - cframe.Position
+		if direction.Magnitude < 0.1 then return 0 end
+		return math.acos(math.clamp(cframe.LookVector:Dot(direction.Unit), -1, 1))
+end
+
+end
+
+---Return the player whose aim part projects closest to the cursor within the FOV radius.
+---@return Player?, number?, table
+local getClosestPlayer = LPH_NO_VIRTUALIZE(function()
+	local closest, closestDist, candidates = nil, math.huge, {}
+	local mousePos = getAimOrigin()
+
+	for _, player in ipairs(playersService:GetPlayers()) do
+		local character = getEnemyCharacter(player)
+		if not character then continue end
+
+		local aimPart = getAimPart(character)
+		if not aimPart then continue end
+
+		local screenPos, onScreen = currentCamera:WorldToViewportPoint(aimPart.Position)
+		if not onScreen then continue end
+
+		local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+		if dist > Settings.aimbotFov then continue end
+		if Settings.wallCheck and not isVisible(aimPart, character) then continue end
+
+		table.insert(candidates, { player = player, dist = dist, screenPos = screenPos })
+	end
+
+	for _, info in ipairs(candidates) do
+		if info.dist < closestDist then
+			closest = info.player
+			closestDist = info.dist
+		end
+	end
+
+	return closest, closestDist, candidates
+end)
+
+---Whether a locked target can still be aimed at.
+---@param player Player?
+---@return boolean
+local function isLockable(player)
+	if not (player and player.Parent) then return false end
+
+	local character = getEnemyCharacter(player)
+	local aimPart = character and getAimPart(character)
+	if not aimPart then return false end
+
+	return not Settings.wallCheck or isVisible(aimPart, character)
+end
+
+---Runs after the camera step to drag the view onto the target's head.
+local updateAimbot = LPH_NO_VIRTUALIZE(function(deltaTime)
+	if not currentCamera then return end
+	local origin = getAimOrigin()
+
+	if fovCircle then
+		local diameter = Settings.aimbotFov * 2
+		fovCircle.Visible = Settings.aimbot and Settings.showFov
+		fovCircle.Position = UDim2.fromOffset(origin.X, origin.Y)
+		fovCircle.Size = UDim2.fromOffset(diameter, diameter)
+	end
+
+	local holding = not Settings.aimbotHold or userInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+	if not (Settings.aimbot and holding) or State.lookFn then
+		State.aimTarget = nil
+		return
+	end
+
+	-- Stay locked while holding so the view doesn't flick between players.
+	if not (Settings.aimbotHold and isLockable(State.aimTarget)) then
+		State.aimTarget = getClosestPlayer()
+	end
+
+	local character = State.aimTarget and State.aimTarget.Character
+	local aimPart = character and getAimPart(character)
+	if not aimPart then return end
+
+	local alpha = Settings.aimbotSmoothness <= 1 and 1 or 1 - math.exp(-deltaTime * 60 / Settings.aimbotSmoothness)
+	aimCamera(getPredictedPosition(aimPart, character), alpha)
+end)
+
+---Whether a model still counts as alive.
+---@param model Model
+---@return boolean
+local function isAlive(model)
+	local health = getModelHealth(model)
+	return not health or health > 0
+end
+
+---Return a character's root part, falling back to other body parts.
+---@param model Model
+---@return BasePart?
+local function getRootPart(model)
+	local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("Torso")
+	return part and part:IsA("BasePart") and part or nil
+end
+
+---Part the aura drags the camera onto: the head, or the body when head aim is off.
+---@param character Model
+---@return BasePart?
+local function getAuraAimPart(character)
+	local head = Settings.auraAimHead and character:FindFirstChild(Const.AIM_PART)
+	return head and head:IsA("BasePart") and head or getRootPart(character)
+end
+
+---Remember character-like models no player owns, such as practice dummies.
+---@param instance Instance
+local function trackNpc(instance)
+	-- Practice dummies may be plain models with no Humanoid.
+	if instance:IsA("Model") and instance ~= localPlayer.Character and string.find(string.lower(instance.Name), "dummy", 1, true) then
+		npcModels[instance] = true
+		return
+	end
+
+	local isRig = instance:IsA("Humanoid") or (instance.Name == "HumanoidRootPart" and instance:IsA("BasePart"))
+	if not isRig then return end
+
+	local model = instance.Parent
+	if model and model:IsA("Model") and model ~= localPlayer.Character then
+		npcModels[model] = true
+	end
+end
+
+---Every attackable character right now: enemy players, plus NPCs when enabled.
+---@return {Model}
+local function getTargets()
+	local targets = {}
+	for _, player in ipairs(playersService:GetPlayers()) do
+		local character = getEnemyCharacter(player)
+		if character then
+			table.insert(targets, character)
+		end
+	end
+
+	for model in pairs(npcModels) do
+		if not model.Parent then
+			npcModels[model] = nil
+		elseif Settings.targetNpcs and isAlive(model) and not playersService:GetPlayerFromCharacter(model) then
+			table.insert(targets, model)
+		end
+	end
+	return targets
+end
+
+---This frame's targets, nearest first. Built once per frame and shared by every feature.
+---@param rootPart BasePart
+---@return table
+local buildFrameTargets = LPH_NO_VIRTUALIZE(function(rootPart)
+	local origin = rootPart.Position
+	local frame = { origin = origin }
+	for _, character in ipairs(getTargets()) do
+		local root = getRootPart(character)
+		if not root or character:FindFirstChildOfClass("ForceField") then continue end
+
+		table.insert(frame, {
+			character = character,
+			root = root,
+			humanoid = character:FindFirstChildOfClass("Humanoid"),
+			distance = (root.Position - origin).Magnitude,
+		})
+	end
+	table.sort(frame, function(a, b)
+		return a.distance < b.distance
+	end)
+	return frame
+end)
+
+---Wall check from our body (not the camera), cached per entry for the frame.
+---@param frame table
+---@param entry table
+---@return boolean
+local function canSee(frame, entry)
+	if not Settings.wallCheck or entry.distance < 3 then return true end
+	if entry.visible == nil then
+		entry.visible = hasLineOfSight(frame.origin, entry.root, entry.character)
+	end
+	return entry.visible
+end
+
+---Nearest visible target within range.
+---@param frame table
+---@param range number
+---@return table?
+local function nearestEntry(frame, range, ignoreWalls)
+	for _, entry in ipairs(frame) do
+		if entry.distance > range then return end
+		if ignoreWalls or canSee(frame, entry) then return entry end
+	end
+end
+
+---Every visible target within range, nearest first.
+---@param frame table
+---@param range number
+---@return {table}
+local function entriesInRange(frame, range)
+	local inRange = {}
+	for _, entry in ipairs(frame) do
+		if entry.distance > range then break end
+		if canSee(frame, entry) then
+			table.insert(inRange, entry)
+		end
+	end
+	return inRange
+end
+
+---The target entry that owns a part.
+---@param frame table
+---@param part BasePart
+---@return table?
+local function getEntryFromPart(frame, part)
+	for _, entry in ipairs(frame) do
+		if part:IsDescendantOf(entry.character) then
+			return entry
+		end
+	end
+end
+
+---Whether a GUI object is actually drawn on screen.
+---@param object Instance
+---@return boolean
+local function isShown(object)
+	while object and object:IsA("GuiObject") do
+		if not object.Visible then return false end
+		object = object.Parent
+	end
+	return object ~= nil and (not object:IsA("LayerCollector") or object.Enabled)
+end
+
+---Find one of the game's on-screen controls (Attack, Use) by its label.
+---@param name string
+---@return GuiObject?
+local function getControl(name)
+	local cached = controlCache[name]
+	if cached and cached.Parent then return cached end
+	if os.clock() - (controlScans[name] or -math.huge) < Const.CONTROL_RESCAN then return end
+	controlScans[name] = os.clock()
+
+	local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then return end
+
+	local wanted = string.lower(name)
+	local best, bestScore = nil, 0
+	for _, object in ipairs(playerGui:GetDescendants()) do
+		if not (object:IsA("TextButton") or object:IsA("TextLabel")) then continue end
+		if string.lower(string.match(object.ContentText, "^%s*(.-)%s*$")) ~= wanted then continue end
+
+		-- Labels usually sit inside the real button.
+		local parent = object.Parent
+		local control = object:IsA("GuiButton") and object
+			or object:FindFirstAncestorWhichIsA("GuiButton")
+			or (parent and parent:IsA("GuiObject") and parent)
+			or object
+		local score = (isShown(control) and 2 or 0) + (control:IsA("GuiButton") and 1 or 0)
+		if score > bestScore then
+			best, bestScore = control, score
+		end
+		if bestScore == 3 then break end
+	end
+
+	-- Only remember controls that are on screen; hidden ones may belong to menus.
+	controlCache[name] = bestScore >= 2 and best or nil
+	-- A game without this control would otherwise get its whole GUI searched every few seconds.
+	if not best then
+		controlScans[name] = os.clock() + Const.SCAN_BACKOFF
+	end
+	return best
+end
+
+---Whether the game listens to a control's events directly.
+---@param control GuiObject
+---@return boolean
+local function hasHandlers(control)
+	if not getconnections then return false end
+	for _, signalName in ipairs(Const.CONTROL_SIGNALS) do
+		local found, signal = pcall(function()
+			return control[signalName]
+		end)
+		if not found then continue end
+
+		local listed, signalConnections = pcall(getconnections, signal)
+		if listed and signalConnections and #signalConnections > 0 then
+			return true
+		end
+	end
+	return false
+end
+
+---Call every Lua connection on a signal.
+---@param signal RBXScriptSignal
+local function fireConnections(signal, ...)
+	local listed, signalConnections = pcall(getconnections, signal)
+	if not (listed and signalConnections) then return end
+	for _, connection in ipairs(signalConnections) do
+		-- Never re-trigger our own handlers.
+		local fn = connection.Function
+		if fn and isexecutorclosure and isexecutorclosure(fn) then continue end
+		pcall(function(...)
+			connection:Fire(...)
+		end, ...)
+	end
+end
+
+---Stand-in InputObject for handlers that read the input they're given.
+---@param position Vector2
+---@return table
+local function makeFakeInput(position)
+	local touchOnly = userInputService.TouchEnabled and not userInputService.MouseEnabled
+	return {
+		UserInputType = touchOnly and Enum.UserInputType.Touch or Enum.UserInputType.MouseButton1,
+		UserInputState = Enum.UserInputState.Begin,
+		KeyCode = Enum.KeyCode.Unknown,
+		Position = Vector3.new(position.X, position.Y, 0),
+		Delta = Vector3.zero,
+		Changed = Const.DUMMY_SIGNAL,
+		GetPropertyChangedSignal = function()
+			return Const.DUMMY_SIGNAL
+		end,
+	}
+end
+
+---Fire a control's input handlers directly, as if it were pressed or released.
+---@param control GuiObject
+---@param down boolean
+local function setControl(control, down)
+	local center = control.AbsolutePosition + control.AbsoluteSize / 2
+	local fakeInput = fakeInputs[control] or makeFakeInput(center)
+	fakeInputs[control] = down and fakeInput or nil
+	fakeInput.UserInputState = down and Enum.UserInputState.Begin or Enum.UserInputState.End
+
+	local isButton = control:IsA("GuiButton")
+	if down then
+		fireConnections(control.InputBegan, fakeInput)
+		if isButton then
+			fireConnections(control.MouseButton1Down, center.X, center.Y)
+		end
+		return
+	end
+
+	fireConnections(control.InputEnded, fakeInput)
+	if isButton then
+		fireConnections(control.MouseButton1Up, center.X, center.Y)
+		fireConnections(control.MouseButton1Click)
+		fireConnections(control.Activated, fakeInput, 1)
+	end
+end
+
+---Screen position of a control's centre, including the top bar inset when its GUI respects it.
+---@param control GuiObject
+---@return Vector2
+local function getControlScreenPosition(control)
+	local center = control.AbsolutePosition + control.AbsoluteSize / 2
+	local screenGui = control:FindFirstAncestorWhichIsA("ScreenGui")
+	if screenGui and not screenGui.IgnoreGuiInset then
+		center += guiService:GetGuiInset()
+	end
+	return center
+end
+
+---Send a real mouse button event through VirtualInputManager.
+---@param position Vector2
+---@param button number
+---@param down boolean
+---@return boolean
+local function sendMouse(position, button, down)
+	if not virtualInputManager then return false end
+	return (pcall(virtualInputManager.SendMouseButtonEvent, virtualInputManager, position.X, position.Y, button, down, game, 0))
+end
+
+---Press or release a game action like a player would: its on-screen control first, real mouse input otherwise.
+---@param name string
+---@param mouseButton number
+---@param down boolean
+---@param position Vector2?
+local function setAction(name, mouseButton, down, position)
+	local control = getControl(name)
+	local shown = control and isShown(control)
+	if shown and hasHandlers(control) then
+		return setControl(control, down)
+	end
+
+	local point = shown and getControlScreenPosition(control) or position or currentCamera.ViewportSize / 2
+	if sendMouse(point, mouseButton, down) then return end
+
+	-- Last resort for executors without VirtualInputManager.
+	local fallbacks = mouseButton == 0 and { mouse1press, mouse1release } or { mouse2press, mouse2release }
+	local fallback = fallbacks[down and 1 or 2]
+	if fallback then
+		pcall(fallback)
+	end
+end
+
+---The Tool currently in our hand.
+---@return Tool?
+local function getHeldTool()
+	local character = localPlayer.Character
+	return character and character:FindFirstChildOfClass("Tool")
+end
+
+---Activate the currently held Tool.
+---@return boolean
+local function activateHeldTool()
+	local tool = getHeldTool()
+	if not tool then return false end
+	return (pcall(function()
+		tool:Activate()
+	end))
+end
+
+---A control's centre in InputObject space (top bar inset removed).
+---@param control GuiObject
+---@return Vector2
+local function getControlInputPosition(control)
+	local center = control.AbsolutePosition + control.AbsoluteSize / 2
+	local screenGui = control:FindFirstAncestorWhichIsA("ScreenGui")
+	if screenGui and screenGui.IgnoreGuiInset then
+		center -= guiService:GetGuiInset()
+	end
+	return center
+end
+
+---Feed a fake touch straight into the game's UserInputService listeners, for games that hit-test their buttons themselves.
+---@param name string
+---@param point Vector2
+---@param down boolean
+local function fireGlobalInput(name, point, down)
+	local key = "global:" .. name
+	local fakeInput = fakeInputs[key] or makeFakeInput(point)
+	fakeInputs[key] = down and fakeInput or nil
+	fakeInput.UserInputState = down and Enum.UserInputState.Begin or Enum.UserInputState.End
+	local touch = fakeInput.UserInputType == Enum.UserInputType.Touch
+
+	if down then
+		fireConnections(userInputService.InputBegan, fakeInput, false)
+		if touch then fireConnections(userInputService.TouchStarted, fakeInput, false) end
+		return
+	end
+	fireConnections(userInputService.InputEnded, fakeInput, false)
+	if touch then fireConnections(userInputService.TouchEnded, fakeInput, false) end
+end
+-- Swipe aim: cameras that ignore Camera.CFrame still follow a finger dragged across the screen.
+do
+	local SWIPE_TOUCH_ID = 7341
+	local SWIPE_MAX_STEP = 45
+	local SWIPE_RANGE = 0.2
+	local SWIPE_IDLE = 0.15
+	local SWIPE_MIN_GAIN = 1 / 2000
+	local SWIPE_MAX_GAIN = 1 / 4
+
+	-- Gains are radians turned per pixel dragged; the signs are guesses until the first measurement.
+	local swipe = { active = false, gainX = -1 / 40, gainY = -1 / 60, lastAt = -math.huge, deltaX = 0, deltaY = 0 }
+
+	---Send one touch event: through VirtualInputManager when the route allows it, else straight into the game's listeners.
+	---@param state number
+	---@param point Vector2
+	local function sendTouch(state, point)
+		if state == 0 then
+			swipe.viaVim = State.swipeVim and virtualInputManager ~= nil
+		end
+		if swipe.viaVim then
+			if pcall(virtualInputManager.SendTouchEvent, virtualInputManager, SWIPE_TOUCH_ID, state, point.X, point.Y) then return end
+			swipe.viaVim, State.swipeVim = false, false
+		end
+
+		local fake = swipe.fake
+		if state == 0 or not fake then
+			fake = makeFakeInput(point)
+			fake.UserInputType = Enum.UserInputType.Touch
+			swipe.fake = fake
+		end
+		local position = Vector3.new(point.X, point.Y, 0)
+		fake.Delta = state == 1 and position - fake.Position or Vector3.zero
+		fake.Position = position
+		if state == 0 then
+			fake.UserInputState = Enum.UserInputState.Begin
+			fireConnections(userInputService.InputBegan, fake, false)
+			fireConnections(userInputService.TouchStarted, fake, false)
+		elseif state == 1 then
+			fake.UserInputState = Enum.UserInputState.Change
+			fireConnections(userInputService.InputChanged, fake, false)
+			fireConnections(userInputService.TouchMoved, fake, false)
+		else
+			fake.UserInputState = Enum.UserInputState.End
+			fireConnections(userInputService.InputEnded, fake, false)
+			fireConnections(userInputService.TouchEnded, fake, false)
+			swipe.fake = nil
+		end
+	end
+
+	---Lift the swipe finger.
+	local function releaseSwipe()
+		if not swipe.active then return end
+		swipe.active = false
+		sendTouch(2, swipe.position)
+	end
+
+	---Refine radians-per-pixel from how far the last drag step really turned the camera.
+	---@param gain number
+	---@param turned number
+	---@param moved number
+	---@return number
+	local function learnGain(gain, turned, moved)
+		if math.abs(moved) < 3 or math.abs(turned) < 1e-3 then return gain end
+		local measured = turned / moved
+		if math.abs(measured) < SWIPE_MIN_GAIN or math.abs(measured) > SWIPE_MAX_GAIN then return gain end
+		-- A flipped sign means the drag direction was guessed wrong; take the measurement outright.
+		if (measured > 0) ~= (gain > 0) then return measured end
+		return gain * 0.6 + measured * 0.4
+	end
+
+	---One frame of swipe aim: drag the held touch by the pixels that should turn the camera by these angles.
+	---@param yawStep number
+	---@param pitchStep number
+	---@param yaw number
+	---@param pitch number
+	---@return boolean
+	function swipeAim(yawStep, pitchStep, yaw, pitch)
+		if not (currentCamera and userInputService.TouchEnabled) then return false end
+		local now = os.clock()
+		-- Aim runs from two render hooks; only drag once per frame.
+		if now - swipe.lastAt < 0.004 then return true end
+
+		if swipe.active and now - swipe.lastAt < SWIPE_IDLE then
+			swipe.gainX = learnGain(swipe.gainX, wrapAngle(yaw - swipe.lastYaw), swipe.deltaX)
+			swipe.gainY = learnGain(swipe.gainY, pitch - swipe.lastPitch, swipe.deltaY)
+		end
+
+		local viewport = currentCamera.ViewportSize
+		local anchor = Vector2.new(viewport.X * 0.62, viewport.Y * 0.38)
+		if swipe.active and (now - swipe.lastAt >= SWIPE_IDLE or (swipe.position - anchor).Magnitude > viewport.Y * SWIPE_RANGE) then
+			releaseSwipe()
+		end
+
+		-- Damped so cameras that smooth their rotation don't overshoot.
+		local dx = math.clamp(yawStep * 0.8 / swipe.gainX, -SWIPE_MAX_STEP, SWIPE_MAX_STEP)
+		local dy = math.clamp(pitchStep * 0.8 / swipe.gainY, -SWIPE_MAX_STEP, SWIPE_MAX_STEP)
+		if swipe.active then
+			swipe.position += Vector2.new(dx, dy)
+			sendTouch(1, swipe.position)
+		else
+			swipe.active, swipe.position = true, anchor
+			dx, dy = 0, 0
+			sendTouch(0, anchor)
+			task.spawn(function()
+				while swipe.active do
+					task.wait(SWIPE_IDLE / 2)
+					if not Unstable.running or os.clock() - swipe.lastAt > SWIPE_IDLE then
+						releaseSwipe()
+					end
+				end
+			end)
+		end
+		swipe.deltaX, swipe.deltaY = dx, dy
+		swipe.lastYaw, swipe.lastPitch, swipe.lastAt = yaw, pitch, now
+		return true
+	end
+end
+
+---Tap a game action. Auto: button signals, else a virtual click on the button, else the held tool, else a centre click.
+---@param name string
+---@param mouseButton number
+---@param position Vector2?
+---Press or lift a real finger on a game button through VirtualInputManager.
+---@param name string
+---@param control GuiObject
+---@param down boolean
+---@return boolean
+local function sendRealTouch(name, control, down)
+	if not virtualInputManager then return false end
+	local point = getControlScreenPosition(control)
+	local touchId = name == "Attack" and 7351 or name == "Use" and 7352 or 7353
+	return (pcall(virtualInputManager.SendTouchEvent, virtualInputManager, touchId, down and 0 or 2, point.X, point.Y))
+end
+
+---Which route to press a button with: a test override, then what Test Inputs proved, then the Input Mode.
+---@param name string
+---@return string
+local function getRoute(name)
+	if State.forcedRoute then return State.forcedRoute end
+	local mode = Const.INPUT_MODES[Settings.inputMode] or "Auto"
+	if mode ~= "Auto" then return mode end
+	local tested = Settings.testedRoutes[name]
+	if tested and table.find(Const.INPUT_MODES, tested) then return tested end
+	if name == "Attack" and State.learnedRoute then return State.learnedRoute end
+	return mode
+end
+
+local function tapAction(name, mouseButton, position)
+	local mode = getRoute(name)
+	local auto = mode == "Auto"
+	local control = getControl(name)
+	local shown = control and isShown(control)
+
+	if (auto or mode == "Button Signals") and shown and hasHandlers(control) then
+		State.lastDispatch[name] = "button signals"
+		setControl(control, true)
+		task.delay(Const.CLICK_HOLD, setControl, control, false)
+		return
+	end
+
+	-- A real tap on the on-screen button is what a phone player does, so Auto tries it next.
+	if (mode == "Real Touch" or auto) and shown and sendRealTouch(name, control, true) then
+		State.lastDispatch[name] = "real touch"
+		task.delay(Const.CLICK_HOLD, sendRealTouch, name, control, false)
+		return
+	end
+
+	if mode == "Global Touch" or (auto and shown and not virtualInputManager) then
+		local point = shown and getControlInputPosition(control) or currentCamera.ViewportSize / 2
+		State.lastDispatch[name] = "global touch"
+		fireGlobalInput(name, point, true)
+		task.delay(Const.CLICK_HOLD, fireGlobalInput, name, point, false)
+		return
+	end
+
+	if mode == "Tool Activate" or (auto and not shown) then
+		if activateHeldTool() then
+			State.lastDispatch[name] = "tool activate"
+			return
+		end
+	end
+
+	State.lastDispatch[name] = shown and "virtual click (button)" or "virtual click (centre)"
+	setAction(name, mouseButton, true, position)
+	task.delay(Const.CLICK_HOLD, setAction, name, mouseButton, false, position)
+end
+
+---Press or release an action and keep it held (eating), using the same input route as taps.
+---@param name string
+---@param mouseButton number
+---@param down boolean
+---@return boolean
+local function holdAction(name, mouseButton, down)
+	if name == "Use" then
+		State.useHeld = down
+	end
+	local mode = getRoute(name)
+	local control = getControl(name)
+	local shown = control and isShown(control)
+
+	if mode == "Real Touch" and shown and sendRealTouch(name, control, down) then
+		State.lastDispatch[name] = "real touch (hold)"
+		return true
+	end
+	if mode == "Tool Activate" or (mode == "Auto" and not shown) then
+		if down then
+			State.lastDispatch[name] = "tool activate (hold)"
+			return activateHeldTool()
+		end
+		return true
+	end
+	if mode == "Global Touch" or (mode == "Auto" and not hasHandlers(control) and not virtualInputManager) then
+		State.lastDispatch[name] = "global touch (hold)"
+		fireGlobalInput(name, shown and getControlInputPosition(control) or currentCamera.ViewportSize / 2, down)
+		return true
+	end
+
+	State.lastDispatch[name] = "button / virtual (hold)"
+	setAction(name, mouseButton, down)
+	return true
+end
+
+---Swing once.
+---@param position Vector2?
+local function pressAttack(position)
+	tapAction("Attack", 0, position)
+end
+---Use the held item once (throw a pearl, wind charge, web).
+local function tapUse()
+	tapAction("Use", 1)
+end
+
+local scanHotbar, getHeldItemName, heldItemMatches, watchKit
+
+---Find the hotbar's nine slots, left to right.
+---@return {GuiObject}?
+local function getHotbarSlots()
+	local cached = State.hotbarSlots
+	if cached and cached[1].Parent then return cached end
+	if os.clock() - State.hotbarScan < Const.CONTROL_RESCAN then return end
+	State.hotbarScan = os.clock()
+
+	local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then return end
+
+	-- The hotbar is the lowest on-screen row of exactly nine equal squares.
+	local best, bestY = nil, -math.huge
+	for _, container in ipairs(playerGui:GetDescendants()) do
+		if not (container:IsA("GuiObject") or container:IsA("LayerCollector")) then continue end
+
+		local rows = {}
+		for _, child in ipairs(container:GetChildren()) do
+			if not child:IsA("GuiObject") then continue end
+			local size = child.AbsoluteSize
+			if size.X < 20 or math.abs(size.X - size.Y) > 4 then continue end
+
+			local key = string.format("%d:%d", math.floor(size.X + 0.5), math.floor(child.AbsolutePosition.Y + 0.5))
+			rows[key] = rows[key] or {}
+			table.insert(rows[key], child)
+		end
+
+		for _, row in pairs(rows) do
+			local y = row[1].AbsolutePosition.Y
+			if #row == 9 and y > bestY and isShown(row[1]) then
+				best, bestY = row, y
+			end
+		end
+	end
+
+	if not best then
+		State.hotbarScan = os.clock() + Const.SCAN_BACKOFF
+		return
+	end
+	table.sort(best, function(a, b)
+		return a.AbsolutePosition.X < b.AbsolutePosition.X
+	end)
+	State.hotbarSlots = best
+	return best
+end
+
+---Hold a hotbar slot. Skips re-pressing the held slot, since default backpacks unequip on a second press.
+---@param slot number
+---@return boolean
+local function selectSlot(slot, force)
+	slot = math.clamp(math.floor(slot), 1, 9)
+	-- Only skip when the hand really holds that slot's item; a manual tap on the hotbar makes currentSlot stale.
+	if not force and State.currentSlot == slot and getHeldTool() then
+		local held, expected = getHeldItemName(), State.hotbarNames[slot]
+		if not (held and expected and expected ~= "" and held ~= expected) then return false end
+	end
+	State.currentSlot = slot
+
+	local slots = getHotbarSlots()
+	local slotFrame = slots and slots[slot]
+	local control = slotFrame and (slotFrame:IsA("GuiButton") and slotFrame or slotFrame:FindFirstChildWhichIsA("GuiButton", true) or slotFrame)
+	if control and hasHandlers(control) then
+		setControl(control, true)
+		setControl(control, false)
+		return true
+	end
+
+	if virtualInputManager then
+		pcall(virtualInputManager.SendKeyEvent, virtualInputManager, true, Const.SLOT_KEYS[slot], false, game)
+		pcall(virtualInputManager.SendKeyEvent, virtualInputManager, false, Const.SLOT_KEYS[slot], false, game)
+		return true
+	end
+	if keypress and keyrelease then
+		keypress(0x30 + slot)
+		keyrelease(0x30 + slot)
+		return true
+	end
+
+	-- No input API at all: equip straight from the backpack.
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not (backpack and humanoid) then return false end
+
+	local tools = {}
+	for _, item in ipairs(backpack:GetChildren()) do
+		if item:IsA("Tool") then
+			table.insert(tools, item)
+		end
+	end
+	if tools[slot] then
+		humanoid:EquipTool(tools[slot])
+		return true
+	end
+	return false
+end
+
+---Everything a hotbar slot says about its item: names, texts and string attributes.
+---@param slotFrame GuiObject
+---@return string
+local function getSlotText(slotFrame)
+	local parts = {}
+	local function add(object)
+		table.insert(parts, object.Name)
+		if object:IsA("TextLabel") or object:IsA("TextButton") then
+			local text = object.ContentText
+			if text ~= "" and not tonumber(text) then
+				table.insert(parts, text)
+			end
+		end
+		for _, value in pairs(object:GetAttributes()) do
+			if typeof(value) == "string" then
+				table.insert(parts, value)
+			end
+		end
+	end
+
+	add(slotFrame)
+	for _, descendant in ipairs(slotFrame:GetDescendants()) do
+		add(descendant)
+	end
+	return string.lower(table.concat(parts, " "))
+end
+
+---Point each item slot setting at wherever that item sits in the current kit.
+local function detectSlots()
+	if not Settings.autoSlots then return end
+	local now = os.clock()
+	if now - State.slotScanAt < Const.SLOT_SCAN_RATE then return end
+	State.slotScanAt = now
+
+	local slots = getHotbarSlots()
+	if not slots then return end
+
+	local found = {}
+	for index, slotFrame in ipairs(slots) do
+		local text = getSlotText(slotFrame)
+		for key, words in pairs(Const.SLOT_KEYWORDS) do
+			if found[key] then continue end
+			for _, word in ipairs(words) do
+				if string.find(text, word, 1, true) then
+					found[key] = index
+					break
+				end
+			end
+		end
+	end
+
+	local changed = false
+	for key, index in pairs(found) do
+		State.missingItems[key] = nil
+		if Settings[key] ~= index then
+			Settings[key] = index
+			changed = true
+		end
+	end
+	if changed then
+		refreshAll()
+	end
+end
+
+---Select a slot and wait until the item in hand actually changes: a new Tool, or the name popup updating.
+---@param slot number
+---@param sleep function?
+local function equipSlot(slot, sleep)
+	sleep = sleep or task.wait
+	local previous = getHeldTool()
+	local label = State.itemLabel
+	label = label and label.Parent and label or nil
+	local previousName = label and label.ContentText
+	local expected = State.hotbarNames[math.clamp(math.floor(slot), 1, 9)]
+	if not selectSlot(slot) then return end
+
+	-- Nothing to wait on: no Tools and no known name popup.
+	if not (previous or label) then
+		sleep(Const.SLOT_SWITCH_DELAY)
+		return
+	end
+
+	-- Waiting for the popup stops item checks from reading the old item's name right after a switch.
+	local start = os.clock()
+	repeat
+		sleep()
+		local text = label and label.ContentText
+		local done = (previous and getHeldTool() ~= previous)
+			or (label and text ~= previousName)
+			or (label and expected and expected ~= "" and text == expected)
+	until (done and os.clock() - start >= Const.SLOT_SWITCH_DELAY / 2) or os.clock() - start > Const.EQUIP_TIMEOUT
+	sleep(Const.SLOT_SWITCH_DELAY / 2)
+end
+
+---Lock the camera onto a point (applied every render frame) and give the game a couple of frames to read it.
+---@param lookFn function
+local function lookAt(lookFn)
+	State.lookFn = lookFn
+	for _ = 1, Const.LOOK_SETTLE_FRAMES do
+		runService.RenderStepped:Wait()
+	end
+end
+
+---Release the camera lock and face a direction again.
+---@param direction Vector3?
+local function releaseLook(direction)
+	State.lookFn = nil
+	if not (direction and currentCamera) then return end
+	aimCamera(currentCamera.CFrame.Position + direction * 10, 1)
+end
+
+---Bound after every camera step so nothing overrides an aimed throw.
+local updateLookOverride = LPH_NO_VIRTUALIZE(function()
+	local lookFn = State.lookFn
+	if not (lookFn and currentCamera) then return end
+
+	local ok, goal = pcall(lookFn, currentCamera.CFrame.Position)
+	if ok and typeof(goal) == "Vector3" then
+		aimCamera(goal, 1)
+	end
+end)
+
+---In third person the throw follows the cursor, so park it at screen centre (where the camera is aimed).
+---@return Vector2?
+local function centerCursor()
+	if not virtualInputManager or userInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then return end
+	if userInputService.TouchEnabled and not userInputService.MouseEnabled then return end
+
+	local previous = userInputService:GetMouseLocation()
+	local center = currentCamera.ViewportSize / 2
+	pcall(virtualInputManager.SendMouseMoveEvent, virtualInputManager, center.X, center.Y, game)
+	return previous
+end
+
+local function restoreCursor(previous)
+	if previous and virtualInputManager then
+		pcall(virtualInputManager.SendMouseMoveEvent, virtualInputManager, previous.X, previous.Y, game)
+	end
+end
+
+---Run timed inputs (eating, throwing) on their own thread without overlapping another sequence.
+---The sequence gets a sleep(duration) that aborts it on death, respawn, unload or a newer sequence;
+---sleep(0) only checks, without waiting a frame.
+---@param sequence function
+local function runSequence(sequence)
+	if State.busy then return end
+	State.busy = true
+	State.seqId += 1
+	State.busySince = os.clock()
+	State.seqCharacter = localPlayer.Character
+	local id = State.seqId
+
+	local function sleep(duration)
+		if duration ~= 0 then
+			task.wait(duration)
+		end
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if State.seqId ~= id or not Unstable.running or character ~= State.seqCharacter or not humanoid or humanoid.Health <= 0 then
+			error(Const.SEQUENCE_ABORT, 0)
+		end
+	end
+
+	task.spawn(function()
+		local ok, err = pcall(sequence, sleep)
+		-- A sequence the watchdog already replaced must not clear the new one's state.
+		if State.seqId == id then
+			State.busy = false
+			State.comboSequence = false
+			State.lookFn = nil
+			if State.useHeld then
+				pcall(holdAction, "Use", 1, false)
+			end
+		end
+		if not ok and err ~= Const.SEQUENCE_ABORT then
+			warn("[Unstable] " .. tostring(err))
+		end
+	end)
+end
+-- Item awareness: the game shows the held item's name above the hotbar, so read it per slot.
+do
+	local UI_WORDS = { attack = true, use = true, jump = true, sneak = true, zoom = true, swap = true, f5 = true, chat = true, emote = true }
+
+	---Every visible game text label and its text.
+	local function snapshotLabels()
+		local labels = {}
+		local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+		if not playerGui then return labels end
+		for _, object in ipairs(playerGui:GetDescendants()) do
+			if object:IsA("TextLabel") and object.Visible then
+				labels[object] = object.ContentText
+			end
+		end
+		return labels
+	end
+
+	---Whether a label can be the item-name popup: short non-numeric text, centred, lower half of the screen.
+	local function isNameLabel(label, text)
+		if text == "" or tonumber(text) or #text > 40 or UI_WORDS[string.lower(text)] then return false end
+		if not isShown(label) then return false end
+		local viewport = currentCamera.ViewportSize
+		local center = label.AbsolutePosition + label.AbsoluteSize / 2
+		return math.abs(center.X - viewport.X / 2) < viewport.X * 0.3 and center.Y > viewport.Y * 0.3
+	end
+
+	---The label whose text changed (or appeared) after switching slots, closest to screen centre.
+	local function pickChangedLabel(before, after)
+		local halfWidth = currentCamera.ViewportSize.X / 2
+		local best, bestScore = nil, math.huge
+		for label, text in pairs(after) do
+			if before[label] == text or not isNameLabel(label, text) then continue end
+			local center = label.AbsolutePosition.X + label.AbsoluteSize.X / 2
+			local score = math.abs(center - halfWidth)
+			if score < bestScore then
+				best, bestScore = label, score
+			end
+		end
+		return best
+	end
+
+	---Images inside a slot, used to tell empty slots and repeated items apart.
+	local function getSlotIcon(slotFrame)
+		local images = {}
+		for _, descendant in ipairs(slotFrame:GetDescendants()) do
+			if (descendant:IsA("ImageLabel") or descendant:IsA("ImageButton")) and descendant.Image ~= "" and descendant.Visible then
+				table.insert(images, descendant.Image)
+			end
+		end
+		return table.concat(images, "|")
+	end
+
+	---Set each item slot from the scanned names, and remember which items this kit doesn't have.
+	local function applyRoles(names)
+		local assigned, named = {}, 0
+		for index = 1, 9 do
+			if (names[index] or "") ~= "" then
+				named += 1
+			end
+		end
+		for key, words in pairs(Const.SLOT_KEYWORDS) do
+			for index = 1, 9 do
+				local lower = string.lower(names[index] or "")
+				if lower == "" or assigned[key] then continue end
+				for _, word in ipairs(words) do
+					if string.find(lower, word, 1, true) then
+						assigned[key] = index
+						break
+					end
+				end
+			end
+		end
+		for key, index in pairs(assigned) do
+			Settings[key] = index
+		end
+		-- Only trust "missing" when the scan read most slots; a failed read shouldn't switch features off.
+		table.clear(State.missingItems)
+		if named >= 3 then
+			for key in pairs(Const.SLOT_KEYWORDS) do
+				if not assigned[key] then
+					State.missingItems[key] = true
+				end
+			end
+		end
+		refreshAll()
+		return assigned
+	end
+
+	---Name of the item in hand, if the popup is showing.
+	---@return string?
+	function getHeldItemName()
+		local label = State.itemLabel
+		if label and label.Parent and isShown(label) and label.ContentText ~= "" then
+			return label.ContentText
+		end
+		return nil
+	end
+
+	---Whether the item in hand matches a slot role ("windSlot", "maceSlot", ...). Unknown names count as a match.
+	---@param key string
+	---@return boolean
+	function heldItemMatches(key)
+		-- The kit has no such item, so whatever sits in that slot is something else (kit 2 has no wind charge).
+		if State.missingItems[key] then return false end
+		local name = getHeldItemName()
+		if not name then return true end
+		local expected = State.hotbarNames[Settings[key]]
+		if expected and expected ~= "" then
+			return name == expected
+		end
+		local lower = string.lower(name)
+		for _, word in ipairs(Const.SLOT_KEYWORDS[key] or {}) do
+			if string.find(lower, word, 1, true) then return true end
+		end
+		return false
+	end
+
+	---Switch through every slot, read the item name the game shows, and set the item slots from it.
+	---@param silent boolean?
+	function scanHotbar(silent)
+		runSequence(function(sleep)
+			State.hotbarScan = -math.huge
+			local slots = getHotbarSlots()
+			if not slots then
+				if not silent then notify("Hotbar not found, set slots by hand") end
+				return
+			end
+
+			local names, previousIcon = {}, nil
+			-- Start from the last slot so slot 1 also shows its name popup.
+			selectSlot(9, true)
+			sleep(Const.ITEM_SCAN_DELAY)
+
+			for index = 1, 9 do
+				local before = snapshotLabels()
+				selectSlot(index, true)
+				sleep(Const.ITEM_SCAN_DELAY)
+
+				local icon = getSlotIcon(slots[index])
+				local label = pickChangedLabel(before, snapshotLabels())
+				if label then
+					State.itemLabel = label
+					names[index] = label.ContentText
+				elseif icon ~= "" and icon == previousIcon then
+					names[index] = names[index - 1] or ""
+				else
+					names[index] = ""
+				end
+				previousIcon = icon
+			end
+
+			State.hotbarNames = names
+			local assigned = applyRoles(names)
+			selectSlot(Settings.swordSlot, true)
+			markDirty()
+
+			-- Icons with only the sword selected, so a later slot switch alone doesn't look like a new kit.
+			sleep(Const.ITEM_SCAN_DELAY)
+			local icons = {}
+			for index = 1, 9 do
+				icons[index] = slots[index].Parent and getSlotIcon(slots[index]) or ""
+			end
+			State.hotbarIcons, State.kitChangedAt = icons, nil
+
+			if silent then return end
+			local found = 0
+			for _ in pairs(assigned) do
+				found += 1
+			end
+			notify(string.format("Hotbar scanned  •  %d items found", found))
+		end)
+	end
+
+	---Rescan by itself when the kit changes (several slot icons differ from the last scan), but not mid-fight.
+	function watchKit()
+		if not Settings.autoSlots or State.busy then return end
+		local now = os.clock()
+		if now - State.kitCheckAt < Const.SLOT_SCAN_RATE then return end
+		State.kitCheckAt = now
+
+		local slots, icons = State.hotbarSlots, State.hotbarIcons
+		if not (slots and icons and slots[1].Parent) then return end
+		local changed = 0
+		for index = 1, 9 do
+			if getSlotIcon(slots[index]) ~= icons[index] then
+				changed += 1
+			end
+		end
+		if changed < Const.KIT_CHANGE_SLOTS then
+			State.kitChangedAt = nil
+			return
+		end
+
+		-- Two reads in a row, so one animated frame or a pickup doesn't trigger a scan.
+		if not State.kitChangedAt then
+			State.kitChangedAt = now
+			return
+		end
+		if now - State.lastKitScan < Const.KIT_RESCAN_COOLDOWN or State.auraEngaged or State.maceArmed then return end
+		State.lastKitScan, State.kitChangedAt = now, nil
+		notify("Kit changed, rescanning hotbar")
+		scanHotbar(true)
+	end
+end
+
+local stepCombat, updateAuraCamera, comboSmash, windDash, restoreHitboxes, clearEsp, removeEsp, copyDiagnostics, startRemoteLog, testInputs
+
+-- Combat, items, ESP and HUD live in their own block so they don't use up top-level locals.
+do
+	---Face the target, then swing.
+	---@param rootPart BasePart
+	---@param character Model
+	local function attackTarget(rootPart, character)
+		local targetRoot = getRootPart(character)
+		local aimPart = getAuraAimPart(character)
+		-- The camera is the player's: only move it during a SMASH, or when the camera mode asks for it.
+		local smashing = State.maceTarget ~= nil and os.clock() < State.comboUntil
+		local mode = Settings.cameraMode
+		local aim = Settings.killAuraFace and (smashing or mode >= 2)
+		local flickFrom = aim and mode == 2 and not smashing and not State.lookFn and currentCamera.CFrame.LookVector
+		if aim and targetRoot and aimPart then
+			local offset = (targetRoot.Position - rootPart.Position) * Vector3.new(1, 0, 1)
+			if offset.Magnitude > 0.1 then
+				rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + offset)
+			end
+
+			aimCamera(getPredictedPosition(aimPart, character), 1)
+		end
+		recentHits[character] = os.clock()
+
+		-- Remember their health so Auto input mode can tell whether this swing did any damage.
+		if Settings.inputMode == 1 and not State.routeLocked and not State.hitProbe then
+			local health = getModelHealth(character)
+			if health then
+				local distance = targetRoot and (targetRoot.Position - rootPart.Position).Magnitude or math.huge
+				local aimed = not aimPart or getAimError(aimPart.Position) < 0.35
+				State.hitProbe = { character = character, health = health, lowest = health, at = os.clock(), counts = aimed and distance <= Const.ROUTE_PROBE_RANGE }
+			end
+		end
+		pressAttack()
+
+		-- Flick mode: look back where the player was looking once the hit has gone out.
+		if flickFrom then
+			task.spawn(function()
+				runService.RenderStepped:Wait()
+				runService.RenderStepped:Wait()
+				if not State.lookFn and currentCamera then
+					aimCamera(currentCamera.CFrame.Position + flickFrom * 10, 1)
+				end
+			end)
+		end
+	end
+
+	local TEST_ROUTES = { "Button Signals", "Real Touch", "Virtual Click", "Global Touch", "Tool Activate" }
+
+	---The stack count printed on a hotbar slot, if it shows one.
+	---@param slot number
+	---@return number?
+	local function getSlotCount(slot)
+		local slots = getHotbarSlots()
+		local slotFrame = slots and slots[slot]
+		if not slotFrame then return nil end
+		for _, descendant in ipairs(slotFrame:GetDescendants()) do
+			if descendant:IsA("TextLabel") and descendant.Visible then
+				local count = tonumber(descendant.ContentText)
+				if count then return count end
+			end
+		end
+		return nil
+	end
+
+	---Try every way of pressing Use and Attack and keep the ones that really work.
+	---Use is proven by a stack count going down; Attack by a nearby target (or Dummy) losing HP.
+	function testInputs()
+		if State.busy then
+			return notify("Busy, try again in a moment")
+		end
+		runSequence(function(sleep)
+			local character = localPlayer.Character
+			local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+			if not rootPart then return end
+			notify("Testing inputs, stand still near the Dummy")
+
+			-- Use: throw something countable at our feet with each route until the count drops.
+			local useSlot
+			for _, key in ipairs({ "windSlot", "pearlSlot", "webSlot" }) do
+				if not State.missingItems[key] and getSlotCount(Settings[key]) then
+					useSlot = Settings[key]
+					break
+				end
+			end
+			local useRoute
+			if useSlot then
+				equipSlot(useSlot, sleep)
+				lookAt(function()
+					return rootPart.Position - Vector3.yAxis * 3 + Vector3.new(0.05, 0, 0)
+				end)
+				for _, route in ipairs(TEST_ROUTES) do
+					local before = getSlotCount(useSlot)
+					State.forcedRoute = route
+					tapUse()
+					State.forcedRoute = nil
+					sleep(0.8)
+					local after = getSlotCount(useSlot)
+					if before and after and after < before then
+						useRoute = route
+						break
+					end
+				end
+				releaseLook()
+			end
+
+			-- Attack: swing at the nearest target in reach with each route until its HP drops.
+			local attackRoute
+			local victim = nearestEntry(buildFrameTargets(rootPart), math.max(Settings.killAuraRange, 6), true)
+			if victim and getModelHealth(victim.character) then
+				equipSlot(Settings.swordSlot, sleep)
+				for _, route in ipairs(TEST_ROUTES) do
+					local before = getModelHealth(victim.character) or 0
+					local aimPart = getAuraAimPart(victim.character) or victim.root
+					lookAt(function()
+						return aimPart.Position
+					end)
+					for _ = 1, 2 do
+						State.forcedRoute = route
+						pressAttack()
+						State.forcedRoute = nil
+						sleep(0.55)
+					end
+					local after = getModelHealth(victim.character) or before
+					if after < before then
+						attackRoute = route
+						break
+					end
+				end
+				releaseLook()
+			end
+
+			Settings.testedRoutes = { Use = useRoute, Attack = attackRoute }
+			markDirty()
+			local useText = useRoute or (useSlot and "nothing worked" or "no countable item")
+			local attackText = attackRoute or (victim and "nothing worked" or "no target in reach")
+			notify("Use: " .. useText)
+			notify("Attack: " .. attackText)
+		end)
+	end
+
+	---Auto input mode: after several close, aimed swings that did no damage, try the next way of pressing Attack.
+	local function learnAttackRoute()
+		if Settings.inputMode ~= 1 then
+			-- Leaving Auto resets what was learned, so switching back starts fresh.
+			State.hitProbe, State.routeLocked, State.learnedRoute, State.routeIndex, State.routeMisses = nil, false, nil, 0, 0
+			return
+		end
+		local probe = State.hitProbe
+		if not probe then return end
+		local health = probe.character.Parent and getModelHealth(probe.character)
+		if health then
+			probe.lowest = math.min(probe.lowest, health)
+		end
+		if os.clock() - probe.at < Const.ROUTE_PROBE_TIME then return end
+		State.hitProbe = nil
+		if State.routeLocked then return end
+
+		if probe.lowest < probe.health then
+			State.routeLocked, State.routeMisses = true, 0
+			notify("Hits confirmed  •  " .. (State.learnedRoute or "Auto"))
+			return
+		end
+		if not probe.counts then return end
+		State.routeMisses += 1
+		if State.routeMisses < Const.ROUTE_MISS_LIMIT then return end
+
+		State.routeMisses = 0
+		State.routeIndex += 1
+		State.learnedRoute = ({ "Real Touch", "Global Touch", "Virtual Click", "Tool Activate", "Button Signals" })[State.routeIndex]
+		if State.learnedRoute then
+			notify("No damage yet, trying " .. State.learnedRoute)
+			return
+		end
+		State.routeLocked = true
+		notify("Couldn't confirm hits  •  try Input Mode or Copy Diagnostics")
+	end
+
+	---Whether the hand holds the mace, by the game's name popup or the Tool's name.
+	---@return boolean
+	local function holdingMace()
+		local tool = getHeldTool()
+		local name = getHeldItemName() or (tool and tool.Name)
+		if not name then return false end
+		local expected = State.hotbarNames[Settings.maceSlot]
+		return (expected ~= nil and expected ~= "" and name == expected) or string.find(string.lower(name), "mace", 1, true) ~= nil
+	end
+
+	---Pick who the aura hits: stick to the current target, or rotate / focus lowest HP.
+	---@param inRange {table}
+	---@return table
+	local function pickAuraTarget(inRange)
+		if Settings.auraSwitch then
+			-- Move on only after a swing, so the camera has time to line up on each target.
+			if not State.auraRotate then
+				for index, entry in ipairs(inRange) do
+					if entry.character == State.auraTarget then
+						State.auraIndex = index
+						return entry
+					end
+				end
+			end
+			State.auraRotate = false
+			State.auraIndex = State.auraIndex % #inRange + 1
+			return inRange[State.auraIndex]
+		end
+
+		for _, entry in ipairs(inRange) do
+			if entry.character == State.auraTarget then
+				return entry
+			end
+		end
+
+		local best = inRange[1]
+		if Settings.auraFocusLowest then
+			for _, entry in ipairs(inRange) do
+				if (getModelHealth(entry.character) or math.huge) < (getModelHealth(best.character) or math.huge) then
+					best = entry
+				end
+			end
+		end
+		return best
+	end
+
+	---Hit whoever is in reach.
+	---@param frame table
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	local function stepKillAura(frame, rootPart, humanoid)
+		if not Settings.killAura or State.busy or State.maceArmed then return end
+
+		local inRange = entriesInRange(frame, Settings.killAuraRange)
+		if #inRange == 0 then
+			State.auraIndex, State.auraTarget, State.auraEngaged = 0, nil, false
+			return
+		end
+
+		local now = os.clock()
+		-- Pull out the sword the first time someone steps into reach, and give it a beat to equip.
+		if Settings.autoWeapon and not State.auraEngaged then
+			if selectSlot(Settings.swordSlot) then
+				State.lastSwing = now
+			end
+		end
+		State.auraEngaged = true
+
+		local entry = pickAuraTarget(inRange)
+		State.auraTarget = entry.character
+		if entry.character ~= State.auraAimTarget then
+			State.auraAimTarget, State.auraAimSince = entry.character, now
+		end
+		if now - State.lastSwing < Settings.killAuraDelay then return end
+
+		-- The game hits whatever the camera looks at, so wait until the aim is on them (briefly).
+		local aimPart = Settings.killAuraFace and Settings.cameraMode == 3 and getAuraAimPart(entry.character)
+		if aimPart and now - State.auraAimSince < Const.AURA_AIM_TIMEOUT then
+			local tolerance = math.max(Const.AURA_AIM_TOLERANCE, math.atan(2 / math.max(entry.distance, 0.1)))
+			if getAimError(aimPart.Position) > tolerance then return end
+		end
+
+		-- Criticals: hop and swing on the way down; swing normally if the jump never happens.
+		if Settings.criticals then
+			local airborne = humanoid.FloorMaterial == Enum.Material.Air
+			if airborne then
+				if rootPart.AssemblyLinearVelocity.Y > -1 then return end
+			elseif now - State.critJumpAt > Const.CRIT_TIMEOUT * 2 then
+				State.critJumpAt = now
+				humanoid.Jump = true
+				return
+			elseif now - State.critJumpAt < Const.CRIT_TIMEOUT then
+				return
+			end
+		end
+
+		State.lastSwing = now
+		State.auraRotate = true
+		attackTarget(rootPart, entry.character)
+	end
+
+	---Drag the camera onto the aura target every frame, after the game's own camera has run.
+	updateAuraCamera = LPH_NO_VIRTUALIZE(function(deltaTime)
+		if State.lookFn or not currentCamera then return end
+		if State.busy and not (State.comboSequence and State.maceTarget) then return end
+		local follow = Settings.cameraMode == 3
+		local maceTarget = State.maceTarget
+		if maceTarget and not (follow or os.clock() < State.comboUntil) then
+			maceTarget = nil
+		end
+		local character = maceTarget or (follow and State.auraTarget)
+		if not (character and character.Parent) then return end
+		if not maceTarget and not (Settings.killAura and Settings.killAuraFace) then return end
+
+		local aimPart = getAuraAimPart(character)
+		if not aimPart then return end
+
+		-- A falling smash has no time to ease in, so the mace always snaps.
+		local snap = (maceTarget and State.maceFalling) or Settings.auraDragSpeed >= 10
+		local alpha = snap and 1 or 1 - math.exp(-deltaTime * math.max(Settings.auraDragSpeed, 6) * 4)
+		aimCamera(getPredictedPosition(aimPart, character), alpha)
+	end)
+
+	---Track how far we've dropped since the highest point of this airtime.
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	---@return number, boolean
+	local function updateFall(rootPart, humanoid)
+		local height = rootPart.Position.Y
+		local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+		if grounded or not State.fallPeak then
+			State.fallPeak = height
+		else
+			State.fallPeak = math.max(State.fallPeak, height)
+		end
+		return State.fallPeak - height, grounded
+	end
+
+	---Jump like the player would: humanoid jump plus the game's own Jump button if it listens to it.
+	---@param humanoid Humanoid
+	local function pressJump(humanoid)
+		humanoid.Jump = true
+		local control = getControl("Jump")
+		if control and isShown(control) and hasHandlers(control) then
+			setControl(control, true)
+			task.delay(Const.CLICK_HOLD, setControl, control, false)
+		end
+	end
+
+	---Frame-timed wind charge at the feet: throw then jump (default), or jump then throw in the air.
+	---Pass awayDirection to tilt the blast so it pushes us that way; armMace swaps to the mace mid-air.
+	---@param humanoid Humanoid
+	---@param armMace boolean?
+	---@param awayDirection Vector3?
+	local function windLaunch(humanoid, armMace, awayDirection, tiltScale)
+		runSequence(function(sleep)
+			State.comboSequence = armMace and true or false
+			local originalLook = currentCamera.CFrame.LookVector
+			equipSlot(Settings.windSlot, sleep)
+
+			local character = localPlayer.Character
+			local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+			if not rootPart then return end
+
+			-- Never throw the wrong item: if the game says this isn't the wind charge, relearn the hotbar.
+			if not heldItemMatches("windSlot") then
+				notify(string.format("Slot %d is %s, not a wind charge, rescanning", Settings.windSlot, getHeldItemName() or "?"))
+				task.defer(scanHotbar, true)
+				return
+			end
+
+			local flat = Vector3.new(originalLook.X, 0, originalLook.Z)
+			flat = flat.Magnitude > 1e-3 and flat.Unit or Vector3.zAxis
+			local tilt = awayDirection and -awayDirection * (tiltScale or 1.2) or flat * 0.05
+			local function feet()
+				return rootPart.Position - Vector3.yAxis * 3 + tilt
+			end
+
+			local cursor = centerCursor()
+			lookAt(feet)
+			-- A throw before the view is down goes forward instead of at the feet; slower cameras (swipe aim) need a moment.
+			local aimStart = os.clock()
+			while getAimError(feet()) > Const.WIND_AIM_TOLERANCE and os.clock() - aimStart < Const.WIND_AIM_WAIT do
+				runService.RenderStepped:Wait()
+			end
+			sleep(0)
+
+			if Settings.windOrder == 1 then
+				-- Throw at the feet, then jump as the burst goes off for the most height.
+				tapUse()
+				sleep(Const.WIND_JUMP_AFTER_THROW)
+				pressJump(humanoid)
+			else
+				pressJump(humanoid)
+				local start = os.clock()
+				repeat
+					sleep()
+				until humanoid.FloorMaterial == Enum.Material.Air or os.clock() - start > Const.WIND_JUMP_TIMEOUT
+				sleep(Const.WIND_THROW_DELAY)
+				tapUse()
+			end
+			local thrownAt = os.clock()
+			local bestRise = rootPart.AssemblyLinearVelocity.Y
+
+			for _ = 1, Const.LOOK_SETTLE_FRAMES do
+				runService.RenderStepped:Wait()
+			end
+			sleep(0)
+
+			-- Air boost: throw more charges at the top of each rise for a bigger fall.
+			for _ = 1, Settings.airBoostCharges do
+				local start = os.clock()
+				repeat
+					sleep()
+				until rootPart.AssemblyLinearVelocity.Y < Const.AIR_BOOST_APEX or os.clock() - start > Const.AIR_BOOST_TIMEOUT
+				-- Already dropping: a late charge only delays the mace.
+				if rootPart.AssemblyLinearVelocity.Y < -15 then break end
+				lookAt(feet)
+				sleep(0)
+				tapUse()
+				for _ = 1, Const.LOOK_SETTLE_FRAMES do
+					runService.RenderStepped:Wait()
+				end
+			end
+
+			releaseLook(originalLook)
+			restoreCursor(cursor)
+
+			-- Swap while still rising so the mace is ready before the drop.
+			if armMace then
+				equipSlot(Settings.maceSlot, sleep)
+				State.maceArmed, State.maceSwung = true, false
+				-- Slow equips eat into the smash window, so it starts counting from here.
+				State.comboUntil = math.max(State.comboUntil, os.clock() + 2)
+				if not heldItemMatches("maceSlot") then
+					notify(string.format("Slot %d is %s, not a mace", Settings.maceSlot, getHeldItemName() or "?"))
+				end
+			else
+				equipSlot(Settings.swordSlot, sleep)
+			end
+
+			-- Tell the player when the blast didn't lift them; runs on the side so the smash isn't held up.
+			task.spawn(function()
+				while os.clock() - thrownAt < Const.LAUNCH_CHECK_TIME do
+					bestRise = math.max(bestRise, rootPart.AssemblyLinearVelocity.Y)
+					if bestRise >= Const.LAUNCH_MIN_RISE then return end
+					task.wait()
+				end
+				if os.clock() - State.launchWarnedAt > 30 then
+					State.launchWarnedAt = os.clock()
+					notify(State.cameraDriver and "Wind didn't launch you, try Input Mode" or "Wind didn't launch, camera not synced yet")
+				end
+			end)
+		end)
+	end
+
+	---Wind charge launch then mace smash on the nearest target, on demand (button or keybind).
+	function comboSmash()
+		-- Spam taps queue nothing; one tap starts one combo.
+		local now = os.clock()
+		if now - State.smashTapAt < Const.SMASH_TAP_DEBOUNCE then return end
+		State.smashTapAt = now
+
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not humanoid or humanoid.Health <= 0 then return end
+		if State.busy then
+			notify("Busy, tap SMASH again in a moment")
+			return
+		end
+		if State.missingItems.windSlot then
+			notify("No wind charge in this kit")
+			return
+		end
+		State.comboUntil = now + 3
+		State.lastWind = now
+		windLaunch(humanoid, true)
+	end
+
+	---Wind dash: blast behind our feet to fly forward the way the camera faces.
+	function windDash()
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not humanoid or humanoid.Health <= 0 or State.busy then return end
+		if State.missingItems.windSlot then
+			notify("No wind charge in this kit")
+			return
+		end
+
+		local look = currentCamera.CFrame.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		windLaunch(humanoid, false, flat.Magnitude > 1e-3 and flat.Unit or Vector3.zAxis, Const.DASH_TILT)
+	end
+
+	---Whether we'll touch the ground (or the target) within the lookahead window.
+	---@param rootPart BasePart
+	---@param velocity Vector3
+	---@return boolean
+	local function isLandingSoon(rootPart, velocity)
+		local drop = math.max(-velocity.Y * Const.MACE_LANDING_LOOKAHEAD, 0) + rootPart.Size.Y / 2 + 3.2
+		raycastParams.FilterDescendantsInstances = { currentCamera, localPlayer.Character }
+		return workspace:Raycast(rootPart.Position, Vector3.new(0, -drop, 0), raycastParams) ~= nil
+	end
+
+	---The frame entry that still points at a character.
+	---@param frame table
+	---@param character Model?
+	---@return table?
+	local function findEntry(frame, character)
+		if not character then return end
+		for _, entry in ipairs(frame) do
+			if entry.character == character then
+				return entry
+			end
+		end
+	end
+
+	---Where the mace hits: the head while head lock is on, the body otherwise.
+	---@param character Model
+	---@return BasePart?
+	local function maceAimPoint(character)
+		local head = character:FindFirstChild(Const.AIM_PART)
+		if Settings.maceHeadLock and head and head:IsA("BasePart") then
+			return head
+		end
+		return getRootPart(character)
+	end
+
+	---Grow a character's hitbox, remembering its real size.
+	---@param character Model
+	local function applyHitbox(character)
+		local root = getRootPart(character)
+		if not root then return end
+		if hitboxCache[root] == nil then
+			hitboxCache[root] = root.Size
+		end
+		local size = math.max(Settings.hitboxSize, 2)
+		if root.Size ~= Vector3.new(size, size, size) then
+			root.Size = Vector3.new(size, size, size)
+		end
+	end
+
+	---Put every hitbox we grew back the way it was.
+	function restoreHitboxes()
+		for part, size in pairs(hitboxCache) do
+			if part.Parent then
+				part.Size = size
+			end
+			hitboxCache[part] = nil
+		end
+	end
+
+	---Keep the humanoid's real numbers from before any feature changed them.
+	---@param humanoid Humanoid
+	local function captureDefaults(humanoid)
+		if State.baseSpeed == nil then
+			State.baseSpeed = humanoid.WalkSpeed
+		end
+		if State.baseJump == nil then
+			State.baseJump = humanoid.JumpPower
+		end
+	end
+
+	---One frame of the BodyVelocity we fly with.
+	---@param rootPart BasePart
+	---@return BodyVelocity
+	local function getFlyBody(rootPart)
+		local body = rootPart:FindFirstChild("UnstableFly")
+		if not body then
+			body = create("BodyVelocity", {
+				Name = "UnstableFly",
+				MaxForce = Vector3.new(1e5, 1e5, 1e5),
+				P = 1250,
+				Velocity = Vector3.zero,
+				Parent = rootPart,
+			})
+		end
+		return body
+	end
+
+	---Direction the player is steering: stick input, or WASD when the thumbstick is idle.
+	---@return Vector3
+	local function getMoveDirection()
+		local direction = Vector3.zero
+		local look = currentCamera.CFrame.LookVector
+		local right = currentCamera.CFrame.RightVector
+		if userInputService:IsKeyDown(Enum.KeyCode.W) then direction += look end
+		if userInputService:IsKeyDown(Enum.KeyCode.S) then direction -= look end
+		if userInputService:IsKeyDown(Enum.KeyCode.D) then direction += right end
+		if userInputService:IsKeyDown(Enum.KeyCode.A) then direction -= right end
+		return direction
+	end
+
+	---Speed, jump, flight and every movement module, once per frame.
+	---@param deltaTime number
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	local function stepMovement(deltaTime, rootPart, humanoid)
+		local speed = (State.baseSpeed or 16) + (Settings.speedBoost and Settings.speedAmount or 0)
+		if humanoid.WalkSpeed ~= speed then
+			humanoid.WalkSpeed = speed
+		end
+
+		-- Jump power only while High Jump is on; otherwise leave the game's own value alone.
+		if Settings.highJump then
+			humanoid.UseJumpPower = true
+			if humanoid.JumpPower ~= Settings.highJumpPower then
+				humanoid.JumpPower = Settings.highJumpPower
+			end
+		elseif State.baseJump and humanoid.UseJumpPower and humanoid.JumpPower ~= State.baseJump then
+			humanoid.JumpPower = State.baseJump
+		end
+
+		local velocity = rootPart.AssemblyLinearVelocity
+		local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+		State.grounded = grounded
+
+		if Settings.fly then
+			local body = getFlyBody(rootPart)
+			humanoid.PlatformStand = true
+			local direction = humanoid.MoveDirection
+			if direction.Magnitude < 0.05 then
+				direction = getMoveDirection()
+			end
+			direction = direction.Magnitude > 0.05 and direction.Unit or Vector3.zero
+			if userInputService:IsKeyDown(Enum.KeyCode.Space) then
+				direction += Vector3.yAxis
+			end
+			if userInputService:IsKeyDown(Enum.KeyCode.LeftShift) or userInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+				direction -= Vector3.yAxis
+			end
+			body.Velocity = direction * Settings.flySpeed
+			State.safeCFrame = rootPart.CFrame
+			return
+		end
+
+		local flyBody = rootPart:FindFirstChild("UnstableFly")
+		if flyBody then
+			flyBody:Destroy()
+			if humanoid.PlatformStand then
+				humanoid.PlatformStand = false
+			end
+		end
+
+		local jumpDown = userInputService:IsKeyDown(Enum.KeyCode.Space)
+		if grounded then
+			State.airJumps = 0
+			State.safeCFrame = rootPart.CFrame
+			State.jumpAt = nil
+			if Settings.bunnyHop and humanoid.MoveDirection.Magnitude > 0.1 then
+				humanoid.Jump = true
+			end
+		end
+
+		-- Air jump: one extra hop off the ground, refreshed on landing.
+		if Settings.airJump and not grounded then
+			State.airJumps = State.airJumps or 0
+			if jumpDown and not State.jumpHeld and State.airJumps < 1 then
+				State.airJumps += 1
+				local flat = velocity * Vector3.new(1, 0, 1)
+				rootPart.AssemblyLinearVelocity = flat + Vector3.yAxis * math.max(State.baseJump or 50, 30)
+			end
+		end
+		State.jumpHeld = jumpDown
+
+		-- Long jump pushes off the moment the feet leave the ground.
+		if Settings.longJump and State.wasJumping and not grounded and humanoid.MoveDirection.Magnitude > 0.1 then
+			local flat = velocity * Vector3.new(1, 0, 1)
+			if flat.Magnitude < Settings.longJumpPower then
+				rootPart.AssemblyLinearVelocity = humanoid.MoveDirection.Unit * Settings.longJumpPower + Vector3.yAxis * velocity.Y
+			end
+		end
+		State.wasJumping = grounded
+
+		-- Air control steers the fall without touching the horizontal speed on the ground.
+		if Settings.airControl and not grounded and humanoid.MoveDirection.Magnitude > 0.1 then
+			local flat = velocity * Vector3.new(1, 0, 1)
+			local wanted = humanoid.MoveDirection.Unit * speed
+			local blended = flat:Lerp(wanted, math.clamp(deltaTime * 6, 0, 1))
+			rootPart.AssemblyLinearVelocity = blended + Vector3.yAxis * velocity.Y
+		end
+
+		-- Spider climbs whatever wall the player walks into.
+		if Settings.spider and not grounded and humanoid.MoveDirection.Magnitude > 0.05 then
+			raycastParams.FilterDescendantsInstances = { localPlayer.Character }
+			if workspace:Raycast(rootPart.Position, humanoid.MoveDirection.Unit * 2.5, raycastParams) then
+				rootPart.AssemblyLinearVelocity = Vector3.new(
+					humanoid.MoveDirection.X * Const.SPIDER_SPEED * 0.4,
+					Const.SPIDER_SPEED,
+					humanoid.MoveDirection.Z * Const.SPIDER_SPEED * 0.4
+				)
+			end
+		end
+
+		-- Auto jump hops small ledges; Safe walk refuses to walk off a drop.
+		if Settings.autoJump and grounded and humanoid.MoveDirection.Magnitude > 0.05 then
+			raycastParams.FilterDescendantsInstances = { localPlayer.Character }
+			local ahead = workspace:Raycast(rootPart.Position, humanoid.MoveDirection.Unit * Const.AUTO_JUMP_PROBE, raycastParams)
+			if ahead then
+				humanoid.Jump = true
+			end
+		end
+		if Settings.safeWalk and grounded and humanoid.MoveDirection.Magnitude > 0.05 then
+			raycastParams.FilterDescendantsInstances = { localPlayer.Character }
+			local probe = humanoid.MoveDirection.Unit * Const.SAFE_WALK_AHEAD - Vector3.yAxis * Const.SAFE_WALK_DROP
+			if not workspace:Raycast(rootPart.Position, probe, raycastParams) then
+				humanoid:Move(Vector3.zero, false)
+			end
+		end
+
+		-- Mace dive slams straight down while airborne.
+		if Settings.maceDive and not grounded and velocity.Y > -Settings.diveSpeed then
+			rootPart.AssemblyLinearVelocity = Vector3.new(velocity.X, -Settings.diveSpeed, velocity.Z)
+		end
+
+		-- Anti void: drop under the map and get put back on the last solid ground.
+		if Settings.antiVoid and State.safeCFrame and rootPart.Position.Y < workspace.FallenPartsDestroyHeight + Const.VOID_DROP then
+			rootPart.CFrame = State.safeCFrame + Vector3.yAxis * 4
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			notify("Anti Void caught you")
+		end
+	end
+
+	---Start a smash on a target without the wind launch (tool already in hand).
+	---@param entry table
+	local function beginSmash(entry)
+		if not heldItemMatches("maceSlot") then
+			task.spawn(equipSlot, Settings.maceSlot, nil)
+		end
+		State.maceTarget = entry.character
+		State.maceArmed, State.maceSwung, State.maceFalling = true, false, false
+		State.maceSwungAt = 0
+		State.comboUntil = math.max(State.comboUntil, os.clock() + 3)
+	end
+
+	---Swing the mace at an entry that is actually under us.
+	---@param entry table
+	---@param point BasePart
+	local function swingMace(entry, point)
+		State.maceSwung = true
+		State.maceSwungAt = os.clock()
+		State.lastSwing = State.maceSwungAt
+		State.comboUntil = State.maceSwungAt + 1.2
+		pressAttack()
+
+		-- Burst: one more tap on the same arc, in case the first missed.
+		if Settings.smashBurst then
+			task.delay(Const.CLICK_HOLD * 2, function()
+				if Unstable.running and State.maceTarget == entry.character then
+					pressAttack()
+				end
+			end)
+		end
+		-- Follow up: back to the sword for the survivors.
+		if Settings.smashFollowUp then
+			task.delay(0.25, function()
+				if Unstable.running and not State.busy and not State.maceArmed then
+					equipSlot(Settings.swordSlot, nil)
+				end
+			end)
+		end
+	end
+
+	---Auto mace, smash chain and smash assist share this state machine.
+	---@param frame table
+	---@param deltaTime number
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	local function stepMace(frame, deltaTime, rootPart, humanoid)
+		local now = os.clock()
+
+		if not State.maceArmed then
+			if State.busy then return end
+			local victim = nearestEntry(frame, Settings.smashRadius)
+			if not victim then return end
+
+			if Settings.autoMace and now - State.lastWind > 2.5 and not State.missingItems.windSlot then
+				State.lastWind, State.comboUntil = now, now + 3
+				windLaunch(humanoid, true)
+				return
+			end
+
+			-- Smash assist swings the mace at whatever falls into reach, no launch needed.
+			if Settings.smashAssist and humanoid.FloorMaterial == Enum.Material.Air then
+				beginSmash(victim)
+			end
+			return
+		end
+
+		if now > State.comboUntil then
+			State.maceArmed, State.maceTarget, State.maceFalling = false, nil, false
+			return
+		end
+
+		local entry = findEntry(frame, State.maceTarget)
+		if not entry then
+			State.maceArmed, State.maceTarget, State.maceFalling = false, nil, false
+			return
+		end
+
+		local velocity = rootPart.AssemblyLinearVelocity
+		local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+		State.maceFalling = (not grounded) and velocity.Y < 0
+
+		local point = maceAimPoint(entry.character)
+		if not point then
+			State.maceArmed = false
+			return
+		end
+
+		-- Steer the drop so the mace lands on them instead of beside them.
+		if Settings.maceSteer and not grounded then
+			local flat = (entry.root.Position - rootPart.Position) * Vector3.new(1, 0, 1)
+			if flat.Magnitude > 1 then
+				local wanted = flat.Unit * math.min(flat.Magnitude * 1.5, 30)
+				rootPart.AssemblyLinearVelocity = Vector3.new(wanted.X, velocity.Y, wanted.Z)
+			end
+		end
+
+		-- Head lock eases the camera over instead of snapping, so the game's own camera keeps up.
+		if Settings.maceHeadLock then
+			local alpha = 1 - math.exp(-deltaTime * math.max(Settings.headLockSpeed, 1))
+			aimCamera(point.Position + entry.root.AssemblyLinearVelocity * Const.MACE_LEAD, alpha)
+		end
+
+		local distance = (entry.root.Position - rootPart.Position).Magnitude
+		local aimed = getAimError(point.Position) <= math.rad(35)
+		local landing = isLandingSoon(rootPart, velocity)
+		local fall = State.fallPeak and math.max(State.fallPeak - rootPart.Position.Y, 0) or 0
+
+		-- maceMinFall keeps the mace off short hops, where the smash does almost nothing.
+		local canHit = distance <= Settings.smashRadius and (fall >= Settings.maceMinFall or landing or grounded)
+
+		if not State.maceSwung and aimed and canHit then
+			swingMace(entry, point)
+			return
+		end
+
+		if State.maceSwung then
+			-- Back on the ground with the swing spent: the smash is over.
+			if grounded and now - State.maceSwungAt > 0.35 then
+				State.maceArmed, State.maceTarget, State.maceFalling = false, nil, false
+			end
+			-- Smash chain: another launch straight away if someone else is still close.
+			if Settings.smashChain and now - State.maceSwungAt > 0.5 and not State.busy and now - State.lastWind > 1 then
+				local nextTarget = nearestEntry(frame, Settings.smashRadius * 1.4)
+				if nextTarget and not State.missingItems.windSlot then
+					State.lastWind, State.comboUntil = now, now + 3
+					windLaunch(humanoid, true)
+				end
+			end
+		end
+	end
+
+	---Swing while the crosshair sits on an enemy in reach.
+	---@param frame table
+	---@param rootPart BasePart
+	local function stepTriggerbot(frame, rootPart)
+		if not Settings.triggerbot or State.busy then return end
+		if os.clock() - State.lastSwing < math.max(Settings.killAuraDelay, 0.05) then return end
+
+		local entry = nearestEntry(frame, math.min(Const.TRIGGER_DISTANCE, Settings.killAuraRange + 4))
+		if not entry then return end
+		local part = getAuraAimPart(entry.character)
+		if not part then return end
+		if getAimError(part.Position) > math.rad(4) then return end
+
+		State.lastSwing = os.clock()
+		pressAttack()
+	end
+
+	---Orbit the current target at the strafe radius.
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	local function stepStrafe(rootPart, humanoid)
+		if not Settings.targetStrafe then return end
+		local player = State.aimTarget
+		local character = (player and player.Character) or State.auraTarget
+		if not (character and character.Parent) then return end
+
+		local root = getRootPart(character)
+		if not root then return end
+
+		local offset = (root.Position - rootPart.Position) * Vector3.new(1, 0, 1)
+		local distance = offset.Magnitude
+		if distance < 0.5 then return end
+
+		local radial = offset.Unit
+		local tangent = Vector3.new(-radial.Z, 0, radial.X)
+		local correction = radial * (distance - Settings.strafeRadius) * 0.6
+		humanoid:Move((tangent + correction).Unit, false)
+	end
+	---Turn a world position into screen pixels.
+	---@param position Vector3
+	---@return Vector2?
+	local function worldToScreen(position)
+		local screen, onScreen = currentCamera:WorldToViewportPoint(position)
+		if not onScreen then return end
+		return Vector2.new(screen.X, screen.Y)
+	end
+
+	---The ScreenGui that holds the 2D tracers.
+	---@return ScreenGui
+	local function tracerGui()
+		if espFolder and espFolder.Parent then return espFolder end
+		espFolder = create("ScreenGui", {
+			Name = "UnstableTracers",
+			IgnoreGuiInset = true,
+			ResetOnSpawn = false,
+			DisplayOrder = 4,
+			Parent = guiRoot,
+		})
+		return espFolder
+	end
+
+	---Build the nametag and highlight for one character.
+	---@param character Model
+	---@return table?
+	local function createEsp(character)
+		local head = character:FindFirstChild(Const.AIM_PART) or getRootPart(character)
+		if not head then return end
+
+		local highlight = create("Highlight", {
+			Name = "UnstableEsp",
+			Adornee = character,
+			FillColor = Const.ACCENT,
+			FillTransparency = 0.75,
+			OutlineColor = Const.ACCENT_ALT,
+			OutlineTransparency = 0.2,
+			DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+			Parent = character,
+		})
+
+		local billboard = create("BillboardGui", {
+			Name = "UnstableEsp",
+			Size = UDim2.fromOffset(150, 40),
+			StudsOffset = Vector3.new(0, 2.5, 0),
+			AlwaysOnTop = true,
+			MaxDistance = 300,
+			ResetOnSpawn = false,
+			LightInfluence = 0,
+			Parent = head,
+		})
+
+		create("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Const.BACKGROUND,
+			BackgroundTransparency = 0.2,
+			BorderSizePixel = 0,
+			Parent = billboard,
+		}, {
+			corner(6),
+			create("UIStroke", { Color = Const.ACCENT, Transparency = 0.4, Thickness = 1 }),
+		})
+
+		local nameLabel = label({
+			Size = UDim2.new(1, -10, 0, 16),
+			Position = UDim2.fromOffset(5, 3),
+			Text = character.Name,
+			Font = Const.FONT,
+			TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = billboard,
+		})
+		local track = create("Frame", {
+			Size = UDim2.new(1, -10, 0, 4),
+			Position = UDim2.new(0, 5, 1, -9),
+			BackgroundColor3 = Const.TRACK,
+			BorderSizePixel = 0,
+			Parent = billboard,
+		}, { corner(2) })
+		local fill = create("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.fromRGB(120, 230, 140),
+			BorderSizePixel = 0,
+			Parent = track,
+		}, { corner(2) })
+
+		return { highlight = highlight, billboard = billboard, name = nameLabel, fill = fill, at = 0 }
+	end
+
+	---Refresh one character's nametag, at most a few times a second.
+	---@param record table
+	---@param entry table
+	---@param now number
+	local function updateEsp(record, entry, now)
+		if now - record.at < Const.ESP_TEXT_RATE then return end
+		record.at = now
+
+		local health, maxHealth = getModelHealth(entry.character)
+		local ratio = (health and maxHealth and maxHealth > 0) and math.clamp(health / maxHealth, 0, 1) or 1
+		local player = playersService:GetPlayerFromCharacter(entry.character)
+		local name = player and player.DisplayName or entry.character.Name
+
+		record.name.Text = string.format("%s  •  %.0fm", name, entry.distance)
+		record.fill.Size = UDim2.fromScale(ratio, 1)
+		record.fill.BackgroundColor3 = Color3.fromRGB(120, 230, 140):Lerp(Color3.fromRGB(255, 90, 90), 1 - ratio)
+	end
+
+	---Draw the line from the bottom of the screen to one player.
+	---@param player Player
+	---@param character Model
+	local function updateTracer(player, character)
+		local root = getRootPart(character)
+		local screen = root and worldToScreen(root.Position + Vector3.yAxis * 1.5)
+		local frame = tracerFrames[player]
+
+		if not screen then
+			if frame then frame.Visible = false end
+			return
+		end
+
+		if not frame then
+			frame = create("Frame", {
+				Name = player.Name,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundColor3 = Const.ACCENT,
+				BorderSizePixel = 0,
+				ZIndex = 1,
+				Parent = tracerGui(),
+			})
+			tracerFrames[player] = frame
+		end
+
+		local viewport = currentCamera.ViewportSize
+		local origin = Vector2.new(viewport.X / 2, viewport.Y)
+		local delta = screen - origin
+		frame.Visible = true
+		frame.Size = UDim2.fromOffset(math.max(delta.Magnitude, 1), 1)
+		frame.Position = UDim2.fromOffset(origin.X + delta.X / 2, origin.Y + delta.Y / 2)
+		frame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+		frame.BackgroundTransparency = 0.25
+	end
+
+	---Take one character's ESP and tracer off.
+	---@param character Model
+	function removeEsp(character)
+		local record = espObjects[character]
+		if record then
+			for _, object in pairs(record) do
+				if typeof(object) == "Instance" and object.Parent then
+					object:Destroy()
+				end
+			end
+			espObjects[character] = nil
+		end
+
+		local player = playersService:GetPlayerFromCharacter(character)
+		local frame = player and tracerFrames[player]
+		if frame then
+			frame:Destroy()
+			tracerFrames[player] = nil
+		end
+	end
+
+	---Remove every nametag, highlight and tracer.
+	function clearEsp()
+		for character in pairs(espObjects) do
+			removeEsp(character)
+		end
+		for player, frame in pairs(tracerFrames) do
+			frame:Destroy()
+			tracerFrames[player] = nil
+		end
+		if espFolder then
+			espFolder.Parent = nil
+			espFolder = nil
+		end
+	end
+
+	---ESP, nametags and tracers for this frame.
+	---@param frame table
+	local function stepEsp(frame)
+		if not (Settings.esp or Settings.tracers) then
+			if next(espObjects) or next(tracerFrames) then
+				clearEsp()
+			end
+			return
+		end
+
+		local now = os.clock()
+		local alive = {}
+
+		for _, entry in ipairs(frame) do
+			local character = entry.character
+			alive[character] = true
+
+			if Settings.esp then
+				local record = espObjects[character]
+				if not (record and record.highlight.Parent) then
+					record = createEsp(character)
+					espObjects[character] = record
+				end
+				if record then
+					updateEsp(record, entry, now)
+				end
+			elseif espObjects[character] then
+				removeEsp(character)
+			end
+
+			local player = playersService:GetPlayerFromCharacter(character)
+			if player then
+				if Settings.tracers then
+					updateTracer(player, character)
+				elseif tracerFrames[player] then
+					tracerFrames[player]:Destroy()
+					tracerFrames[player] = nil
+				end
+			end
+		end
+
+		for character in pairs(espObjects) do
+			if not alive[character] then
+				removeEsp(character)
+			end
+		end
+		for player, tracer in pairs(tracerFrames) do
+			local character = player.Character
+			if not (Settings.tracers and character and alive[character]) then
+				tracer:Destroy()
+				tracerFrames[player] = nil
+			end
+		end
+	end
+
+	---Target card: who we're on, their health and how far away they are.
+	---@param frame table
+	local function stepTargetHud(frame)
+		if not targetHud then return end
+
+		local character = (State.aimTarget and State.aimTarget.Character) or State.auraTarget
+		local entry = findEntry(frame, character)
+		if not (Settings.targetHud and entry) then
+			targetHud.Visible = false
+			return
+		end
+
+		targetHud.Visible = true
+		local health, maxHealth = getModelHealth(entry.character)
+		local ratio = (health and maxHealth and maxHealth > 0) and math.clamp(health / maxHealth, 0, 1) or 1
+		State.hudRatio = State.hudRatio or ratio
+		State.hudRatio += (ratio - State.hudRatio) * 0.25
+
+		local player = playersService:GetPlayerFromCharacter(entry.character)
+		hudName.Text = player and player.DisplayName or entry.character.Name
+		hudInfo.Text = string.format("%d HP  •  %.0f m", math.floor(health or 0), entry.distance)
+		hudFill.Size = UDim2.fromScale(State.hudRatio, 1)
+		hudFill.BackgroundColor3 = Color3.fromRGB(120, 230, 140):Lerp(Color3.fromRGB(255, 90, 90), 1 - State.hudRatio)
+	end
+
+	---Red edges pulse when health runs low.
+	---@param humanoid Humanoid
+	local function stepVignette(humanoid)
+		local ratio = humanoid.MaxHealth > 0 and humanoid.Health / humanoid.MaxHealth or 1
+		local low = Settings.lowHealthWarning and ratio < 0.3
+
+		if low and not State.lowHealthWarned then
+			State.lowHealthWarned = true
+			notify("Low health")
+		elseif not low then
+			State.lowHealthWarned = false
+		end
+
+		if not healthVignette then return end
+		healthVignette.Visible = low
+		if not low then return end
+
+		local alpha = math.clamp(0.5 + math.sin(os.clock() * 4) * 0.12, 0, 1)
+		for _, edge in ipairs(healthVignette:GetChildren()) do
+			local gradient = edge:FindFirstChildOfClass("UIGradient")
+			if gradient then
+				gradient.Transparency = NumberSequence.new({
+					NumberSequenceKeypoint.new(0, 1 - alpha),
+					NumberSequenceKeypoint.new(0.55, 0.85),
+					NumberSequenceKeypoint.new(1, 1),
+				})
+			end
+		end
+	end
+
+	---Ring on the floor that shows the kill aura range.
+	---@param rootPart BasePart
+	local function stepReachRing(rootPart)
+		if not reachRing then return end
+
+		local visible = Settings.reachCircle and Settings.killAura
+		if reachRing.Parent == nil and not visible then return end
+		reachRing.Parent = visible and workspace or nil
+		if not visible then return end
+
+		local radius = Settings.killAuraRange
+		local origin = rootPart.Position - Vector3.yAxis * 1.6
+		for _, tick in ipairs(reachRing:GetChildren()) do
+			local angle = tick:GetAttribute("Angle") or 0
+			local position = origin + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+			local tangent = Vector3.new(-math.sin(angle), 0, math.cos(angle))
+			tick.CFrame = CFrame.lookAt(position, position + tangent)
+		end
+	end
+
+	---Fall distance readout while the mace (or a dive) is in play.
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	local function stepFallMeter(rootPart, humanoid)
+		local fall, grounded = updateFall(rootPart, humanoid)
+		if not fallLabel then return end
+
+		local visible = Settings.fallMeter and (State.maceArmed or Settings.maceDive) and not grounded
+		fallLabel.Visible = visible
+		if visible then
+			fallLabel.Text = string.format("%.1f m", math.max(fall, 0))
+		end
+	end
+	---Eat a golden apple when health drops below the setting.
+	---@param humanoid Humanoid
+	local function stepAutoEat(humanoid)
+		if not Settings.autoGapple or State.busy or State.missingItems.gappleSlot then return end
+		if humanoid.Health >= Settings.gappleHealth then return end
+
+		local now = os.clock()
+		if now - State.lastGapple < Const.GAPPLE_COOLDOWN then return end
+		State.lastGapple = now
+
+		runSequence(function(sleep)
+			equipSlot(Settings.gappleSlot, sleep)
+			holdAction("Use", 1, true)
+			sleep(Const.EAT_DURATION)
+			holdAction("Use", 1, false)
+			sleep(Const.HEAL_SETTLE)
+			equipSlot(Settings.swordSlot, sleep)
+		end)
+	end
+
+	---The way out with the most open space, picked from the escape probe angles.
+	---@param rootPart BasePart
+	---@param threat table
+	---@return Vector3
+	local function escapeDirection(rootPart, threat)
+		local away = (rootPart.Position - threat.root.Position) * Vector3.new(1, 0, 1)
+		away = away.Magnitude > 0.1 and away.Unit or Vector3.zAxis
+		local base = math.atan2(away.Z, away.X)
+
+		raycastParams.FilterDescendantsInstances = { localPlayer.Character }
+		local bestDirection, bestDistance = away, -1
+		for _, degrees in ipairs(Const.ESCAPE_ANGLES) do
+			local angle = base + math.rad(degrees)
+			local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+			local hit = workspace:Raycast(rootPart.Position, direction * Const.ESCAPE_PROBE, raycastParams)
+			local distance = hit and (hit.Position - rootPart.Position).Magnitude or Const.ESCAPE_PROBE
+			if distance > bestDistance then
+				bestDistance, bestDirection = distance, direction
+			end
+		end
+		return bestDirection
+	end
+
+	---Throw a pearl at the floor ahead to break away from the threat.
+	---@param rootPart BasePart
+	---@param threat table
+	local function pearlEscape(rootPart, threat)
+		local direction = escapeDirection(rootPart, threat)
+		runSequence(function(sleep)
+			equipSlot(Settings.pearlSlot, sleep)
+			local landing = rootPart.Position
+				+ direction * Const.ESCAPE_PROBE
+				- Vector3.yAxis * math.tan(math.rad(Const.ESCAPE_PITCH)) * Const.ESCAPE_PROBE
+			lookAt(function()
+				return landing
+			end)
+			sleep(Const.WIND_THROW_DELAY)
+			tapUse()
+			for _ = 1, Const.LOOK_SETTLE_FRAMES do
+				runService.RenderStepped:Wait()
+			end
+			releaseLook(direction)
+			sleep(0.25)
+			equipSlot(Settings.swordSlot, sleep)
+		end)
+	end
+
+	---Pearl or wind charge out of danger when health gets critical.
+	---@param frame table
+	---@param rootPart BasePart
+	---@param humanoid Humanoid
+	local function stepEscape(frame, rootPart, humanoid)
+		if State.busy or not (Settings.pearlEscape or Settings.windEscape) then return end
+		if humanoid.Health > Settings.escapeHealth then return end
+
+		local now = os.clock()
+		if now - State.lastEscape < Const.ESCAPE_COOLDOWN then return end
+
+		local threat = nearestEntry(frame, 16)
+		if not threat then return end
+		State.lastEscape = now
+
+		if Settings.windEscape and not State.missingItems.windSlot then
+			windLaunch(humanoid, false, escapeDirection(rootPart, threat), 1.5)
+			return
+		end
+		if Settings.pearlEscape and not State.missingItems.pearlSlot then
+			pearlEscape(rootPart, threat)
+		end
+	end
+
+	---Pearl after a target that's running away.
+	---@param frame table
+	---@param rootPart BasePart
+	local function stepPearlChase(frame, rootPart)
+		if not Settings.pearlChase or State.busy or State.missingItems.pearlSlot then return end
+
+		local now = os.clock()
+		if now - State.lastChase < Const.PEARL_CHASE_COOLDOWN then return end
+
+		local entry = nearestEntry(frame, Const.PEARL_CHASE_MAX)
+		if not entry or entry.distance < 12 then return end
+		State.lastChase = now
+
+		runSequence(function(sleep)
+			equipSlot(Settings.pearlSlot, sleep)
+			-- Aim where they will be, not where they are.
+			lookAt(function()
+				local root = entry.root.Parent and entry.root or nil
+				local position = root and root.Position or rootPart.Position
+				local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+				return position + velocity * Const.PEARL_ARC - Vector3.yAxis * 1.2
+			end)
+			sleep(Const.WIND_THROW_DELAY)
+			tapUse()
+			for _ = 1, Const.LOOK_SETTLE_FRAMES do
+				runService.RenderStepped:Wait()
+			end
+			releaseLook()
+			sleep(0.3)
+			equipSlot(Settings.swordSlot, sleep)
+		end)
+	end
+
+	---Web the closest target so they can't run.
+	---@param frame table
+	---@param rootPart BasePart
+	local function stepWebTrap(frame, rootPart)
+		if not Settings.webTrap or State.busy or State.missingItems.webSlot then return end
+
+		local now = os.clock()
+		if now - State.lastWeb < Const.WEB_COOLDOWN then return end
+
+		local entry = nearestEntry(frame, 14)
+		if not entry then return end
+		State.lastWeb = now
+
+		runSequence(function(sleep)
+			equipSlot(Settings.webSlot, sleep)
+			lookAt(function()
+				local root = entry.root.Parent and entry.root or nil
+				return root and root.Position + Vector3.yAxis * 0.5 or rootPart.Position
+			end)
+			sleep(Const.WIND_THROW_DELAY)
+			tapUse()
+			for _ = 1, Const.LOOK_SETTLE_FRAMES do
+				runService.RenderStepped:Wait()
+			end
+			releaseLook()
+			sleep(0.2)
+			equipSlot(Settings.swordSlot, sleep)
+		end)
+	end
+
+	---Health drop handler: knockback damping, jump reset and the hit timestamp.
+	---@param humanoid Humanoid
+	local function stepHealth(humanoid)
+		local health = humanoid.Health
+		if State.lastHealth and health < State.lastHealth then
+			State.hitAt = os.clock()
+			local rootPart = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+
+			if Settings.jumpReset and humanoid.FloorMaterial ~= Enum.Material.Air then
+				if os.clock() - (State.jumpResetAt or 0) > 0.3 then
+					State.jumpResetAt = os.clock()
+					humanoid.Jump = true
+				end
+			end
+			if Settings.antiKnockback and rootPart then
+				local keep = math.clamp(Settings.knockbackKeep / 100, 0, 1)
+				rootPart.AssemblyLinearVelocity = rootPart.AssemblyLinearVelocity * keep
+			end
+		end
+		State.lastHealth = health
+	end
+
+	---Count a kill when someone we hit recently dies.
+	local function stepKills()
+		local now = os.clock()
+		for character, at in pairs(recentHits) do
+			if not character.Parent or now - at > Const.KILL_CREDIT_TIME then
+				recentHits[character] = nil
+			else
+				local health = getModelHealth(character)
+				if health and health <= 0 then
+					recentHits[character] = nil
+					State.kills += 1
+					notify(string.format("Kill  •  %d", State.kills))
+				end
+			end
+		end
+	end
+
+	---Toast when a new enemy walks into alert range.
+	---@param frame table
+	local function stepAlerts(frame)
+		if not Settings.enemyAlert then return end
+
+		local now = os.clock()
+		for _, entry in ipairs(frame) do
+			if entry.distance <= Settings.alertRange then
+				local seen = alerted[entry.character]
+				if not seen or now - seen > 12 then
+					alerted[entry.character] = now
+					local player = playersService:GetPlayerFromCharacter(entry.character)
+					notify(string.format("%s is close", player and player.DisplayName or entry.character.Name))
+				end
+			end
+		end
+	end
+
+	---Everything that runs once per frame: movement, combat, items, ESP and HUD.
+	---@param deltaTime number
+	function stepCombat(deltaTime)
+		if not Unstable.running then return end
+
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+		if not (character and humanoid and rootPart and humanoid.Health > 0) then
+			State.auraTarget, State.auraEngaged, State.auraIndex = nil, false, 0
+			State.maceArmed, State.maceTarget, State.maceSwung, State.maceFalling = false, nil, false, false
+			State.lastHealth, State.hudRatio = nil, nil
+			if targetHud then targetHud.Visible = false end
+			if fallLabel then fallLabel.Visible = false end
+			return
+		end
+
+		-- New character: nothing the old one was holding or wearing carries over.
+		if State.bodyCharacter ~= character then
+			State.bodyCharacter = character
+			State.baseSpeed, State.baseJump = nil, nil
+			State.lastHealth, State.airJumps, State.jumpHeld = nil, 0, false
+			State.auraTarget, State.maceTarget, State.maceArmed = nil, nil, false
+			State.currentSlot, State.hotbarSlots, State.hotbarIcons = nil, nil, nil
+			State.lastKitScan = -math.huge
+			restoreHitboxes()
+		end
+
+		captureDefaults(humanoid)
+		stepMovement(deltaTime, rootPart, humanoid)
+		stepHealth(humanoid)
+
+		local frame = buildFrameTargets(rootPart)
+		State.lastTargetCount = #frame
+
+		stepKillAura(frame, rootPart, humanoid)
+		stepMace(frame, deltaTime, rootPart, humanoid)
+		stepTriggerbot(frame, rootPart)
+		stepStrafe(rootPart, humanoid)
+
+		-- Item use runs one sequence at a time, so only the first one that fires gets to act.
+		stepAutoEat(humanoid)
+		stepEscape(frame, rootPart, humanoid)
+		stepPearlChase(frame, rootPart)
+		stepWebTrap(frame, rootPart)
+
+		if Settings.hitboxExpander then
+			for _, entry in ipairs(frame) do
+				applyHitbox(entry.character)
+			end
+		elseif next(hitboxCache) then
+			restoreHitboxes()
+		end
+
+		stepKills()
+		stepAlerts(frame)
+		stepEsp(frame)
+		stepTargetHud(frame)
+		stepVignette(humanoid)
+		stepReachRing(rootPart)
+		stepFallMeter(rootPart, humanoid)
+		detectSlots()
+		watchKit()
+		learnAttackRoute()
+	end
+end
+-- Diagnostics, the on-screen HUD and the RobScript menu.
+do
+	---Everything support needs, in one string.
+	---@return string
+	local function collectDiagnostics()
+		local lines = {}
+		local function add(text)
+			table.insert(lines, text)
+		end
+
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local okPing, ping = pcall(localPlayer.GetNetworkPing, localPlayer)
+
+		add("RobScript.com - Unstable SMP diagnostics")
+		add(string.format("executor: %s", IdentifyExecutor()))
+		add(string.format("place: %s (%s)", tostring(game.PlaceId), tostring(game.JobId)))
+		add(string.format("touch: %s  mouse: %s", tostring(userInputService.TouchEnabled), tostring(userInputService.MouseEnabled)))
+		add(string.format("health: %s  ping: %s ms  fps: %d", humanoid and math.floor(humanoid.Health) or "?", okPing and math.floor(ping * 1000) or "?", math.floor(State.fps)))
+		add(string.format("camera: %s  method: %s  swipe: %s/%s", State.cameraDriver and ("synced " .. tostring(State.cameraDriver.yaw.label)) or "direct", State.aimMethod, tostring(State.swipeVim), tostring(State.swipeFailed)))
+		add(string.format("input mode: %s  learned: %s  locked: %s", Const.INPUT_MODES[Settings.inputMode] or "?", tostring(State.learnedRoute), tostring(State.routeLocked)))
+		add(string.format("attack: %s  use: %s", tostring(State.lastDispatch.Attack), tostring(State.lastDispatch.Use)))
+		add(string.format("items: sword %d, mace %d, wind %d, gapple %d, pearl %d, web %d", Settings.swordSlot, Settings.maceSlot, Settings.windSlot, Settings.gappleSlot, Settings.pearlSlot, Settings.webSlot))
+
+		local missing = {}
+		for key in pairs(State.missingItems) do
+			table.insert(missing, key)
+		end
+		add("missing: " .. (#missing > 0 and table.concat(missing, ", ") or "none"))
+
+		local names = {}
+		for index = 1, 9 do
+			names[index] = State.hotbarNames[index] or "-"
+		end
+		add("hotbar: " .. table.concat(names, " | "))
+
+		local tool = getHeldTool()
+		add("tool: " .. tostring(tool and tool.Name or "none"))
+
+		local logged = {}
+		for remote, entry in pairs(remoteLog) do
+			table.insert(logged, string.format("%s x%d (%d args)", remote:GetFullName(), entry.count, entry.args or 0))
+		end
+		if #logged > 0 then
+			add("remotes:")
+			for _, text in ipairs(logged) do
+				add("  " .. text)
+			end
+		end
+
+		return table.concat(lines, "\n")
+	end
+
+	---Copy the diagnostics to the clipboard (or print them when there isn't one).
+	function copyDiagnostics()
+		local text = collectDiagnostics()
+		if setclipboard then
+			local ok = pcall(setclipboard, text)
+			notify(ok and "Diagnostics copied" or "Couldn't copy diagnostics")
+		else
+			print(text)
+			notify("Diagnostics printed to console")
+		end
+	end
+
+	---Watch RemoteEvent traffic for a few seconds, for games that hit-test on the server.
+	function startRemoteLog()
+		if State.namecallHooked then
+			notify("Remote log is already running")
+			return
+		end
+		if not (hookmetamethod and getnamecallmethod) then
+			notify("Remote log needs hookmetamethod")
+			return
+		end
+
+		State.namecallHooked, State.logging = true, true
+		local oldNamecall
+		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+			local method = getnamecallmethod()
+			if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+				local entry = remoteLog[self]
+				if not entry then
+					if State.remoteCount and State.remoteCount >= 40 then
+						return oldNamecall(self, ...)
+					end
+					entry = { count = 0 }
+					remoteLog[self] = entry
+					State.remoteCount = (State.remoteCount or 0) + 1
+				end
+				entry.count += 1
+				entry.args = select("#", ...)
+				entry.at = os.clock()
+			end
+			return oldNamecall(self, ...)
+		end)
+
+		notify("Logging remotes for a few seconds")
+		task.delay(Const.REMOTE_LOG_TIME, function()
+			State.logging = false
+		end)
+	end
+
+	---Make one of the round touch buttons draggable.
+	---@param object GuiObject
+	---@param key string
+	local function makeDraggable(object, key)
+		local dragging, moved, start, origin
+		object.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+				return
+			end
+			dragging, moved, start, origin = true, 0, input.Position, object.Position
+		end)
+		userInputService.InputChanged:Connect(function(input)
+			if not dragging then return end
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				local delta = input.Position - start
+				moved = math.max(moved, delta.Magnitude)
+				object.Position = UDim2.new(origin.X.Scale, origin.X.Offset + delta.X, origin.Y.Scale, origin.Y.Offset + delta.Y)
+			end
+		end)
+		userInputService.InputEnded:Connect(function(input)
+			if not (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+				return
+			end
+			object:SetAttribute("Dragged", moved > 4)
+			if dragging and moved > 4 then
+				Settings.buttonPositions[key] = {
+					x = object.Position.X.Offset,
+					y = object.Position.Y.Offset,
+				}
+			end
+			dragging = false
+		end)
+	end
+
+	---Click handler that ignores the click that ends a drag.
+	---@param object GuiObject
+	---@param callback function
+	local function bindPress(object, callback)
+		object.MouseButton1Click:Connect(function()
+			if object:GetAttribute("Dragged") then
+				object:SetAttribute("Dragged", false)
+				return
+			end
+			playUiSound(1.15, 0.2)
+			callback()
+		end)
+	end
+
+	---Watermark, target card, FOV ring, vignette, reach ring and the touch buttons.
+	local function buildHud()
+		hubGui = create("ScreenGui", {
+			Name = "RobScriptUnstableHud",
+			ResetOnSpawn = false,
+			IgnoreGuiInset = false,
+			DisplayOrder = 20,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+			Parent = guiRoot,
+		})
+
+		fovCircle = create("Frame", {
+			Name = "Fov",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Size = UDim2.fromOffset(240, 240),
+			BackgroundTransparency = 1,
+			Visible = false,
+			ZIndex = 3,
+			Parent = hubGui,
+		}, { round(), create("UIStroke", { Color = Const.ACCENT, Transparency = 0.35, Thickness = 1.5 }) })
+
+		watermark = create("Frame", {
+			Name = "Watermark",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -12, 0, 8),
+			Size = UDim2.fromOffset(190, 26),
+			BackgroundColor3 = Const.BACKGROUND,
+			BackgroundTransparency = 0.2,
+			BorderSizePixel = 0,
+			Parent = hubGui,
+		}, {
+			corner(8),
+			create("UIStroke", { Color = Const.ACCENT, Transparency = 0.55, Thickness = 1 }),
+			create("Frame", {
+				Size = UDim2.fromOffset(3, 14),
+				Position = UDim2.fromOffset(7, 6),
+				BackgroundColor3 = Const.WHITE,
+				BorderSizePixel = 0,
+			}, { round(), gradient({ Const.ACCENT, Const.ACCENT_ALT }, 90) }),
+		})
+		watermarkLabel = label({
+			Size = UDim2.new(1, -18, 1, -4),
+			Position = UDim2.fromOffset(16, 2),
+			Text = "RobScript  •  Unstable SMP",
+			TextSize = 11,
+			TextColor3 = Const.TEXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = watermark,
+		})
+
+		targetHud = create("Frame", {
+			Name = "TargetHud",
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.new(0.5, 0, 0, 52),
+			Size = UDim2.fromOffset(230, 52),
+			BackgroundColor3 = Const.BACKGROUND,
+			BackgroundTransparency = 0.2,
+			BorderSizePixel = 0,
+			Visible = false,
+			Parent = hubGui,
+		}, {
+			corner(10),
+			create("UIStroke", { Color = Const.ACCENT, Transparency = 0.45, Thickness = 1 }),
+		})
+		hudName = label({
+			Size = UDim2.new(1, -20, 0, 20),
+			Position = UDim2.fromOffset(10, 4),
+			Text = "Target",
+			Font = Const.FONT,
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = targetHud,
+		})
+		hudInfo = label({
+			Size = UDim2.new(1, -20, 0, 16),
+			Position = UDim2.fromOffset(10, 22),
+			Text = "",
+			TextSize = 11,
+			TextColor3 = Const.SUBTEXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = targetHud,
+		})
+		local hudTrack = create("Frame", {
+			Size = UDim2.new(1, -20, 0, 5),
+			Position = UDim2.new(0, 10, 1, -10),
+			BackgroundColor3 = Const.TRACK,
+			BorderSizePixel = 0,
+			Parent = targetHud,
+		}, { round() })
+		hudFill = create("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.fromRGB(120, 230, 140),
+			BorderSizePixel = 0,
+			Parent = hudTrack,
+		}, { round() })
+
+		healthVignette = create("Frame", {
+			Name = "Vignette",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Visible = false,
+			Parent = hubGui,
+		})
+
+		local edges = {
+			{ Size = UDim2.new(1, 0, 0, 110), Position = UDim2.new(0, 0, 0, 0), Rotation = 90 },
+			{ Size = UDim2.new(1, 0, 0, 110), Position = UDim2.new(0, 0, 1, -110), Rotation = 270 },
+			{ Size = UDim2.new(0, 130, 1, 0), Position = UDim2.new(0, 0, 0, 0), Rotation = 0 },
+			{ Size = UDim2.new(0, 130, 1, 0), Position = UDim2.new(1, -130, 0, 0), Rotation = 180 },
+		}
+		for _, edge in ipairs(edges) do
+			create("Frame", {
+				Size = edge.Size,
+				Position = edge.Position,
+				BackgroundColor3 = Color3.fromRGB(190, 35, 55),
+				BorderSizePixel = 0,
+				Parent = healthVignette,
+			}, {
+				create("UIGradient", {
+					Rotation = edge.Rotation,
+					Transparency = NumberSequence.new({
+						NumberSequenceKeypoint.new(0, 0.4),
+						NumberSequenceKeypoint.new(0.6, 0.85),
+						NumberSequenceKeypoint.new(1, 1),
+					}),
+				}),
+			})
+		end
+
+		reachRing = create("Folder", { Name = "RobScriptReach" })
+		for index = 1, 20 do
+			local angle = (index - 1) / 20 * math.pi * 2
+			local tick = create("Part", {
+				Name = "Tick",
+				Size = Vector3.new(0.3, 0.06, 0.9),
+				Anchored = true,
+				CanCollide = false,
+				CanQuery = false,
+				CanTouch = false,
+				CastShadow = false,
+				Material = Enum.Material.Neon,
+				Color = Const.ACCENT,
+				Transparency = Const.HITBOX_TRANSPARENCY,
+				Parent = reachRing,
+			})
+			tick:SetAttribute("Angle", angle)
+		end
+
+		fallLabel = create("TextLabel", {
+			Name = "FallMeter",
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.new(0.5, 0, 1, -140),
+			Size = UDim2.fromOffset(80, 20),
+			BackgroundColor3 = Const.BACKGROUND,
+			BackgroundTransparency = 0.3,
+			BorderSizePixel = 0,
+			Text = "",
+			Font = Const.FONT,
+			TextSize = 12,
+			TextColor3 = Const.ACCENT,
+			Visible = false,
+			Parent = hubGui,
+		}, { round(), create("UIStroke", { Color = Const.ACCENT, Transparency = 0.7, Thickness = 1 }) })
+
+		smashButton = create("TextButton", {
+			Name = "Smash",
+			Size = UDim2.fromOffset(76, 76),
+			Position = UDim2.new(1, -104, 1, -128),
+			BackgroundColor3 = Const.WHITE,
+			BorderSizePixel = 0,
+			Text = "SMASH",
+			Font = Const.FONT,
+			TextSize = 13,
+			TextColor3 = Const.WHITE,
+			AutoButtonColor = false,
+			Visible = Settings.smashButton,
+			Parent = hubGui,
+		}, { round(), gradient({ Const.ACCENT, Const.ACCENT_ALT }, 45), animatedStroke(1.5) })
+		bindPress(smashButton, comboSmash)
+		makeDraggable(smashButton, "smash")
+
+		dashButton = create("TextButton", {
+			Name = "Dash",
+			Size = UDim2.fromOffset(54, 54),
+			Position = UDim2.new(1, -104, 1, -212),
+			BackgroundColor3 = Const.BACKGROUND,
+			BackgroundTransparency = 0.15,
+			BorderSizePixel = 0,
+			Text = "DASH",
+			Font = Const.FONT,
+			TextSize = 10,
+			TextColor3 = Const.TEXT,
+			AutoButtonColor = false,
+			Visible = false,
+			Parent = hubGui,
+		}, { round(), create("UIStroke", { Color = Const.ACCENT, Transparency = 0.3, Thickness = 1.2 }) })
+		bindPress(dashButton, windDash)
+		makeDraggable(dashButton, "dash")
+
+		flyButton = create("TextButton", {
+			Name = "Fly",
+			Size = UDim2.fromOffset(54, 54),
+			Position = UDim2.new(1, -168, 1, -212),
+			BackgroundColor3 = Const.BACKGROUND,
+			BackgroundTransparency = 0.15,
+			BorderSizePixel = 0,
+			Text = "FLY",
+			Font = Const.FONT,
+			TextSize = 10,
+			TextColor3 = Const.TEXT,
+			AutoButtonColor = false,
+			Visible = false,
+			Parent = hubGui,
+		}, { round(), create("UIStroke", { Color = Const.ACCENT, Transparency = 0.3, Thickness = 1.2 }) })
+		bindPress(flyButton, function()
+			Settings.fly = not Settings.fly
+			refreshAll()
+			flyButton.TextColor3 = Settings.fly and Const.ACCENT or Const.TEXT
+		end)
+		makeDraggable(flyButton, "fly")
+	end
+
+	---Load the Robly Airflow build the RobScript hubs use.
+	---@return table?
+	local function loadAirflow()
+		local sources = {
+			"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+			"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+		}
+		for _, url in ipairs(sources) do
+			local ok, library = pcall(function()
+				return loadstring(game:HttpGet(url))()
+			end)
+			if ok and typeof(library) == "table" and typeof(library.CreateWindow) == "function" then
+				return library
+			end
+		end
+		return nil
+	end
+
+	---Build the whole menu.
+	local function buildUI()
+		Airflow = loadAirflow()
+		if not Airflow then
+			error("[" .. Const.HUB_NAME .. "] couldn't load the Robly Airflow interface, check the connection and retry")
+		end
+
+		if type(Airflow.ThemePresets) == "table" then
+			Airflow.ThemePresets.Robscript = Const.THEME
+		end
+		pcall(function()
+			Airflow:SetDefaultTheme(Const.THEME)
+		end)
+		pcall(function()
+			Airflow:LoadFont({ Name = "ValleySans" })
+		end)
+		pcall(function()
+			Airflow:PreloadIcons()
+		end)
+
+		Window = Airflow:CreateWindow({
+			Name = Const.HUB_NAME,
+			LoadingSubtitle = "combat, items and movement",
+			ToggleUIKeybind = "RightControl",
+			Size = UDim2.fromOffset(760, 520),
+			Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+			Theme = Const.THEME,
+			ConfigurationSaving = { Enabled = true, FolderName = Const.CONFIG_FOLDER },
+			MaxNotifications = 4,
+			Home = {
+				Name = "Home",
+				Welcome = "Welcome back,",
+				Tier = "v" .. Const.VERSION .. " · RobScript",
+				Stats = { "Players", "Session", "Game", "FPS", "Ping" },
+			},
+		})
+
+		---Register a control so settings can be pushed back into it.
+		---@param key string
+		---@param handle any
+		---@param fromFlag function?
+		---@param toFlag function?
+		local function bind(key, handle, fromFlag, toFlag)
+			if handle ~= nil then
+				FLAGS[key] = { handle = handle, fromFlag = fromFlag, toFlag = toFlag }
+			end
+			return handle
+		end
+
+		local function optionIndex(options, option)
+			for index, text in ipairs(options) do
+				if text == option then
+					return index
+				end
+			end
+		end
+
+		---A switch bound to a Settings key.
+		local function toggle(parent, name, key, desc)
+			return bind(key, parent:CreateToggle({
+				Name = name,
+				Desc = desc,
+				Flag = "SMP_" .. key,
+				CurrentValue = Settings[key] and true or false,
+				Callback = function(state)
+					Settings[key] = state
+				end,
+			}))
+		end
+
+		---A slider bound to a Settings key.
+		local function slider(parent, name, key, minimum, maximum, increment, suffix, desc)
+			return bind(key, parent:CreateSlider({
+				Name = name,
+				Desc = desc,
+				Range = { minimum, maximum },
+				Increment = increment,
+				Suffix = suffix or "",
+				Flag = "SMP_" .. key,
+				CurrentValue = tonumber(Settings[key]) or minimum,
+				Callback = function(value)
+					Settings[key] = value
+				end,
+			}))
+		end
+
+		---A list bound to a Settings key that stores the option index.
+		local function dropdown(parent, name, key, options, desc)
+			return bind(key, parent:CreateDropdown({
+				Name = name,
+				Desc = desc,
+				Options = options,
+				Flag = "SMP_" .. key,
+				CurrentOption = options[Settings[key]] or options[1],
+				Callback = function(option)
+					local index = optionIndex(options, option)
+					if index then
+						Settings[key] = index
+					end
+				end,
+			}), function(option)
+				return optionIndex(options, option)
+			end, function(index)
+				return options[index] or options[1]
+			end)
+		end
+
+		---A key that runs an action while in game.
+		local function keybind(parent, name, action, default, desc)
+			local handle = parent:CreateKeybind({
+				Name = name,
+				Desc = desc,
+				Flag = "SMPBind_" .. action,
+				CurrentKeybind = Settings.binds[action] or default,
+				Callback = function(key)
+					if typeof(key) == "EnumItem" then
+						key = key.Name
+					end
+					Settings.binds[action] = tostring(key)
+				end,
+			})
+			BINDS[action] = handle
+			return handle
+		end
+
+		----- Combat -----
+		local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+		local AuraBox = CombatTab:CreateGroupbox({ Name = "Kill aura", Side = "Left" })
+		local LockBox = CombatTab:CreateGroupbox({ Name = "Camera lock", Side = "Right" })
+
+		toggle(AuraBox, "Kill aura", "killAura", "Hits whatever is in reach, with an optional camera drag")
+		slider(AuraBox, "Reach", "killAuraRange", 5, 25, 1, " m")
+		slider(AuraBox, "Swing delay", "killAuraDelay", 0.05, 0.5, 0.01, " s", "Wait between swings")
+		toggle(AuraBox, "Face the target", "killAuraFace")
+		dropdown(AuraBox, "Camera", "cameraMode", Const.CAMERA_MODES)
+		slider(AuraBox, "Camera drag", "auraDragSpeed", 1, 20, 1, "", "How fast the view slides onto the target")
+		toggle(AuraBox, "Aim at the head", "auraAimHead")
+		toggle(AuraBox, "Switch targets", "auraSwitch", "Rotate through everyone in reach")
+		toggle(AuraBox, "Focus lowest health", "auraFocusLowest")
+		toggle(AuraBox, "Attack NPCs and dummies", "targetNpcs")
+		toggle(AuraBox, "Draw the sword automatically", "autoWeapon")
+
+		toggle(LockBox, "Camera lock", "aimbot", "Pulls the view onto the target closest to the cursor")
+		slider(LockBox, "Field of view", "aimbotFov", 20, 400, 5, " px")
+		slider(LockBox, "Smoothness", "aimbotSmoothness", 1, 20, 1, "", "Higher is slower and softer")
+		toggle(LockBox, "Hold right mouse", "aimbotHold", "Only locks while right mouse is held")
+		toggle(LockBox, "Show the FOV ring", "showFov")
+		slider(LockBox, "Prediction", "prediction", 0, 200, 5, " ms", "Leads a moving target")
+		toggle(LockBox, "Triggerbot", "triggerbot", "Swings on its own when the crosshair is on someone")
+
+		local SmashBox = CombatTab:CreateGroupbox({ Name = "Smash", Side = "Left" })
+		local DefenceBox = CombatTab:CreateGroupbox({ Name = "Defence", Side = "Right" })
+
+		toggle(SmashBox, "Smash chain", "smashChain", "Launches again as soon as a smash lands")
+		toggle(SmashBox, "Smash assist", "smashAssist", "Smashes with the mace when someone is under you")
+		toggle(SmashBox, "SMASH button", "smashButton")
+		slider(SmashBox, "Smash reach", "smashRadius", 6, 40, 1, " m")
+		toggle(SmashBox, "Burst", "smashBurst", "Second tap on the same arc")
+		toggle(SmashBox, "Follow up with the sword", "smashFollowUp")
+
+		toggle(DefenceBox, "Criticals", "criticals")
+		toggle(DefenceBox, "Velocity", "antiKnockback", "Cuts the knockback the game pushes on you")
+		slider(DefenceBox, "Knockback kept", "knockbackKeep", 0, 100, 5, "%")
+		toggle(DefenceBox, "Jump reset", "jumpReset")
+		toggle(DefenceBox, "Target strafe", "targetStrafe")
+		slider(DefenceBox, "Strafe radius", "strafeRadius", 2, 16, 1, " m")
+		toggle(DefenceBox, "Hitboxes", "hitboxExpander")
+		slider(DefenceBox, "Hitbox size", "hitboxSize", 2, 20, 1, " studs")
+
+		----- Items -----
+		local ItemsTab = Window:CreateTab({ Name = "Items", Icon = "shopping-cart" })
+		local EatBox = ItemsTab:CreateGroupbox({ Name = "Auto eat", Side = "Left" })
+		local MaceBox = ItemsTab:CreateGroupbox({ Name = "Auto mace", Side = "Right" })
+
+		toggle(EatBox, "Auto eat", "autoGapple", "Eats a golden apple when health drops")
+		slider(EatBox, "Eat below", "gappleHealth", 10, 90, 5, " hp")
+
+		toggle(MaceBox, "Auto mace", "autoMace", "Wind charge at the feet, then a mace smash")
+		slider(MaceBox, "Minimum fall", "maceMinFall", 3, 40, 1, " m", "The mace only swings after this much fall")
+		toggle(MaceBox, "Steer the fall", "maceSteer")
+		toggle(MaceBox, "Lock the head", "maceHeadLock")
+		slider(MaceBox, "Head lock speed", "headLockSpeed", 5, 80, 1)
+		slider(MaceBox, "Air boost charges", "airBoostCharges", 0, 3, 1, "", "Extra wind charges at the top of the jump")
+
+		local WindBox = ItemsTab:CreateGroupbox({ Name = "Wind charge", Side = "Left" })
+		local PearlBox = ItemsTab:CreateGroupbox({ Name = "Pearls and web", Side = "Right" })
+
+		toggle(WindBox, "Wind launch", "windLaunch")
+		dropdown(WindBox, "Order", "windOrder", Const.WIND_ORDERS, "Throw then jump, or jump then throw")
+
+		toggle(PearlBox, "Pearl escape", "pearlEscape")
+		toggle(PearlBox, "Wind escape", "windEscape")
+		slider(PearlBox, "Escape below", "escapeHealth", 5, 80, 5, " hp")
+		toggle(PearlBox, "Pearl chase", "pearlChase", "Pearls after targets that run away")
+		toggle(PearlBox, "Web trap", "webTrap")
+
+		local KitBox = ItemsTab:CreateGroupbox({ Name = "Kit", Side = "Left" })
+
+		toggle(KitBox, "Detect slots automatically", "autoSlots", "Reads the hotbar and finds the sword, mace, wind charge and so on")
+		KitBox:CreateButton({
+			Name = "Scan hotbar",
+			Desc = "Switches through every slot once and learns what is where",
+			Callback = function()
+				scanHotbar(false)
+			end,
+		})
+		slider(KitBox, "Sword slot", "swordSlot", 1, 9, 1)
+		slider(KitBox, "Mace slot", "maceSlot", 1, 9, 1)
+		slider(KitBox, "Wind slot", "windSlot", 1, 9, 1)
+		slider(KitBox, "Gapple slot", "gappleSlot", 1, 9, 1)
+		slider(KitBox, "Pearl slot", "pearlSlot", 1, 9, 1)
+		slider(KitBox, "Web slot", "webSlot", 1, 9, 1)
+
+		----- Assist -----
+		local AssistTab = Window:CreateTab({ Name = "Assist", Icon = "radar" })
+		local InputBox = AssistTab:CreateGroupbox({ Name = "Inputs", Side = "Left" })
+		local StatusBox = AssistTab:CreateGroupbox({ Name = "Right now", Side = "Right" })
+		local CameraBox = AssistTab:CreateGroupbox({ Name = "Camera", Side = "Left" })
+		local CheckBox = AssistTab:CreateGroupbox({ Name = "Checks", Side = "Right" })
+
+		dropdown(InputBox, "Input mode", "inputMode", Const.INPUT_MODES, "How the hub presses Attack and Use")
+		InputBox:CreateButton({
+			Name = "Test inputs",
+			Desc = "Tries every way of pressing the buttons and keeps the one that works",
+			Callback = function()
+				testInputs()
+			end,
+		})
+		InputBox:CreateButton({
+			Name = "Copy diagnostics",
+			Desc = "Puts the whole state of the hub on your clipboard",
+			Callback = function()
+				copyDiagnostics()
+			end,
+		})
+		InputBox:CreateButton({
+			Name = "Log remotes",
+			Desc = "Watches RemoteEvent traffic for a few seconds",
+			Callback = function()
+				startRemoteLog()
+			end,
+		})
+
+		StatusBox:CreateStatus({
+			Name = "Target",
+			Style = "Row",
+			Pin = true,
+			UpdateRate = 0.25,
+			Update = function()
+				local character = State.auraTarget or (State.aimTarget and State.aimTarget.Character)
+				if not (character and character.Parent) then
+					return "<Muted>none</Muted>"
+				end
+				return "<Accent>" .. tostring(character.Name) .. "</Accent>"
+			end,
+		})
+		StatusBox:CreateStatus({
+			Name = "Kills",
+			Style = "Row",
+			Pin = true,
+			UpdateRate = 0.5,
+			Update = function()
+				return string.format("<Success>%d</Success>", State.kills)
+			end,
+		})
+		StatusBox:CreateStatus({
+			Name = "Camera",
+			Style = "Row",
+			UpdateRate = 0.5,
+			Update = function()
+				if State.cameraDriver then
+					return string.format("<Success>synced</Success> <Muted>%s</Muted>", tostring(State.cameraDriver.yaw.label))
+				end
+				return "<Warning>" .. tostring(State.aimMethod) .. "</Warning>"
+			end,
+		})
+		StatusBox:CreateStatus({
+			Name = "Attack",
+			Style = "Row",
+			UpdateRate = 0.5,
+			Update = function()
+				return "<Muted>" .. tostring(State.lastDispatch.Attack or "not yet") .. "</Muted>"
+			end,
+		})
+		StatusBox:CreateStatus({
+			Name = "Held",
+			Style = "Row",
+			UpdateRate = 0.5,
+			Update = function()
+				local tool = getHeldTool()
+				return "<Muted>" .. tostring(tool and tool.Name or "nothing") .. "</Muted>"
+			end,
+		})
+
+		toggle(CameraBox, "Sync with the game camera", "cameraSync", "Learns the game's own yaw and pitch so the camera keeps up")
+		toggle(CameraBox, "Swipe aim on touch", "swipeAim")
+
+		toggle(CheckBox, "Team check", "teamCheck")
+		toggle(CheckBox, "Wall check", "wallCheck")
+		toggle(CheckBox, "Debug readout", "debugInfo")
+
+		----- Move -----
+		local MoveTab = Window:CreateTab({ Name = "Move", Icon = "user" })
+		local SpeedBox = MoveTab:CreateGroupbox({ Name = "Speed", Side = "Left" })
+		local JumpBox = MoveTab:CreateGroupbox({ Name = "Jump", Side = "Right" })
+
+		toggle(SpeedBox, "Speed", "speedBoost")
+		slider(SpeedBox, "Extra speed", "speedAmount", 1, 40, 1, " studs/s")
+
+		toggle(JumpBox, "High jump", "highJump")
+		slider(JumpBox, "Jump power", "highJumpPower", 50, 250, 5)
+		toggle(JumpBox, "Air jump", "airJump")
+		toggle(JumpBox, "Long jump", "longJump")
+		slider(JumpBox, "Long jump power", "longJumpPower", 10, 150, 5)
+		toggle(JumpBox, "Auto jump", "autoJump")
+		toggle(JumpBox, "Bunny hop", "bunnyHop")
+
+		local TravelBox = MoveTab:CreateGroupbox({ Name = "Traversal", Side = "Left" })
+		local FlyBox = MoveTab:CreateGroupbox({ Name = "Flight", Side = "Right" })
+
+		toggle(TravelBox, "Spider", "spider")
+		toggle(TravelBox, "Safe walk", "safeWalk")
+		toggle(TravelBox, "Air control", "airControl")
+		toggle(TravelBox, "Anti void", "antiVoid")
+		toggle(TravelBox, "Mace dive", "maceDive")
+		slider(TravelBox, "Dive speed", "diveSpeed", 20, 150, 5)
+
+		toggle(FlyBox, "Fly", "fly")
+		slider(FlyBox, "Fly speed", "flySpeed", 10, 300, 5)
+		toggle(FlyBox, "Quick buttons", "quickButtons", "Shows the DASH and FLY buttons on screen")
+
+		----- World -----
+		local WorldTab = Window:CreateTab({ Name = "World", Icon = "eye" })
+		local VisualBox = WorldTab:CreateGroupbox({ Name = "Visuals", Side = "Left" })
+		local SceneBox = WorldTab:CreateGroupbox({ Name = "Scene", Side = "Right" })
+
+		toggle(VisualBox, "ESP", "esp", "Highlights and nameplates on every enemy")
+		toggle(VisualBox, "Tracers", "tracers")
+		toggle(VisualBox, "Target card", "targetHud")
+		toggle(VisualBox, "Reach ring", "reachCircle")
+		toggle(VisualBox, "Fall meter", "fallMeter")
+		toggle(VisualBox, "Watermark", "watermark")
+
+		toggle(SceneBox, "Fullbright", "fullbright")
+		toggle(SceneBox, "No fog", "noFog")
+		toggle(SceneBox, "Zoom", "cameraFovEnabled")
+		slider(SceneBox, "Zoom FOV", "cameraFov", 40, 130, 1, "°")
+
+		local AlertBox = WorldTab:CreateGroupbox({ Name = "Alerts", Side = "Left" })
+
+		toggle(AlertBox, "Enemy nearby", "enemyAlert")
+		slider(AlertBox, "Alert range", "alertRange", 10, 100, 5, " m")
+		toggle(AlertBox, "Low health warning", "lowHealthWarning")
+
+		----- Settings -----
+		local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+
+		pcall(function()
+			SettingsTab:CreateConfigManager({ Name = "Save and load", Side = "Left" })
+		end)
+		pcall(function()
+			SettingsTab:CreateThemeManager({ Name = "Colours", Side = "Right" })
+		end)
+
+		local KeyBox = SettingsTab:CreateGroupbox({ Name = "Keys", Side = "Left" })
+		keybind(KeyBox, "SMASH combo", "smash", "Q", "Wind charge up, mace down")
+		keybind(KeyBox, "Wind dash", "dash", "C")
+		keybind(KeyBox, "Flight", "fly", "G", "Same as the fly toggle")
+		keybind(KeyBox, "Camera lock", Const.AIM_BIND, "E")
+		keybind(KeyBox, "Kill aura", Const.AURA_BIND, "R")
+		keybind(KeyBox, "Zoom", Const.CAMERA_BIND, "Z")
+		keybind(KeyBox, "Cycle camera", Const.LOOK_BIND, "X")
+		local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
+		AboutBox:CreateParagraph({
+			Title = "RobScript.com - Unstable SMP",
+			Content = "Made for RobScript.com. Everything is off when the menu opens, so turn on what you need. "
+				.. "Your choices are saved for next time.",
+		})
+		AboutBox:CreateButton({
+			Name = "Turn off",
+			Desc = "Stops every feature and closes the menu",
+			Icon = "power",
+			Callback = function()
+				shutdown()
+			end,
+		})
+
+		pcall(function()
+			Window:LoadAutoload()
+		end)
+		syncFromFlags()
+	end
+
+	---Draw the HUD, then the menu.
+	function buildHub()
+		buildHud()
+		buildUI()
+	end
+end
+
+-- Keybinds, the per-frame loops, teardown and startup.
+do
+	---Default keys, used until the player binds something else.
+	local BIND_DEFAULTS = {
+		[Const.AIM_BIND] = "E",
+		[Const.AURA_BIND] = "R",
+		[Const.CAMERA_BIND] = "Z",
+		[Const.LOOK_BIND] = "X",
+		["smash"] = "Q",
+		["dash"] = "C",
+		["fly"] = "G",
+	}
+
+	---Flip a module from a key and keep the menu in step with it.
+	---@param key string
+	---@param name string
+	local function flip(key, name)
+		Settings[key] = not Settings[key]
+		refreshAll()
+		notify(name .. (Settings[key] and " on" or " off"))
+	end
+
+	local keyActions = {
+		[Const.AIM_BIND] = function()
+			flip("aimbot", "Camera lock")
+		end,
+		[Const.AURA_BIND] = function()
+			flip("killAura", "Kill aura")
+		end,
+		[Const.CAMERA_BIND] = function()
+			flip("cameraFovEnabled", "Zoom")
+		end,
+		[Const.LOOK_BIND] = function()
+			Settings.cameraMode = Settings.cameraMode % #Const.CAMERA_MODES + 1
+			refreshAll()
+			notify("Camera: " .. Const.CAMERA_MODES[Settings.cameraMode])
+		end,
+		["smash"] = function()
+			comboSmash()
+		end,
+		["dash"] = function()
+			windDash()
+		end,
+		["fly"] = function()
+			flip("fly", "Flight")
+		end,
+	}
+
+	track(userInputService.InputBegan:Connect(function(input, gameProcessed)
+		if input.UserInputType ~= Enum.UserInputType.Keyboard or gameProcessed then return end
+		local pressed = input.KeyCode.Name
+		for action, default in pairs(BIND_DEFAULTS) do
+			if keyActions[action] and (Settings.binds[action] or default) == pressed then
+				keyActions[action]()
+				return
+			end
+		end
+	end))
+
+	---FPS counter for the watermark.
+	local function stepFps(deltaTime)
+		State.fpsFrames += 1
+		State.fpsTime += deltaTime
+		if State.fpsTime >= 0.5 then
+			State.fps = State.fpsFrames / State.fpsTime
+			State.fpsFrames, State.fpsTime = 0, 0
+		end
+	end
+
+	local lastRender = os.clock()
+
+	---Aim and camera work: runs right after the game's own camera step.
+	local function onRender()
+		local now = os.clock()
+		local deltaTime = math.min(now - lastRender, 0.1)
+		lastRender = now
+
+		if workspace.CurrentCamera ~= currentCamera then
+			currentCamera = workspace.CurrentCamera
+		end
+		if not Unstable.running then return end
+
+		stepCameraSync()
+		updateAimbot(deltaTime)
+		updateAuraCamera(deltaTime)
+		updateLookOverride()
+		updateCameraFov()
+		stepFps(deltaTime)
+
+		-- Spinning strokes and the rest of the menu animation.
+		for index = #animators, 1, -1 do
+			local entry = animators[index]
+			if entry.owner.Parent then
+				entry.fn(entry.owner, deltaTime)
+			else
+				table.remove(animators, index)
+			end
+		end
+	end
+
+	---Combat, items, ESP and the HUD.
+	---@param deltaTime number
+	local function onHeartbeat(deltaTime)
+		if not Unstable.running then return end
+		-- The menu owns the values; copy them back in case a config was loaded.
+		syncFromFlags()
+		applyLighting()
+		stepCombat(deltaTime)
+		updateWatermark()
+	end
+
+	---Keep the game from kicking an idle player.
+	local function antiAfkLoop()
+		while Unstable.running do
+			task.wait(45)
+			if Unstable.running and Settings.antiAfk and virtualUser then
+				pcall(function()
+					virtualUser:CaptureController()
+					virtualUser:Button2Down(Vector2.zero, currentCamera.CFrame)
+					task.wait(0.1)
+					virtualUser:Button2Up(Vector2.zero, currentCamera.CFrame)
+				end)
+			end
+		end
+	end
+
+	---Drop the reach ring when the script goes away.
+	local function clearReach()
+		if reachRing then
+			reachRing:Destroy()
+			reachRing = nil
+		end
+	end
+
+	---Stop everything this script added and close the menu.
+	function shutdown()
+		if not Unstable.running then return end
+		Unstable.running = false
+
+		pcall(function()
+			runService:UnbindFromRenderStep("UnstableAim")
+		end)
+		for _, connection in ipairs(connections) do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+
+		pcall(clearEsp)
+		pcall(restoreHitboxes)
+		pcall(clearReach)
+
+		Settings.fullbright, Settings.noFog = false, false
+		pcall(applyLighting)
+		Settings.cameraFovEnabled = false
+		pcall(updateCameraFov)
+
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+		if rootPart then
+			local flyBody = rootPart:FindFirstChild("UnstableFly")
+			if flyBody then
+				flyBody:Destroy()
+			end
+		end
+		if humanoid then
+			humanoid.PlatformStand = false
+			humanoid.WalkSpeed = State.baseSpeed or 16
+			if State.baseJump and humanoid.UseJumpPower then
+				humanoid.JumpPower = State.baseJump
+			end
+		end
+
+		if Window then
+			pcall(function()
+				Window:Destroy()
+			end)
+			Window = nil
+		end
+		if hubGui then
+			hubGui:Destroy()
+			hubGui = nil
+		end
+		Environment.UnstableSMP = nil
+		Environment.UnstableSMPWindow = nil
+		Environment.UnstableSMPShutdown = nil
+		print("[RobScript] Unstable SMP stopped")
+	end
+
+	local function start()
+		Unstable.running = true
+		Environment.UnstableSMPShutdown = shutdown
+
+		local ok, err = pcall(buildHub)
+		if not ok then
+			shutdown()
+			error("[" .. Const.HUB_NAME .. "] interface failed to build: " .. tostring(err))
+		end
+
+		Environment.UnstableSMP = {
+			Airflow = Airflow,
+			Window = Window,
+			Flags = FLAGS,
+			Settings = Settings,
+			Shutdown = shutdown,
+		}
+		Environment.UnstableSMPWindow = Window
+
+		runService:BindToRenderStep("UnstableAim", Enum.RenderPriority.Camera.Value + 1, onRender)
+		track(runService.Heartbeat:Connect(onHeartbeat))
+
+		track(localPlayer.CharacterAdded:Connect(function()
+			State.baseSpeed, State.baseJump = nil, nil
+			State.currentSlot, State.hotbarSlots, State.hotbarIcons = nil, nil, nil
+			State.lastHealth, State.hudRatio = nil, nil
+			State.auraTarget, State.maceTarget, State.maceArmed = nil, nil, false
+			State.hotbarNames, State.missingItems = {}, {}
+			State.safeCFrame, State.airJumps = nil, 0
+			task.wait(0.5)
+			if Unstable.running then
+				restoreHitboxes()
+			end
+		end))
+
+		track(playersService.PlayerRemoving:Connect(function(player)
+			if player.Character then
+				pcall(removeEsp, player.Character)
+				alerted[player.Character] = nil
+			end
+		end))
+
+		task.spawn(antiAfkLoop)
+		notify("Ready  •  RightControl hides the menu")
+	end
+
+	start()
+end
