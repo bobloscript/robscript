@@ -1,0 +1,1960 @@
+-- Robscript Team - Tiny Snipers
+-- Game: [NEW MAP] Tiny Snipers | placeId 76740361051685
+-- Window: RightControl | Unload: Settings -> Unload | API: getgenv().RobScriptTS
+--
+-- What it does:
+--   Aim      - silent aim that rewrites the shot the client sends (Action "Fire" / "SwingHit"),
+--              trigger bot on the same target picker, weapon quality of life (instant scope, scope FOV).
+--   ESP      - highlight + name + distance + health bar for bots and players, through walls on demand.
+--   Movement - speed and jump through the game's own Movement config, gravity, fly, noclip, anti fall.
+--   Visuals  - fullbright, no fog, hidden game HUD, camera FOV through the game's own config.
+--
+-- How the game works (found in the client sources): the whole fight is client side.
+-- WeaponController sends Remotes.Action:FireServer("Fire", { id, origin, dir, hit, hits }, seq)
+-- and the server only re-validates that the claimed ray reaches the claimed target. So the aim tab
+-- rewrites that payload; nothing is faked on the server, the shot still has to be visible.
+
+do
+	local existing = getgenv().RobScriptTS
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local VERSION = "1.0"
+local STOP = false
+local CONNECTIONS = {}
+
+local function track(connection)
+	if connection then
+		table.insert(CONNECTIONS, connection)
+	end
+	return connection
+end
+
+-- Executor globals sit behind the environment's __index, so rawget(getfenv(), name)
+-- returns nil and the aim hook would silently never install. Resolve once at load.
+local function resolveExecutor(name)
+	local ok, value = pcall(function()
+		return getfenv()[name]
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return nil
+end
+
+local EXEC = {
+	newClosure = resolveExecutor("newcclosure"),
+	checkCaller = resolveExecutor("checkcaller"),
+	methodName = resolveExecutor("getnamecallmethod"),
+	rawMeta = resolveExecutor("getrawmetatable"),
+	setReadOnly = resolveExecutor("setreadonly"),
+}
+
+local function newClosure(callback)
+	if type(EXEC.newClosure) == "function" then
+		local ok, wrapped = pcall(EXEC.newClosure, callback)
+		if ok then
+			return wrapped
+		end
+	end
+	return callback
+end
+
+local function canCheckCaller()
+	return type(EXEC.checkCaller) == "function" and EXEC.checkCaller or nil
+end
+
+local function getMethodName()
+	if type(EXEC.methodName) ~= "function" then
+		return nil
+	end
+	local ok, value = pcall(EXEC.methodName)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[RobScript TS] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Language -----
+
+Airflow:AddLanguage("ru", {
+	Name = "Русский",
+	Flag = "ru",
+	Strings = {
+		["aim, esp, movement"] = "аим, esp, движение",
+		["Aim"] = "Аим",
+		["ESP"] = "ESP",
+		["Visuals"] = "Визуалы",
+		["Logs"] = "Логи",
+		["Settings"] = "Настройки",
+		["Activity"] = "События",
+		["Nothing yet"] = "Пока пусто",
+		-- Aim
+		["Silent aim"] = "Сайлент-аим",
+		["Redirects your shots to the picked target"] = "Перенаправляет выстрел в выбранную цель",
+		["Aim key"] = "Клавиша аима",
+		["Hold to aim, no key means always on"] = "Держать для аима, без клавиши — всегда включён",
+		["Field of view"] = "Угол обзора",
+		["Only targets inside this cone"] = "Только цели внутри этого конуса",
+		["Priority"] = "Приоритет",
+		["Crosshair"] = "По прицелу",
+		["Distance"] = "По дистанции",
+		["Target part"] = "Часть тела",
+		["Head"] = "Голова",
+		["Torso"] = "Торс",
+		["Max distance"] = "Макс. дистанция",
+		["Visible only"] = "Только видимые",
+		["Skips targets behind cover"] = "Пропускает цели за укрытием",
+		["Ignore spawn protection"] = "Игнорировать защиту спавна",
+		["Team check"] = "Проверка команды",
+		["Target types"] = "Типы целей",
+		["Bots"] = "Боты",
+		["Players"] = "Игроки",
+		["Target"] = "Цель",
+		["Nothing"] = "Ничего",
+		["Trigger bot"] = "Триггер-бот",
+		["Fires as soon as a target is in the cone"] = "Стреляет, как только цель в конусе",
+		["Fire delay"] = "Задержка выстрела",
+		["Trigger field of view"] = "Угол триггера",
+		["Weapon"] = "Оружие",
+		["Instant scope"] = "Мгновенный скоп",
+		["No scope-in animation"] = "Без анимации прицеливания",
+		["Scope FOV"] = "FOV в скопе",
+		["Hip FOV"] = "FOV от бедра",
+		["Hipfire FOV"] = "FOV от бедра",
+		-- ESP
+		["Player ESP"] = "ESP игроков",
+		["Bot ESP"] = "ESP ботов",
+		["Highlight"] = "Подсветка",
+		["Glow around the model"] = "Свечение вокруг модели",
+		["Names"] = "Ники",
+		["Health bar"] = "Полоса HP",
+		["Through walls"] = "Через стены",
+		["Color"] = "Цвет",
+		["In match"] = "В матче",
+		-- Movement
+		["Speed boost"] = "Ускорение",
+		["Uses the game's own movement settings"] = "Использует штатные настройки движения игры",
+		["Speed"] = "Скорость",
+		["Jump boost"] = "Прыжок",
+		["Jump height"] = "Высота прыжка",
+		["Gravity"] = "Гравитация",
+		["Gravity value"] = "Значение гравитации",
+		["Infinite jump"] = "Бесконечный прыжок",
+		["Auto hop"] = "Авто-хоп",
+		["Jumps the moment you land"] = "Прыгает в момент приземления",
+		["Fly"] = "Полёт",
+		["Fly speed"] = "Скорость полёта",
+		["Camera direction, Space up, Ctrl down"] = "По камере, Space вверх, Ctrl вниз",
+		["Noclip"] = "Noclip",
+		["Anti fall"] = "Анти-падение",
+		["Position"] = "Позиция",
+		["Save position"] = "Сохранить позицию",
+		["Back to position"] = "Вернуться",
+		["Go to range"] = "В тир",
+		-- Visuals
+		["Scene"] = "Сцена",
+		["Fullbright"] = "Фулбрайт",
+		["Bright scene, no darkness"] = "Светлая сцена без темноты",
+		["No fog"] = "Без тумана",
+		["HUD"] = "Интерфейс",
+		["Hide game HUD"] = "Скрыть HUD игры",
+		["Restore visuals"] = "Сбросить визуалы",
+		["Camera"] = "Камера",
+		-- Settings
+		["Keys"] = "Клавиши",
+		["Unload hub"] = "Выгрузить хаб",
+		["Version"] = "Версия",
+		-- Status and logs
+		["State"] = "Состояние",
+		["Idle"] = "Ожидание",
+		["Ready"] = "Готов",
+		["Loaded"] = "Загружено",
+		["Hub is ready"] = "Хаб готов",
+		["RightControl hides the window"] = "RightControl скрывает окно",
+		["Hub v%s loaded"] = "Хаб v%s загружен",
+		["Aim on"] = "Аим включён",
+		["Aim off"] = "Аим выключен",
+		["Trigger bot on"] = "Триггер-бот включён",
+		["Trigger bot off"] = "Триггер-бот выключен",
+		["ESP on"] = "ESP включён",
+		["ESP off"] = "ESP выключен",
+		["Movement restored"] = "Движение восстановлено",
+		["Visuals restored"] = "Визуалы сброшены",
+		["Unloaded"] = "Выгружено",
+		["Position saved"] = "Позиция сохранена",
+		["No saved position"] = "Нет сохранённой позиции",
+		["Could not reach the game config"] = "Не удалось получить конфиг игры",
+	},
+})
+
+----- State -----
+
+local S = {
+	AimOn = false,
+	AimKey = Enum.KeyCode.E,
+	AimFov = 120,
+	AimPriority = "Crosshair",
+	AimPart = "Head",
+	AimMaxDistance = 600,
+	AimVisibleOnly = true,
+	AimIgnoreProtected = true,
+	AimTeam = true,
+	AimBots = true,
+	AimPlayers = true,
+
+	TriggerOn = false,
+	TriggerDelay = 0.12,
+	TriggerFov = 45,
+
+	InstantScope = false,
+	ScopeFov = 35,
+	HipFov = 85,
+
+	EspPlayers = false,
+	EspBots = false,
+	EspHighlight = true,
+	EspNames = true,
+	EspHealth = true,
+	EspThrough = true,
+	EspDistance = 500,
+	PlayerColor = Color3.fromHex("#FF3B7F"),
+	BotColor = Color3.fromHex("#3BD1FF"),
+
+	SpeedOn = false,
+	SpeedValue = 60,
+	JumpOn = false,
+	JumpValue = 8,
+	GravityOn = false,
+	GravityValue = 130,
+	InfJump = false,
+	AutoHop = false,
+	FlyOn = false,
+	FlySpeed = 55,
+	Noclip = false,
+	AntiFall = false,
+
+	Fullbright = false,
+	NoFog = false,
+	HideHud = false,
+
+	SavedPosition = nil,
+}
+
+local RUNTIME = {
+	TargetName = "Nothing",
+	TargetCount = 0,
+	BotCount = 0,
+	PlayerCount = 0,
+	EspCount = 0,
+}
+
+-- Filled near the end of the file; the unload button keeps this upvalue alive.
+local API = nil
+
+----- Game references -----
+
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local ActionRemote = Remotes and Remotes:FindFirstChild("Action")
+
+local Config = nil
+do
+	local ok, module = pcall(function()
+		return require(ReplicatedStorage.Shared.Config)
+	end)
+	if ok and type(module) == "table" then
+		Config = module
+	end
+end
+
+local MOVE_DEFAULTS = {
+	BaseSpeed = Config and Config.Movement and Config.Movement.BaseSpeed or 20,
+	JumpHeight = Config and Config.Movement and Config.Movement.JumpHeight or 4.2,
+	Gravity = Workspace.Gravity,
+	ScopeFov = Config and Config.Camera and Config.Camera.ScopeFov or 35,
+	HipFov = Config and Config.Camera and Config.Camera.HipFov or 85,
+	ScopeTransition = Config and Config.Camera and Config.Camera.ScopeTransition or 0.15,
+}
+
+----- Helpers -----
+
+local function escapeText(text)
+	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function shortNumber(value)
+	value = tonumber(value) or 0
+	if value >= 1e6 then
+		return string.format("%.1fM", value / 1e6)
+	elseif value >= 1e3 then
+		return string.format("%.1fk", value / 1e3)
+	end
+	return tostring(math.floor(value))
+end
+
+local function getCharacter()
+	local character = LocalPlayer.Character
+	if not character or not character.Parent then
+		return nil, nil, nil
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		return nil, nil, nil
+	end
+	if humanoid.Health <= 0 then
+		return nil, nil, nil
+	end
+	return character, humanoid, root
+end
+
+local function combatantsFolder()
+	return Workspace:FindFirstChild("Combatants")
+end
+
+local function kindOf(model)
+	local kind = model:GetAttribute("CombatantKind")
+	if type(kind) == "string" then
+		return kind
+	end
+	return "Human"
+end
+
+local function isLocalModel(model)
+	local character = LocalPlayer.Character
+	return model == character or model.Name == LocalPlayer.Name
+end
+
+local function aimPartOf(model, wanted)
+	if wanted == "Torso" then
+		local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+		if torso and torso:IsA("BasePart") then
+			return torso
+		end
+	end
+	local head = model:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head
+	end
+	local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+	if torso and torso:IsA("BasePart") then
+		return torso
+	end
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	return nil
+end
+
+local function blocked(from, to)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = { LocalPlayer.Character }
+	local folder = combatantsFolder()
+	if folder then
+		table.insert(ignore, folder)
+	end
+	local effects = Workspace:FindFirstChild("Effects")
+	if effects then
+		table.insert(ignore, effects)
+	end
+	params.FilterDescendantsInstances = ignore
+	params.IgnoreWater = true
+	local result = Workspace:Raycast(from, to - from, params)
+	if not result then
+		return false
+	end
+	return result.Distance < (to - from).Magnitude - 1
+end
+
+local function aimKeyHeld()
+	local key = S.AimKey
+	if key == nil then
+		return true
+	end
+	if typeof(key) ~= "EnumItem" then
+		return true
+	end
+	return UserInputService:IsKeyDown(key)
+end
+
+local function aimActive()
+	return S.AimOn and aimKeyHeld()
+end
+
+----- Target picking -----
+
+local function collectTargets(fov, wantKinds)
+	local folder = combatantsFolder()
+	local camera = Workspace.CurrentCamera
+	local character = LocalPlayer.Character
+	if not folder or not camera then
+		return {}
+	end
+
+	local camPos = camera.CFrame.Position
+	local look = camera.CFrame.LookVector
+	local team = character and character:GetAttribute("Team")
+	local list = {}
+
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") and not isLocalModel(model) then
+			local kind = kindOf(model)
+			local allowed = (kind == "Bot" and S.AimBots) or (kind == "Human" and S.AimPlayers)
+			if wantKinds and wantKinds[kind] ~= nil then
+				allowed = wantKinds[kind]
+			end
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			local part = aimPartOf(model, S.AimPart)
+			if allowed and humanoid and humanoid.Health > 0 and part then
+				local delta = part.Position - camPos
+				local distance = delta.Magnitude
+				if distance > 1 and distance <= S.AimMaxDistance then
+					local angle = math.deg(math.acos(math.clamp(look:Dot(delta.Unit), -1, 1)))
+					if angle <= fov then
+						local ok = true
+						if S.AimIgnoreProtected and model:GetAttribute("Protected") == true then
+							ok = false
+						end
+						if ok and S.AimTeam and team ~= nil and model:GetAttribute("Team") == team then
+							ok = false
+						end
+						if ok and S.AimVisibleOnly then
+							ok = not blocked(camPos, part.Position)
+						end
+						if ok then
+							list[#list + 1] = {
+								model = model,
+								part = part,
+								pos = part.Position,
+								angle = angle,
+								distance = distance,
+								kind = kind,
+							}
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if S.AimPriority == "Distance" then
+		table.sort(list, function(a, b)
+			return a.distance < b.distance
+		end)
+	else
+		table.sort(list, function(a, b)
+			return a.angle < b.angle
+		end)
+	end
+
+	return list
+end
+
+local function bestTarget(fov)
+	local list = collectTargets(fov or S.AimFov)
+	return list[1], list
+end
+
+local function buildAimPayload(entry)
+	local camera = Workspace.CurrentCamera
+	if not camera or not entry then
+		return nil
+	end
+	local origin = camera.CFrame.Position
+	local point = entry.pos
+	local direction = point - origin
+	if direction.Magnitude < 1 then
+		return nil
+	end
+	return {
+		origin = origin,
+		dir = direction.Unit,
+		hit = {
+			target = entry.model,
+			part = entry.part.Name,
+			pos = point,
+		},
+	}
+end
+
+----- Silent aim hook -----
+
+local hookState = {
+	installed = false,
+	original = nil,
+	metatable = nil,
+}
+
+local function installHook()
+	if hookState.installed then
+		return true
+	end
+	local getMeta = EXEC.rawMeta
+	local setReadOnly = EXEC.setReadOnly
+	if type(getMeta) ~= "function" then
+		return false
+	end
+
+	local ok, metatable = pcall(getMeta, game)
+	if not ok or type(metatable) ~= "table" or type(metatable.__namecall) ~= "function" then
+		return false
+	end
+
+	local original = metatable.__namecall
+	local callerCheck = canCheckCaller()
+
+	if type(setReadOnly) == "function" then
+		pcall(setReadOnly, metatable, false)
+	end
+
+	local hook = newClosure(function(self, ...)
+		local method = getMethodName()
+		if method == "FireServer" and (callerCheck == nil or not callerCheck()) then
+			local okName, instanceName = pcall(function()
+				return self.Name
+			end)
+			if okName and instanceName == "Action" and aimActive() then
+				local args = { ... }
+				local kind = args[1]
+				if kind == "Fire" and type(args[2]) == "table" then
+					local entry = bestTarget(S.AimFov)
+					local payload = buildAimPayload(entry)
+					if payload then
+						args[2].origin = payload.origin
+						args[2].dir = payload.dir
+						args[2].hit = payload.hit
+						args[2].hits = nil
+					end
+				elseif kind == "SwingHit" and type(args[2]) == "table" then
+					local entry = bestTarget(S.AimFov)
+					if entry then
+						args[2].target = entry.model
+					end
+				end
+				return original(self, table.unpack(args))
+			end
+		end
+		return original(self, ...)
+	end)
+
+	metatable.__namecall = hook
+	if type(setReadOnly) == "function" then
+		pcall(setReadOnly, metatable, true)
+	end
+
+	hookState.installed = true
+	hookState.original = original
+	hookState.metatable = metatable
+	return true
+end
+
+local function removeHook()
+	if not hookState.installed then
+		return
+	end
+	local setReadOnly = EXEC.setReadOnly
+	if type(setReadOnly) == "function" then
+		pcall(setReadOnly, hookState.metatable, false)
+	end
+	hookState.metatable.__namecall = hookState.original
+	if type(setReadOnly) == "function" then
+		pcall(setReadOnly, hookState.metatable, true)
+	end
+	hookState.installed = false
+end
+
+----- ESP -----
+
+local ESP_TAG = "TS_HubEsp"
+
+local espEntries = {}
+
+local function removeEspEntry(entry)
+	if entry.highlight then
+		pcall(function()
+			entry.highlight:Destroy()
+		end)
+	end
+	if entry.billboard then
+		pcall(function()
+			entry.billboard:Destroy()
+		end)
+	end
+end
+
+local function clearEsp()
+	for model, entry in pairs(espEntries) do
+		removeEspEntry(entry)
+		espEntries[model] = nil
+	end
+end
+
+local function makeEntry(model, color)
+	local highlight = nil
+	local billboard = nil
+	local head = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("UpperTorso")
+	if not head or not head:IsA("BasePart") then
+		-- Lobby copies of the bots live in Workspace.LobbyPlayers; combatants without parts
+		-- cannot be shot and have nothing to attach a nameplate to.
+		return nil
+	end
+
+	if S.EspHighlight then
+		highlight = Instance.new("Highlight")
+		highlight.Name = ESP_TAG
+		highlight.Adornee = model
+		highlight.FillColor = color
+		highlight.OutlineColor = color
+		highlight.FillTransparency = 0.72
+		highlight.OutlineTransparency = 0
+		highlight.DepthMode = S.EspThrough and Enum.HighlightDepthMode.AlwaysOnTop
+			or Enum.HighlightDepthMode.Occluded
+		highlight.Parent = model
+	end
+
+	if head and (S.EspNames or S.EspHealth or S.EspDistance) then
+		billboard = Instance.new("BillboardGui")
+		billboard.Name = ESP_TAG
+		billboard.Size = UDim2.fromOffset(200, 52)
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.4, 0)
+		billboard.AlwaysOnTop = S.EspThrough
+		billboard.MaxDistance = 600
+		billboard.Adornee = head
+		billboard.Parent = head
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Info"
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.new(1, 0, 0.6, 0)
+		label.Position = UDim2.fromScale(0, 0)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 13
+		label.TextColor3 = Color3.fromRGB(245, 245, 247)
+		label.TextStrokeTransparency = 0.35
+		label.RichText = true
+		label.Text = ""
+		label.Parent = billboard
+
+		if S.EspHealth then
+			local back = Instance.new("Frame")
+			back.Name = "HpBack"
+			back.Size = UDim2.fromOffset(90, 6)
+			back.Position = UDim2.new(0.5, -45, 0.72, 0)
+			back.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+			back.BorderSizePixel = 0
+			back.Parent = billboard
+
+			local fill = Instance.new("Frame")
+			fill.Name = "HpFill"
+			fill.Size = UDim2.fromScale(1, 1)
+			fill.BackgroundColor3 = color
+			fill.BorderSizePixel = 0
+			fill.Parent = back
+		end
+	end
+
+	return {
+		highlight = highlight,
+		billboard = billboard,
+		color = color,
+	}
+end
+
+local function updateEspEntry(model, entry)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local head = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not head then
+		return
+	end
+
+	local distance = root and math.floor((head.Position - root.Position).Magnitude) or 0
+	local health = math.clamp(humanoid.Health, 0, humanoid.MaxHealth > 0 and humanoid.MaxHealth or 100)
+	local ratio = humanoid.MaxHealth > 0 and (health / humanoid.MaxHealth) or 1
+	local hpColor = ratio > 0.5 and "#5BF07A" or (ratio > 0.25 and "#FFDE00" or "#FF4D5E")
+
+	local text = ""
+	if S.EspNames then
+		text = string.format("<b>%s</b>", escapeText(model.Name))
+	end
+	if S.EspDistance then
+		local chunk = string.format("<font color='#8D8D99'>%dm</font>", distance)
+		text = text == "" and chunk or (text .. " " .. chunk)
+	end
+	if S.EspHealth then
+		local chunk = string.format("<font color='%s'>%d</font>", hpColor, math.floor(health))
+		text = text == "" and chunk or (text .. "\n" .. chunk)
+	end
+
+	if entry.billboard then
+		if entry.billboard.MaxDistance ~= S.EspDistance then
+			entry.billboard.MaxDistance = S.EspDistance
+		end
+		local label = entry.billboard:FindFirstChild("Info")
+		if label and label.Text ~= text then
+			label.Text = text
+		end
+		local back = entry.billboard:FindFirstChild("HpBack")
+		local fill = back and back:FindFirstChild("HpFill")
+		if fill then
+			fill.Size = UDim2.fromScale(math.clamp(ratio, 0, 1), 1)
+		end
+	end
+end
+
+local function refreshEsp()
+	local folder = combatantsFolder()
+	if not folder then
+		if next(espEntries) then
+			clearEsp()
+		end
+		RUNTIME.EspCount = 0
+		return
+	end
+
+	local wanted = {}
+	local bots = 0
+	local humans = 0
+
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") and not isLocalModel(model) then
+			local kind = kindOf(model)
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			local enabled = (kind == "Bot" and S.EspBots) or (kind == "Human" and S.EspPlayers)
+			if kind == "Bot" then
+				bots = bots + 1
+			elseif kind == "Human" then
+				humans = humans + 1
+			end
+			if enabled and humanoid and humanoid.Health > 0 then
+				wanted[model] = true
+				local entry = espEntries[model]
+				local color = kind == "Bot" and S.BotColor or S.PlayerColor
+				if not entry then
+					entry = makeEntry(model, color)
+					if entry then
+						espEntries[model] = entry
+					else
+						wanted[model] = nil
+					end
+				end
+				if entry then
+					if entry.color ~= color then
+						entry.color = color
+						if entry.highlight then
+							entry.highlight.FillColor = color
+							entry.highlight.OutlineColor = color
+						end
+						if entry.billboard then
+							local back = entry.billboard:FindFirstChild("HpBack")
+							local fill = back and back:FindFirstChild("HpFill")
+							if fill then
+								fill.BackgroundColor3 = color
+							end
+						end
+					end
+					if entry.highlight then
+						local mode = S.EspThrough and Enum.HighlightDepthMode.AlwaysOnTop
+							or Enum.HighlightDepthMode.Occluded
+						if entry.highlight.DepthMode ~= mode then
+							entry.highlight.DepthMode = mode
+						end
+					end
+					if entry.billboard and entry.billboard.AlwaysOnTop ~= S.EspThrough then
+						entry.billboard.AlwaysOnTop = S.EspThrough
+					end
+				end
+				local active = espEntries[model]
+				if active then
+					updateEspEntry(model, active)
+					local head = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+					local wantsBoard = head and (S.EspNames or S.EspHealth or S.EspDistance)
+					if not wantsBoard and active.billboard then
+						active.billboard:Destroy()
+						active.billboard = nil
+					elseif wantsBoard and not active.billboard and head then
+						local fresh = makeEntry(model, active.color)
+						if fresh then
+							active.billboard = fresh.billboard
+							if not active.highlight then
+								active.highlight = fresh.highlight
+							elseif fresh.highlight then
+								fresh.highlight:Destroy()
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for model, entry in pairs(espEntries) do
+		if not wanted[model] or not model.Parent then
+			removeEspEntry(entry)
+			espEntries[model] = nil
+		end
+	end
+
+	RUNTIME.BotCount = bots
+	RUNTIME.PlayerCount = humans
+	local count = 0
+	for _ in pairs(espEntries) do
+		count = count + 1
+	end
+	RUNTIME.EspCount = count
+end
+
+local function applyEspVisibility()
+	for model, entry in pairs(espEntries) do
+		removeEspEntry(entry)
+		espEntries[model] = nil
+	end
+	if S.EspPlayers or S.EspBots then
+		refreshEsp()
+	end
+end
+
+----- Movement -----
+
+local flyVelocity = nil
+local lightingDefaults = nil
+local hudStates = {}
+local speedApplied = false
+local jumpApplied = false
+local jumpBase = nil
+local visualsApplied = false
+
+local function stopFly()
+	if flyVelocity then
+		pcall(function()
+			flyVelocity:Destroy()
+		end)
+		flyVelocity = nil
+	end
+end
+
+local function stepFly(humanoid, root)
+	if not flyVelocity or flyVelocity.Parent ~= root then
+		stopFly()
+		flyVelocity = Instance.new("BodyVelocity")
+		flyVelocity.Name = "RT_Fly"
+		flyVelocity.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+		flyVelocity.Parent = root
+	end
+
+	local camera = Workspace.CurrentCamera
+	local direction = Vector3.zero
+	if camera then
+		local look = camera.CFrame.LookVector
+		local right = camera.CFrame.RightVector
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+			direction = direction + look
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+			direction = direction - look
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+			direction = direction + right
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+			direction = direction - right
+		end
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+		direction = direction + Vector3.new(0, 1, 0)
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+		direction = direction - Vector3.new(0, 1, 0)
+	end
+
+	if direction.Magnitude > 0.05 then
+		flyVelocity.Velocity = direction.Unit * S.FlySpeed
+	else
+		flyVelocity.Velocity = Vector3.zero
+	end
+end
+
+local cliplessParts = {}
+
+local function restoreCollision()
+	for part in pairs(cliplessParts) do
+		if part.Parent then
+			pcall(function()
+				part.CanCollide = true
+			end)
+		end
+		cliplessParts[part] = nil
+	end
+end
+
+local function applyMovement()
+	local _, humanoid, root = getCharacter()
+
+	if Config then
+		if Config.Movement then
+			Config.Movement.BaseSpeed = S.SpeedOn and S.SpeedValue or MOVE_DEFAULTS.BaseSpeed
+			Config.Movement.JumpHeight = S.JumpOn and S.JumpValue or MOVE_DEFAULTS.JumpHeight
+		end
+	end
+
+	if humanoid then
+		if S.SpeedOn then
+			humanoid.WalkSpeed = S.SpeedValue
+			speedApplied = true
+		elseif speedApplied then
+			humanoid.WalkSpeed = MOVE_DEFAULTS.BaseSpeed
+			speedApplied = false
+		end
+		if S.JumpOn then
+			if not jumpApplied then
+				jumpBase = humanoid.JumpHeight
+			end
+			pcall(function()
+				humanoid.UseJumpPower = false
+				humanoid.JumpHeight = S.JumpValue
+			end)
+			jumpApplied = true
+		elseif jumpApplied then
+			pcall(function()
+				humanoid.JumpHeight = jumpBase or MOVE_DEFAULTS.JumpHeight
+			end)
+			jumpApplied = false
+			jumpBase = nil
+		end
+	end
+
+	Workspace.Gravity = S.GravityOn and S.GravityValue or MOVE_DEFAULTS.Gravity
+
+	if not root then
+		stopFly()
+		return
+	end
+
+	if S.FlyOn and humanoid then
+		stepFly(humanoid, root)
+	elseif flyVelocity then
+		stopFly()
+	end
+
+	if S.Noclip then
+		local character = LocalPlayer.Character
+		if character then
+			for _, part in ipairs(character:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanCollide then
+					part.CanCollide = false
+					cliplessParts[part] = true
+				end
+			end
+		end
+	elseif next(cliplessParts) then
+		restoreCollision()
+	end
+
+	if S.AntiFall and root.Position.Y < -40 then
+		local target = S.SavedPosition
+		if target then
+			root.CFrame = CFrame.new(target + Vector3.new(0, 3, 0))
+		else
+			root.CFrame = CFrame.new(Vector3.new(0, 220, 0))
+		end
+	end
+end
+
+local function applyWeaponConfig()
+	if not Config or not Config.Camera then
+		return
+	end
+	Config.Camera.ScopeFov = S.ScopeFov
+	Config.Camera.HipFov = S.HipFov
+	Config.Camera.ScopeTransition = S.InstantScope and 0.001 or MOVE_DEFAULTS.ScopeTransition
+end
+
+----- Visuals -----
+
+local function storeLighting()
+	if lightingDefaults then
+		return
+	end
+	lightingDefaults = {
+		Brightness = Lighting.Brightness,
+		ClockTime = Lighting.ClockTime,
+		FogEnd = Lighting.FogEnd,
+		FogStart = Lighting.FogStart,
+		Ambient = Lighting.Ambient,
+		OutdoorAmbient = Lighting.OutdoorAmbient,
+		GlobalShadows = Lighting.GlobalShadows,
+	}
+end
+
+local function applyVisuals()
+	if not (S.Fullbright or S.NoFog) then
+		return
+	end
+	storeLighting()
+	if S.Fullbright then
+		Lighting.Brightness = 3
+		Lighting.ClockTime = 14
+		Lighting.Ambient = Color3.fromRGB(160, 160, 170)
+		Lighting.OutdoorAmbient = Color3.fromRGB(160, 160, 170)
+		Lighting.GlobalShadows = false
+	end
+	if S.NoFog then
+		Lighting.FogStart = 0
+		Lighting.FogEnd = 1e6
+	end
+end
+
+local function restoreVisuals()
+	if not lightingDefaults then
+		return
+	end
+	Lighting.Brightness = lightingDefaults.Brightness
+	Lighting.ClockTime = lightingDefaults.ClockTime
+	Lighting.FogEnd = lightingDefaults.FogEnd
+	Lighting.FogStart = lightingDefaults.FogStart
+	Lighting.Ambient = lightingDefaults.Ambient
+	Lighting.OutdoorAmbient = lightingDefaults.OutdoorAmbient
+	Lighting.GlobalShadows = lightingDefaults.GlobalShadows
+end
+
+local HUD_NAMES = {
+	"TinySnipersHud",
+	"TinySnipersHudAim",
+	"TinySnipersHudCorners",
+	"TinySnipersKillFeedback",
+	"TinySnipersTicker",
+	"TinySnipersMatchGoals",
+	"TinySnipersCommunityBoost",
+	"TinySnipersMatchPay",
+	"TS_Scoreboard",
+	"TinySnipersRewards",
+}
+
+local function setHudVisible(visible)
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then
+		return
+	end
+	for _, name in ipairs(HUD_NAMES) do
+		local gui = playerGui:FindFirstChild(name)
+		if gui and gui:IsA("ScreenGui") then
+			if visible then
+				if hudStates[name] ~= nil then
+					gui.Enabled = hudStates[name]
+				else
+					gui.Enabled = true
+				end
+			else
+				if hudStates[name] == nil then
+					hudStates[name] = gui.Enabled
+				end
+				gui.Enabled = false
+			end
+		end
+	end
+end
+
+----- Window -----
+
+local WINDOW = Airflow:CreateWindow({
+	Name = "Tiny Snipers",
+	LoadingSubtitle = "aim, esp, movement",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptTinySnipers" },
+	Home = {
+		Title = "Tiny Snipers",
+		Welcome = "Welcome back,",
+		Tier = "v" .. VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogsTab = WINDOW:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogsBox = LogsTab:CreateGroupbox({ Name = "Activity", Side = "Left" })
+local LOG = LogsBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+local function log(text, tone)
+	if LOG then
+		LOG:Push(text, tone)
+	end
+end
+
+----- Aim tab -----
+
+local AimTab = WINDOW:CreateTab({ Name = "Aim", Icon = "crosshair" })
+local AimBox = AimTab:CreateGroupbox({ Name = "Silent aim", Side = "Left" })
+local TriggerBox = AimTab:CreateGroupbox({ Name = "Trigger bot", Side = "Right" })
+local WeaponBox = AimTab:CreateGroupbox({ Name = "Weapon", Side = "Right" })
+
+AimBox:CreateToggle({
+	Name = "Silent aim",
+	Desc = "Redirects your shots to the picked target",
+	Flag = "AimOn",
+	CurrentValue = false,
+	Callback = function(value)
+		S.AimOn = value
+		if value then
+			local ok = installHook()
+			if not ok then
+				log("Aim hook is not available", "Error")
+			end
+		end
+		log(value and "Aim on" or "Aim off", value and "Success" or nil)
+	end,
+})
+
+AimBox:CreateKeybind({
+	Name = "Aim key",
+	Desc = "Hold to aim, no key means always on",
+	Flag = "AimKey",
+	CurrentKeybind = "E",
+	Callback = function(key)
+		S.AimKey = key
+	end,
+})
+
+AimBox:CreateSlider({
+	Name = "Field of view",
+	Range = { 5, 360 },
+	Increment = 5,
+	Suffix = " deg",
+	CurrentValue = 120,
+	Flag = "AimFov",
+	Callback = function(value)
+		S.AimFov = value
+	end,
+})
+
+AimBox:CreateDropdown({
+	Name = "Priority",
+	Options = { "Crosshair", "Distance" },
+	CurrentOption = "Crosshair",
+	Flag = "AimPriority",
+	Callback = function(value)
+		S.AimPriority = value
+	end,
+})
+
+AimBox:CreateDropdown({
+	Name = "Target part",
+	Options = { "Head", "Torso" },
+	CurrentOption = "Head",
+	Flag = "AimPart",
+	Callback = function(value)
+		S.AimPart = value
+	end,
+})
+
+AimBox:CreateSlider({
+	Name = "Max distance",
+	Range = { 25, 1500 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 600,
+	Flag = "AimMaxDistance",
+	Callback = function(value)
+		S.AimMaxDistance = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Visible only",
+	Desc = "Skips targets behind cover",
+	Flag = "AimVisibleOnly",
+	CurrentValue = true,
+	Callback = function(value)
+		S.AimVisibleOnly = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Ignore spawn protection",
+	Flag = "AimIgnoreProtected",
+	CurrentValue = true,
+	Callback = function(value)
+		S.AimIgnoreProtected = value
+	end,
+})
+
+AimBox:CreateToggle({
+	Name = "Team check",
+	Flag = "AimTeam",
+	CurrentValue = true,
+	Callback = function(value)
+		S.AimTeam = value
+	end,
+})
+
+AimBox:CreateDropdown({
+	Name = "Target types",
+	Options = { "Bots", "Players" },
+	MultipleOptions = true,
+	CurrentOption = { "Bots", "Players" },
+	Flag = "AimTargets",
+	Callback = function(list)
+		S.AimBots = false
+		S.AimPlayers = false
+		for _, value in ipairs(list) do
+			if value == "Bots" then
+				S.AimBots = true
+			elseif value == "Players" then
+				S.AimPlayers = true
+			end
+		end
+	end,
+})
+
+AimBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.3,
+	Update = function()
+		if not S.AimOn then
+			return "<Muted>Idle</Muted>"
+		end
+		local entry = bestTarget(S.AimFov)
+		if not entry then
+			return "<Muted>Nothing</Muted>"
+		end
+		RUNTIME.TargetName = entry.model.Name
+		return string.format(
+			"<Accent>%s</Accent> <Muted>%dm</Muted>",
+			escapeText(entry.model.Name),
+			math.floor(entry.distance)
+		)
+	end,
+})
+
+TriggerBox:CreateToggle({
+	Name = "Trigger bot",
+	Desc = "Fires as soon as a target is in the cone",
+	Flag = "TriggerOn",
+	CurrentValue = false,
+	Callback = function(value)
+		S.TriggerOn = value
+		if value then
+			installHook()
+		end
+		log(value and "Trigger bot on" or "Trigger bot off", value and "Success" or nil)
+	end,
+})
+
+TriggerBox:CreateSlider({
+	Name = "Fire delay",
+	Range = { 0, 0.6 },
+	Increment = 0.01,
+	Suffix = " s",
+	CurrentValue = 0.12,
+	Flag = "TriggerDelay",
+	Callback = function(value)
+		S.TriggerDelay = value
+	end,
+})
+
+TriggerBox:CreateSlider({
+	Name = "Trigger field of view",
+	Range = { 1, 60 },
+	Increment = 1,
+	Suffix = " deg",
+	CurrentValue = 45,
+	Flag = "TriggerFov",
+	Callback = function(value)
+		S.TriggerFov = value
+	end,
+})
+
+TriggerBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Update = function()
+		return S.TriggerOn and "<Success>Ready</Success>" or "<Muted>Idle</Muted>"
+	end,
+})
+
+WeaponBox:CreateToggle({
+	Name = "Instant scope",
+	Desc = "No scope-in animation",
+	Flag = "InstantScope",
+	CurrentValue = false,
+	Callback = function(value)
+		S.InstantScope = value
+		applyWeaponConfig()
+	end,
+})
+
+WeaponBox:CreateSlider({
+	Name = "Scope FOV",
+	Range = { 5, 90 },
+	Increment = 1,
+	CurrentValue = 35,
+	Flag = "ScopeFov",
+	Callback = function(value)
+		S.ScopeFov = value
+		applyWeaponConfig()
+	end,
+})
+
+WeaponBox:CreateSlider({
+	Name = "Hipfire FOV",
+	Range = { 40, 120 },
+	Increment = 1,
+	CurrentValue = 85,
+	Flag = "HipFov",
+	Callback = function(value)
+		S.HipFov = value
+		applyWeaponConfig()
+	end,
+})
+
+----- ESP tab -----
+
+local EspTab = WINDOW:CreateTab({ Name = "ESP", Icon = "eye" })
+local EspPlayersBox = EspTab:CreateGroupbox({ Name = "Players", Side = "Left" })
+local EspBotsBox = EspTab:CreateGroupbox({ Name = "Bots", Side = "Right" })
+local EspInfoBox = EspTab:CreateGroupbox({ Name = "In match", Side = "Right" })
+
+EspPlayersBox:CreateToggle({
+	Name = "Player ESP",
+	Flag = "EspPlayers",
+	CurrentValue = false,
+	Callback = function(value)
+		S.EspPlayers = value
+		applyEspVisibility()
+		log(value and "ESP on" or "ESP off", value and "Success" or nil)
+	end,
+})
+
+EspPlayersBox:CreateColorPicker({
+	Name = "Color",
+	Color = Color3.fromHex("#FF3B7F"),
+	Flag = "PlayerColor",
+	Callback = function(color)
+		S.PlayerColor = color
+	end,
+})
+
+EspPlayersBox:CreateSlider({
+	Name = "Max distance",
+	Range = { 50, 1000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 500,
+	Flag = "EspDistance",
+	Callback = function(value)
+		S.EspDistance = value
+	end,
+})
+
+EspBotsBox:CreateToggle({
+	Name = "Bot ESP",
+	Flag = "EspBots",
+	CurrentValue = false,
+	Callback = function(value)
+		S.EspBots = value
+		applyEspVisibility()
+	end,
+})
+
+EspBotsBox:CreateColorPicker({
+	Name = "Color",
+	Color = Color3.fromHex("#3BD1FF"),
+	Flag = "BotColor",
+	Callback = function(color)
+		S.BotColor = color
+	end,
+})
+
+EspBotsBox:CreateToggle({
+	Name = "Highlight",
+	Desc = "Glow around the model",
+	Flag = "EspHighlight",
+	CurrentValue = true,
+	Callback = function(value)
+		S.EspHighlight = value
+		applyEspVisibility()
+	end,
+})
+
+EspBotsBox:CreateToggle({
+	Name = "Names",
+	Flag = "EspNames",
+	CurrentValue = true,
+	Callback = function(value)
+		S.EspNames = value
+		applyEspVisibility()
+	end,
+})
+
+EspBotsBox:CreateToggle({
+	Name = "Health bar",
+	Flag = "EspHealth",
+	CurrentValue = true,
+	Callback = function(value)
+		S.EspHealth = value
+		applyEspVisibility()
+	end,
+})
+
+EspBotsBox:CreateToggle({
+	Name = "Through walls",
+	Flag = "EspThrough",
+	CurrentValue = true,
+	Callback = function(value)
+		S.EspThrough = value
+		applyEspVisibility()
+	end,
+})
+
+EspInfoBox:CreateStatus({
+	Name = "Bots",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Accent>%d</Accent>", RUNTIME.BotCount)
+	end,
+})
+
+EspInfoBox:CreateStatus({
+	Name = "Players",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Accent>%d</Accent>", RUNTIME.PlayerCount)
+	end,
+})
+
+EspInfoBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local on = S.EspPlayers or S.EspBots
+		return on and string.format("<Success>%d</Success>", RUNTIME.EspCount) or "<Muted>Idle</Muted>"
+	end,
+})
+
+----- Movement tab -----
+
+local MovementTab = WINDOW:CreateTab({ Name = "Movement", Icon = "move" })
+local SpeedBox = MovementTab:CreateGroupbox({ Name = "Speed", Side = "Left" })
+local TravelBox = MovementTab:CreateGroupbox({ Name = "Fly", Side = "Right" })
+local PositionBox = MovementTab:CreateGroupbox({ Name = "Position", Side = "Right" })
+
+SpeedBox:CreateToggle({
+	Name = "Speed boost",
+	Desc = "Uses the game's own movement settings",
+	Flag = "SpeedOn",
+	CurrentValue = false,
+	Callback = function(value)
+		S.SpeedOn = value
+		applyMovement()
+	end,
+})
+
+SpeedBox:CreateSlider({
+	Name = "Speed",
+	Range = { 20, 160 },
+	Increment = 5,
+	Suffix = " studs",
+	CurrentValue = 60,
+	Flag = "SpeedValue",
+	DependsOn = "SpeedOn",
+	Callback = function(value)
+		S.SpeedValue = value
+	end,
+})
+
+SpeedBox:CreateToggle({
+	Name = "Jump boost",
+	Flag = "JumpOn",
+	CurrentValue = false,
+	Callback = function(value)
+		S.JumpOn = value
+	end,
+})
+
+SpeedBox:CreateSlider({
+	Name = "Jump height",
+	Range = { 4, 40 },
+	Increment = 1,
+	CurrentValue = 8,
+	Flag = "JumpValue",
+	DependsOn = "JumpOn",
+	Callback = function(value)
+		S.JumpValue = value
+	end,
+})
+
+SpeedBox:CreateToggle({
+	Name = "Gravity",
+	Flag = "GravityOn",
+	CurrentValue = false,
+	Callback = function(value)
+		S.GravityOn = value
+		applyMovement()
+	end,
+})
+
+SpeedBox:CreateSlider({
+	Name = "Gravity value",
+	Range = { 20, 200 },
+	Increment = 5,
+	CurrentValue = 130,
+	Flag = "GravityValue",
+	DependsOn = "GravityOn",
+	Callback = function(value)
+		S.GravityValue = value
+	end,
+})
+
+SpeedBox:CreateToggle({
+	Name = "Infinite jump",
+	Flag = "InfJump",
+	CurrentValue = false,
+	Callback = function(value)
+		S.InfJump = value
+	end,
+})
+
+SpeedBox:CreateToggle({
+	Name = "Auto hop",
+	Desc = "Jumps the moment you land",
+	Flag = "AutoHop",
+	CurrentValue = false,
+	Callback = function(value)
+		S.AutoHop = value
+	end,
+})
+
+TravelBox:CreateToggle({
+	Name = "Fly",
+	Desc = "Camera direction, Space up, Ctrl down",
+	Flag = "FlyOn",
+	CurrentValue = false,
+	Callback = function(value)
+		S.FlyOn = value
+		if not value then
+			stopFly()
+		end
+	end,
+})
+
+TravelBox:CreateSlider({
+	Name = "Fly speed",
+	Range = { 20, 220 },
+	Increment = 5,
+	Suffix = " studs",
+	CurrentValue = 55,
+	Flag = "FlySpeed",
+	DependsOn = "FlyOn",
+	Callback = function(value)
+		S.FlySpeed = value
+	end,
+})
+
+TravelBox:CreateToggle({
+	Name = "Noclip",
+	Flag = "Noclip",
+	CurrentValue = false,
+	Callback = function(value)
+		S.Noclip = value
+		if not value then
+			restoreCollision()
+		end
+	end,
+})
+
+TravelBox:CreateToggle({
+	Name = "Anti fall",
+	Flag = "AntiFall",
+	CurrentValue = false,
+	Callback = function(value)
+		S.AntiFall = value
+	end,
+})
+
+PositionBox:CreateButton({
+	Name = "Save position",
+	Icon = "map-pin",
+	Callback = function()
+		local _, _, root = getCharacter()
+		if root then
+			S.SavedPosition = root.Position
+			log("Position saved", "Success")
+		end
+	end,
+})
+
+PositionBox:CreateButton({
+	Name = "Back to position",
+	Icon = "undo-2",
+	Callback = function()
+		local _, _, root = getCharacter()
+		if root and S.SavedPosition then
+			root.CFrame = CFrame.new(S.SavedPosition + Vector3.new(0, 3, 0))
+		elseif not S.SavedPosition then
+			log("No saved position", "Warning")
+		end
+	end,
+})
+
+PositionBox:CreateButton({
+	Name = "Go to range",
+	Icon = "crosshair",
+	Callback = function()
+		task.spawn(function()
+			local ok, travel = pcall(function()
+				return Remotes.Travel
+			end)
+			if ok and travel then
+				pcall(function()
+					travel:InvokeServer({ range = true })
+				end)
+			end
+		end)
+	end,
+})
+
+----- Visuals tab -----
+
+local VisualsTab = WINDOW:CreateTab({ Name = "Visuals", Icon = "sparkles" })
+local SceneBox = VisualsTab:CreateGroupbox({ Name = "Scene", Side = "Left" })
+local HudBox = VisualsTab:CreateGroupbox({ Name = "HUD", Side = "Right" })
+
+SceneBox:CreateToggle({
+	Name = "Fullbright",
+	Desc = "Bright scene, no darkness",
+	Flag = "Fullbright",
+	CurrentValue = false,
+	Callback = function(value)
+		S.Fullbright = value
+		if value then
+			applyVisuals()
+		else
+			restoreVisuals()
+			applyVisuals()
+		end
+	end,
+})
+
+SceneBox:CreateToggle({
+	Name = "No fog",
+	Flag = "NoFog",
+	CurrentValue = false,
+	Callback = function(value)
+		S.NoFog = value
+		if value then
+			applyVisuals()
+		else
+			restoreVisuals()
+			applyVisuals()
+		end
+	end,
+})
+
+SceneBox:CreateButton({
+	Name = "Restore visuals",
+	Icon = "rotate-ccw",
+	Callback = function()
+		S.Fullbright = false
+		S.NoFog = false
+		restoreVisuals()
+		log("Visuals restored")
+	end,
+})
+
+HudBox:CreateToggle({
+	Name = "Hide game HUD",
+	Flag = "HideHud",
+	CurrentValue = false,
+	Callback = function(value)
+		S.HideHud = value
+		setHudVisible(not value)
+	end,
+})
+
+----- Settings tab -----
+
+local SettingsTab = WINDOW:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local KeysBox = SettingsTab:CreateGroupbox({ Name = "Keys", Side = "Right" })
+
+KeysBox:CreateButton({
+	Name = "Unload hub",
+	Icon = "power",
+	Style = "Primary",
+	Confirm = true,
+	Callback = function()
+		if API and type(API.Destroy) == "function" then
+			API.Destroy()
+		end
+	end,
+})
+
+KeysBox:CreateLabel({
+	Name = "Version",
+	Text = "v" .. VERSION,
+})
+
+KeysBox:CreateLabel({
+	Name = "RightControl hides the window",
+	Text = "<Muted>RightControl hides the window</Muted>",
+})
+
+----- Runtime -----
+
+local function cleanup()
+	if STOP then
+		return
+	end
+	STOP = true
+	removeHook()
+	clearEsp()
+	stopFly()
+	restoreCollision()
+
+	if Config and Config.Movement then
+		Config.Movement.BaseSpeed = MOVE_DEFAULTS.BaseSpeed
+		Config.Movement.JumpHeight = MOVE_DEFAULTS.JumpHeight
+	end
+	if Config and Config.Camera then
+		Config.Camera.ScopeFov = MOVE_DEFAULTS.ScopeFov
+		Config.Camera.HipFov = MOVE_DEFAULTS.HipFov
+		Config.Camera.ScopeTransition = MOVE_DEFAULTS.ScopeTransition
+	end
+	Workspace.Gravity = MOVE_DEFAULTS.Gravity
+	restoreVisuals()
+	if hudStates and next(hudStates) then
+		setHudVisible(true)
+	end
+
+	local character = LocalPlayer.Character
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.WalkSpeed = 16
+		end
+	end
+
+	for _, connection in ipairs(CONNECTIONS) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	CONNECTIONS = {}
+
+	pcall(function()
+		WINDOW:Destroy()
+	end)
+	getgenv().RobScriptTS = nil
+end
+
+API = {
+	Version = VERSION,
+	Destroy = cleanup,
+	Config = Config,
+	Airflow = Airflow,
+}
+getgenv().RobScriptTS = API
+
+-- Test helper: what the hub would send for the current best target.
+API.TestAim = function(fov)
+	local entry = bestTarget(fov or S.AimFov)
+	if not entry then
+		return nil, "no target"
+	end
+	local payload = buildAimPayload(entry)
+	return {
+		model = entry.model.Name,
+		kind = entry.kind,
+		part = entry.part.Name,
+		angle = math.floor(entry.angle),
+		distance = math.floor(entry.distance),
+		origin = tostring(payload and payload.origin),
+		dir = tostring(payload and payload.dir),
+	}
+end
+
+API.State = S
+API.Runtime = RUNTIME
+API.HookInstalled = function()
+	return hookState.installed
+end
+
+-- Fast loop: movement enforcement.
+track(RunService.Heartbeat:Connect(function()
+	if STOP then
+		return
+	end
+	local ok, err = pcall(applyMovement)
+	if not ok then
+		log("Movement error: " .. tostring(err), "Error")
+	end
+end))
+
+-- Fast loop: trigger bot.
+local lastTrigger = 0
+track(RunService.Heartbeat:Connect(function()
+	if STOP or not S.TriggerOn then
+		return
+	end
+	if os.clock() - lastTrigger < S.TriggerDelay then
+		return
+	end
+	local entry = bestTarget(S.TriggerFov)
+	if not entry then
+		return
+	end
+	lastTrigger = os.clock()
+	local ok, weapon = pcall(function()
+		return require(LocalPlayer.PlayerScripts.Client.WeaponController)
+	end)
+	if ok and type(weapon) == "table" and type(weapon.fire) == "function" then
+		pcall(weapon.fire)
+	end
+end))
+
+-- Infinite jump and auto hop.
+track(UserInputService.JumpRequest:Connect(function()
+	if STOP then
+		return
+	end
+	if S.InfJump then
+		local _, humanoid = getCharacter()
+		if humanoid then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end
+end))
+
+-- Slow loop: ESP refresh plus config re-apply.
+task.spawn(function()
+	local timer = 0
+	while not STOP do
+		local ok, err = pcall(function()
+			if S.EspPlayers or S.EspBots then
+				refreshEsp()
+			elseif next(espEntries) then
+				clearEsp()
+			end
+
+			if S.AutoHop then
+				local _, humanoid = getCharacter()
+				if humanoid and humanoid.FloorMaterial ~= Enum.Material.Air then
+					local move = humanoid.MoveDirection
+					if move.Magnitude > 0.1 then
+						humanoid.Jump = true
+					end
+				end
+			end
+
+			if S.Fullbright or S.NoFog then
+				applyVisuals()
+				visualsApplied = true
+			elseif visualsApplied then
+				restoreVisuals()
+				visualsApplied = false
+			end
+
+			if S.InstantScope or S.ScopeFov ~= MOVE_DEFAULTS.ScopeFov or S.HipFov ~= MOVE_DEFAULTS.HipFov then
+				applyWeaponConfig()
+			end
+		end)
+		if not ok then
+			log("Loop error: " .. tostring(err), "Error")
+		end
+		task.wait(0.15)
+	end
+end)
+
+WINDOW:LoadAutoload()
+
+-- Autoload may have turned aim on without running a callback.
+if S.AimOn or S.TriggerOn then
+	installHook()
+end
+if S.EspPlayers or S.EspBots then
+	refreshEsp()
+end
+
+WINDOW:Notify({ Title = "Loaded", Content = "Hub is ready", Type = "Success" })
+log(string.format("<Success>Hub v%s loaded</Success>", VERSION))
+log("<Muted>RightControl hides the window</Muted>")
