@@ -1,5 +1,17 @@
 -- Robscript Team - Grow As Anomaly
--- Version 1.2 - auto farm, auto upgrades, milestones and daily spin
+-- Version 1.3 - auto farm (all blocks, gold first), auto upgrades, milestones and daily spin
+--
+-- 1.3 fixes:
+--   * Controls are read through the library's Get/Set. A Dropdown has no Value field,
+--     so the target mode and the upgrade stat always read nil and silently fell back to
+--     "Valuable" (gold blocks only) and "Cheapest" (cheapest stat only) - the two bugs
+--     reported by users.
+--   * The target dropdown now farms every destructible block and only prefers gold
+--     ("Gold first"), with "Gold only" and "Nearest" as the other choices.
+--   * The block list of a map is cached for a few seconds and tiny decorative parts
+--     (snow flakes, cacti) are skipped, so the scan no longer walks 14 000 parts per swing.
+--   * Blocks that sit high (tree crowns, wall tops) are now hit at their own height
+--     instead of at the ground under them.
 -- Game: Grow As Anomaly | place 120121152269725
 -- Window toggle: RightControl | Panic: End | API: getgenv().RobScriptGrowAnomaly
 --
@@ -80,7 +92,9 @@ local HUD_INTERVAL = 0.25
 local BLACKLIST_TIME = 8
 local SELL_LOCK = 1.4 -- the game refuses a sale right after a swing
 local SELL_COOLDOWN = 1.5
-local VALUABLE_WEIGHT = 4
+local VALUABLE_WEIGHT = 1000 -- a gold block is always worth more than a plain one
+local MIN_BLOCK_VOLUME = 2 -- snow flakes, cacti and other props pay nothing per swing
+local SCAN_CACHE_TIME = 5 -- seconds before the block list of a map is rebuilt
 local STANCE_HEIGHT = 3.1 -- root height above the ground under the stance point
 local PLACE_DELAY = 0.28 -- time for the server to see the new position before swinging
 
@@ -308,12 +322,18 @@ local function handleFor(name)
 	return nil
 end
 
+-- Toggle, Slider and Stepper keep their state in handle.Value, but a Dropdown keeps it
+-- in a local selection table and only exposes Get()/Set(). Reading Value on a dropdown
+-- returns nil, which made every dropdown in this script look like it did nothing.
 local function flag(name, fallback)
 	local handle = handleFor(name)
 	if not handle then
 		return fallback
 	end
 	local ok, value = pcall(function()
+		if type(handle.Get) == "function" then
+			return handle:Get()
+		end
 		return handle.Value
 	end)
 	if ok and value ~= nil then
@@ -322,13 +342,15 @@ local function flag(name, fallback)
 	return fallback
 end
 
+-- The second argument of Set is "silent": it updates the control without firing its
+-- callback, so a programmatic change never runs the farm logic twice.
 local function setFlag(name, value)
 	local handle = handleFor(name)
 	if not handle then
 		return false
 	end
 	return (pcall(function()
-		handle:Set(value)
+		handle:Set(value, true)
 	end))
 end
 
@@ -349,7 +371,14 @@ end
 ----- Blocks -----
 
 local function targetMode()
-	return flag("FarmTargets", "Valuable")
+	local mode = flag("TargetMode", "Gold first")
+	if type(mode) == "table" then
+		mode = mode[1]
+	end
+	if mode ~= "Gold first" and mode ~= "Gold only" and mode ~= "Nearest" then
+		mode = "Gold first"
+	end
+	return mode
 end
 
 -- Distance to the surface of the part: a wall counts as close as its face is, not as
@@ -374,6 +403,35 @@ local function isBlocked(part, blocked)
 	return false
 end
 
+-- The block list of a map is rebuilt only every few seconds: walking ~14 000 parts on
+-- every swing was the reason the interface stuttered while the farm was running.
+local PartCache = { container = nil, parts = nil, stamp = 0 }
+
+local function blockVolume(part)
+	local size = part.Size
+	return size.X * size.Y * size.Z
+end
+
+local function collectBlocks(container)
+	local list = {}
+	for _, part in ipairs(container:GetDescendants()) do
+		if part:IsA("BasePart") and blockVolume(part) >= MIN_BLOCK_VOLUME and part.Transparency < 0.6 then
+			list[#list + 1] = part
+		end
+	end
+	return list
+end
+
+local function blocksOf(container)
+	local now = os.clock()
+	if PartCache.container ~= container or not PartCache.parts or now - PartCache.stamp > SCAN_CACHE_TIME then
+		PartCache.container = container
+		PartCache.parts = collectBlocks(container)
+		PartCache.stamp = now
+	end
+	return PartCache.parts
+end
+
 local function scanTarget()
 	local container = mapContainer()
 	local root = rootOf()
@@ -387,17 +445,17 @@ local function scanTarget()
 	local position = root.Position
 	local blocked = CollectionService:GetTagged("Indestructible")
 	local best, bestScore, bestDistance
-	for _, part in ipairs(container:GetDescendants()) do
-		if part:IsA("BasePart") and part.Parent then
+	for _, part in ipairs(blocksOf(container)) do
+		-- The cache keeps parts that were carved since it was built; drop them here.
+		if part.Parent then
 			local valuable = part:GetAttribute("MoreMass") ~= nil
-			local wanted = valuable or mode ~= "Valuable"
-			if wanted and not isBlocked(part, blocked) then
+			if (valuable or mode ~= "Gold only") and not isBlocked(part, blocked) then
 				local expiry = Farm.blacklist[part]
 				if not expiry or expiry < now then
 					local distance = surfaceDistance(part, position)
 					if distance <= radius then
 						local score
-						if mode == "Nearest" then
+						if mode == "Nearest" or mode == "Gold only" then
 							score = distance
 						else
 							score = valuable and (distance / VALUABLE_WEIGHT) or distance
@@ -434,14 +492,18 @@ local function stanceFor(target, root)
 	end
 	local stand = facePoint + away.Unit * standOffset()
 	local ground = workspace:Raycast(
-		Vector3.new(stand.X, stand.Y + 8, stand.Z),
+		Vector3.new(stand.X, facePoint.Y + 6, stand.Z),
 		Vector3.new(0, -40, 0)
 	)
-	if ground then
-		stand = Vector3.new(stand.X, ground.Position.Y + STANCE_HEIGHT, stand.Z)
+	local standY
+	if ground and facePoint.Y - ground.Position.Y <= 8 then
+		standY = ground.Position.Y + STANCE_HEIGHT
 	else
-		stand = Vector3.new(stand.X, target.Position.Y + 1, stand.Z)
+		-- A high block (a tree crown, the top of a wall): stand at the block itself,
+		-- otherwise the swing happens at ground level and carves nothing.
+		standY = facePoint.Y
 	end
+	stand = Vector3.new(stand.X, standY, stand.Z)
 	local lookAt = Vector3.new(target.Position.X, stand.Y, target.Position.Z)
 	return stand, lookAt
 end
@@ -528,6 +590,40 @@ local function cheapestUpgrade()
 	return bestKey, bestPrice
 end
 
+-- What the auto-upgrade loop would buy next. "Cheapest" ignores the stat list and picks
+-- whatever is affordable now; any other name buys that stat only (nil while it is at max).
+local function nextUpgrade()
+	if not Game.upgrades then
+		return nil, nil, "Cheapest"
+	end
+	local mode = flag("UpgradeStat", "Cheapest")
+	if type(mode) == "table" then
+		mode = mode[1]
+	end
+	-- A saved config can name a stat this build does not know: fall back to cheapest
+	-- instead of doing nothing.
+	local known = false
+	for _, key in ipairs(Game.upgrades.Order) do
+		if key == mode then
+			known = true
+			break
+		end
+	end
+	if not known then
+		mode = "Cheapest"
+	end
+	local key, price
+	if mode == "Cheapest" then
+		key, price = cheapestUpgrade()
+	else
+		local rung = upgradeRung(mode)
+		if rung then
+			key, price = mode, rung.Price
+		end
+	end
+	return key, price, mode
+end
+
 local function upgradeStep()
 	if not flag("AutoUpgrade", false) then
 		return
@@ -542,17 +638,8 @@ local function upgradeStep()
 	if now - Farm.lastUpgrade < 1.5 then
 		return
 	end
-	local mode = flag("UpgradeStat", "Cheapest")
-	local key, price
-	if mode == "Cheapest" then
-		key, price = cheapestUpgrade()
-	else
-		local rung = upgradeRung(mode)
-		if rung and rung.Price <= tokenCount() then
-			key, price = mode, rung.Price
-		end
-	end
-	if not key then
+	local key, price = nextUpgrade()
+	if not key or (price or 0) > tokenCount() then
 		return
 	end
 	Farm.lastUpgrade = now
@@ -866,7 +953,7 @@ local Window = Airflow:CreateWindow({
 	Home = {
 		Title = "Robscript Team",
 		Welcome = "Welcome back,",
-		Tier = "v1.2",
+		Tier = "v1.3",
 		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
 	},
 })
@@ -893,10 +980,10 @@ handles.AutoFarm = AutomationBox:CreateToggle({
 
 AutomationBox:CreateDropdown({
 	Name = "Targets",
-	Desc = "Valuable blocks pay four times more mass",
-	Options = { "Valuable", "Nearest", "Everything" },
-	CurrentOption = "Valuable",
-	Flag = "FarmTargets",
+	Desc = "\"Gold first\" breaks any block and prefers gold ones",
+	Options = { "Gold first", "Gold only", "Nearest" },
+	CurrentOption = "Gold first",
+	Flag = "TargetMode",
 })
 
 AutomationBox:CreateSlider({
@@ -1004,6 +1091,22 @@ StatusBox:CreateStatus({
 	UpdateRate = 0.5,
 	Update = function()
 		return string.format("<Text>%d</Text>", tokenCount())
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Next buy",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if not (Game.upgrades and Game.upgrade) then
+			return "<Muted>waiting for the game</Muted>"
+		end
+		local key, price = nextUpgrade()
+		if not key then
+			return "<Muted>nothing affordable</Muted>"
+		end
+		return string.format("<Text>%s</Text> <Muted>%d tokens</Muted>", key, price or 0)
 	end,
 })
 
@@ -1224,7 +1327,11 @@ ActionsBox:CreateButton({
 local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
 AboutBox:CreateParagraph({
 	Title = "Auto farm",
-	Content = "The script breaks blocks the way the attack button does: it sends the game's own attack event while the character stands in front of a block. The character is placed next to the block instead of walking, because this game clears humanoid movement every frame. Upgrades, milestones and the daily spin use the same remotes as the shop and the wheel, and only fire when the game reports something claimable.",
+	Content = "The script breaks blocks the way the attack button does: it sends the game's own attack event while the character stands in front of a block. The character is placed next to the block instead of walking, because this game clears humanoid movement every frame. Targets has three modes: Gold first breaks every block and prefers gold ones, Gold only breaks gold, Nearest ignores value. Upgrades, milestones and the daily spin use the same remotes as the shop and the wheel, and only fire when the game reports something claimable.",
+})
+AboutBox:CreateParagraph({
+	Title = "Auto upgrade",
+	Content = "Cheapest buys whatever stat is affordable right now. Pick AttackSpeed, MaxMass, MassMultiplier, WalkSpeed or Luck to buy only that stat; the Next buy row shows what the next purchase will be.",
 })
 AboutBox:CreateParagraph({
 	Title = "Controls",
@@ -1261,11 +1368,13 @@ local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
 	rewardAccumulator = rewardAccumulator + deltaTime
 	hudAccumulator = hudAccumulator + deltaTime
 
+	-- Upgrades are bought even while the farm is idle: the shop does not need the farm.
+	if upgradeAccumulator >= 2 then
+		upgradeAccumulator = 0
+		safeCall(upgradeStep)
+	end
+
 	if Farm.enabled then
-		if upgradeAccumulator >= 2 then
-			upgradeAccumulator = 0
-			safeCall(upgradeStep)
-		end
 		safeCall(sellStep)
 	end
 
@@ -1328,7 +1437,7 @@ local function destroy()
 end
 
 getgenv().RobScriptGrowAnomaly = {
-	Version = "1.2",
+	Version = "1.3",
 	Get = function(name)
 		return flag(name, nil)
 	end,
@@ -1366,7 +1475,19 @@ getgenv().RobScriptGrowAnomaly = {
 			rate = massRate(),
 			tokens = tokenCount(),
 			target = Farm.target and Farm.target:GetFullName() or nil,
+			targetValuable = Farm.target ~= nil and Farm.target:GetAttribute("MoreMass") ~= nil,
 			distance = Farm.targetDistance,
+		}
+	end,
+	-- What the auto-upgrade loop would buy right now, without buying it.
+	NextUpgrade = function()
+		bindGame()
+		local key, price, mode = nextUpgrade()
+		return {
+			mode = mode,
+			key = key,
+			price = price,
+			tokens = tokenCount(),
 		}
 	end,
 	GetRewards = function()
