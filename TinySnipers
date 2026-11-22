@@ -3,16 +3,15 @@
 -- Window: RightControl | Unload: Settings -> Unload | API: getgenv().RobScriptTS
 --
 -- What it does:
---   Aim      - silent aim that rewrites the shot the client sends (Action "Fire" / "SwingHit"),
---              trigger bot on the same target picker, weapon quality of life (instant scope, scope FOV).
+--   Aim      - aimbot that turns your camera onto the picked target through the game's own
+--              LookRotation module, trigger bot on the same target picker, weapon quality of life.
 --   ESP      - highlight + name + distance + health bar for bots and players, through walls on demand.
 --   Movement - speed and jump through the game's own Movement config, gravity, fly, noclip, anti fall.
 --   Visuals  - fullbright, no fog, hidden game HUD, camera FOV through the game's own config.
 --
--- How the game works (found in the client sources): the whole fight is client side.
--- WeaponController sends Remotes.Action:FireServer("Fire", { id, origin, dir, hit, hits }, seq)
--- and the server only re-validates that the claimed ray reaches the claimed target. So the aim tab
--- rewrites that payload; nothing is faked on the server, the shot still has to be visible.
+-- How the aim works: the game is client side and takes the shot ray straight from the camera
+-- (WeaponController.shotRay -> Workspace.CurrentCamera.CFrame). Client/LookRotation rotates that
+-- camera by degrees, so aiming the camera is the whole aimbot. No hooks, no remote rewriting.
 
 do
 	local existing = getgenv().RobScriptTS
@@ -32,7 +31,7 @@ local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
-local VERSION = "1.0"
+local VERSION = "1.1"
 local STOP = false
 local CONNECTIONS = {}
 
@@ -41,51 +40,6 @@ local function track(connection)
 		table.insert(CONNECTIONS, connection)
 	end
 	return connection
-end
-
--- Executor globals sit behind the environment's __index, so rawget(getfenv(), name)
--- returns nil and the aim hook would silently never install. Resolve once at load.
-local function resolveExecutor(name)
-	local ok, value = pcall(function()
-		return getfenv()[name]
-	end)
-	if ok and value ~= nil then
-		return value
-	end
-	return nil
-end
-
-local EXEC = {
-	newClosure = resolveExecutor("newcclosure"),
-	checkCaller = resolveExecutor("checkcaller"),
-	methodName = resolveExecutor("getnamecallmethod"),
-	rawMeta = resolveExecutor("getrawmetatable"),
-	setReadOnly = resolveExecutor("setreadonly"),
-}
-
-local function newClosure(callback)
-	if type(EXEC.newClosure) == "function" then
-		local ok, wrapped = pcall(EXEC.newClosure, callback)
-		if ok then
-			return wrapped
-		end
-	end
-	return callback
-end
-
-local function canCheckCaller()
-	return type(EXEC.checkCaller) == "function" and EXEC.checkCaller or nil
-end
-
-local function getMethodName()
-	if type(EXEC.methodName) ~= "function" then
-		return nil
-	end
-	local ok, value = pcall(EXEC.methodName)
-	if ok then
-		return value
-	end
-	return nil
 end
 
 ----- Library -----
@@ -151,10 +105,12 @@ Airflow:AddLanguage("ru", {
 		["Activity"] = "События",
 		["Nothing yet"] = "Пока пусто",
 		-- Aim
-		["Silent aim"] = "Сайлент-аим",
-		["Redirects your shots to the picked target"] = "Перенаправляет выстрел в выбранную цель",
+		["Aimbot"] = "Аимбот",
+		["Turns your camera onto the picked target"] = "Наводит камеру на выбранную цель",
+		["Smoothness"] = "Плавность",
+		["0 snaps instantly, higher values glide"] = "0 — мгновенно, выше — плавнее",
 		["Aim key"] = "Клавиша аима",
-		["Hold to aim, no key means always on"] = "Держать для аима, без клавиши — всегда включён",
+		["Optional hold key, empty means always on"] = "Необязательная клавиша удержания, пусто — всегда включён",
 		["Field of view"] = "Угол обзора",
 		["Only targets inside this cone"] = "Только цели внутри этого конуса",
 		["Priority"] = "Приоритет",
@@ -253,8 +209,9 @@ Airflow:AddLanguage("ru", {
 
 local S = {
 	AimOn = false,
-	AimKey = Enum.KeyCode.E,
+	AimKey = nil,
 	AimFov = 120,
+	AimSmooth = 0.35,
 	AimPriority = "Crosshair",
 	AimPart = "Head",
 	AimMaxDistance = 600,
@@ -518,113 +475,74 @@ local function bestTarget(fov)
 	return list[1], list
 end
 
-local function buildAimPayload(entry)
-	local camera = Workspace.CurrentCamera
-	if not camera or not entry then
-		return nil
-	end
-	local origin = camera.CFrame.Position
-	local point = entry.pos
-	local direction = point - origin
-	if direction.Magnitude < 1 then
-		return nil
-	end
-	return {
-		origin = origin,
-		dir = direction.Unit,
-		hit = {
-			target = entry.model,
-			part = entry.part.Name,
-			pos = point,
-		},
-	}
-end
+----- Aimbot -----
 
------ Silent aim hook -----
-
-local hookState = {
-	installed = false,
-	original = nil,
-	metatable = nil,
-}
-
-local function installHook()
-	if hookState.installed then
-		return true
-	end
-	local getMeta = EXEC.rawMeta
-	local setReadOnly = EXEC.setReadOnly
-	if type(getMeta) ~= "function" then
-		return false
-	end
-
-	local ok, metatable = pcall(getMeta, game)
-	if not ok or type(metatable) ~= "table" or type(metatable.__namecall) ~= "function" then
-		return false
-	end
-
-	local original = metatable.__namecall
-	local callerCheck = canCheckCaller()
-
-	if type(setReadOnly) == "function" then
-		pcall(setReadOnly, metatable, false)
-	end
-
-	local hook = newClosure(function(self, ...)
-		local method = getMethodName()
-		if method == "FireServer" and (callerCheck == nil or not callerCheck()) then
-			local okName, instanceName = pcall(function()
-				return self.Name
-			end)
-			if okName and instanceName == "Action" and aimActive() then
-				local args = { ... }
-				local kind = args[1]
-				if kind == "Fire" and type(args[2]) == "table" then
-					local entry = bestTarget(S.AimFov)
-					local payload = buildAimPayload(entry)
-					if payload then
-						args[2].origin = payload.origin
-						args[2].dir = payload.dir
-						args[2].hit = payload.hit
-						args[2].hits = nil
-					end
-				elseif kind == "SwingHit" and type(args[2]) == "table" then
-					local entry = bestTarget(S.AimFov)
-					if entry then
-						args[2].target = entry.model
-					end
-				end
-				return original(self, table.unpack(args))
-			end
-		end
-		return original(self, ...)
+-- The game ships its own look module: LookRotation(dx, dy) rotates the camera by degrees.
+-- The shot ray is taken straight from the camera, so turning the camera is all an aimbot needs.
+local lookRotation = nil
+do
+	local ok, module = pcall(function()
+		return require(LocalPlayer.PlayerScripts.Client.LookRotation)
 	end)
-
-	metatable.__namecall = hook
-	if type(setReadOnly) == "function" then
-		pcall(setReadOnly, metatable, true)
+	if ok and type(module) == "function" then
+		lookRotation = module
 	end
-
-	hookState.installed = true
-	hookState.original = original
-	hookState.metatable = metatable
-	return true
 end
 
-local function removeHook()
-	if not hookState.installed then
+local AIM_BIND = "TS_Aimbot"
+
+local function aimStep()
+	if STOP or not (S.AimOn and aimKeyHeld()) then
 		return
 	end
-	local setReadOnly = EXEC.setReadOnly
-	if type(setReadOnly) == "function" then
-		pcall(setReadOnly, hookState.metatable, false)
+	local entry = bestTarget(S.AimFov)
+	if not entry then
+		return
 	end
-	hookState.metatable.__namecall = hookState.original
-	if type(setReadOnly) == "function" then
-		pcall(setReadOnly, hookState.metatable, true)
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
 	end
-	hookState.installed = false
+
+	local origin = camera.CFrame.Position
+	local direction = entry.pos - origin
+	if direction.Magnitude < 1 then
+		return
+	end
+	direction = direction.Unit
+
+	local look = camera.CFrame.LookVector
+	local currentYaw = math.atan2(-look.X, -look.Z)
+	local wantedYaw = math.atan2(-direction.X, -direction.Z)
+	local deltaYaw = math.deg(currentYaw - wantedYaw)
+	if deltaYaw > 180 then
+		deltaYaw = deltaYaw - 360
+	elseif deltaYaw < -180 then
+		deltaYaw = deltaYaw + 360
+	end
+	local currentPitch = math.asin(math.clamp(look.Y, -1, 1))
+	local wantedPitch = math.asin(math.clamp(direction.Y, -1, 1))
+	local deltaPitch = math.deg(wantedPitch - currentPitch)
+
+	local strength = math.clamp(1 - S.AimSmooth, 0.05, 1)
+	deltaYaw = deltaYaw * strength
+	deltaPitch = deltaPitch * strength
+
+	if lookRotation then
+		pcall(lookRotation, deltaYaw, deltaPitch)
+	else
+		pcall(function()
+			camera.CFrame = CFrame.lookAt(origin, entry.pos)
+		end)
+	end
+
+	RUNTIME.TargetName = entry.model.Name
+	RUNTIME.TargetDistance = math.floor(entry.distance)
 end
+
+track(RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 2, function()
+	pcall(aimStep)
+end))
 
 ----- ESP -----
 
@@ -1156,32 +1074,26 @@ end
 ----- Aim tab -----
 
 local AimTab = WINDOW:CreateTab({ Name = "Aim", Icon = "crosshair" })
-local AimBox = AimTab:CreateGroupbox({ Name = "Silent aim", Side = "Left" })
+local AimBox = AimTab:CreateGroupbox({ Name = "Aimbot", Side = "Left" })
 local TriggerBox = AimTab:CreateGroupbox({ Name = "Trigger bot", Side = "Right" })
 local WeaponBox = AimTab:CreateGroupbox({ Name = "Weapon", Side = "Right" })
 
 AimBox:CreateToggle({
-	Name = "Silent aim",
-	Desc = "Redirects your shots to the picked target",
+	Name = "Aimbot",
+	Desc = "Turns your camera onto the picked target",
 	Flag = "AimOn",
 	CurrentValue = false,
 	Callback = function(value)
 		S.AimOn = value
-		if value then
-			local ok = installHook()
-			if not ok then
-				log("Aim hook is not available", "Error")
-			end
-		end
 		log(value and "Aim on" or "Aim off", value and "Success" or nil)
 	end,
 })
 
 AimBox:CreateKeybind({
 	Name = "Aim key",
-	Desc = "Hold to aim, no key means always on",
+	Desc = "Optional hold key, empty means always on",
 	Flag = "AimKey",
-	CurrentKeybind = "E",
+	CurrentKeybind = nil,
 	Callback = function(key)
 		S.AimKey = key
 	end,
@@ -1196,6 +1108,18 @@ AimBox:CreateSlider({
 	Flag = "AimFov",
 	Callback = function(value)
 		S.AimFov = value
+	end,
+})
+
+AimBox:CreateSlider({
+	Name = "Smoothness",
+	Desc = "0 snaps instantly, higher values glide",
+	Range = { 0, 0.9 },
+	Increment = 0.05,
+	CurrentValue = 0.35,
+	Flag = "AimSmooth",
+	Callback = function(value)
+		S.AimSmooth = value
 	end,
 })
 
@@ -1307,9 +1231,6 @@ TriggerBox:CreateToggle({
 	CurrentValue = false,
 	Callback = function(value)
 		S.TriggerOn = value
-		if value then
-			installHook()
-		end
 		log(value and "Trigger bot on" or "Trigger bot off", value and "Success" or nil)
 	end,
 })
@@ -1786,7 +1707,9 @@ local function cleanup()
 		return
 	end
 	STOP = true
-	removeHook()
+	pcall(function()
+		RunService:UnbindFromRenderStep(AIM_BIND)
+	end)
 	clearEsp()
 	stopFly()
 	restoreCollision()
@@ -1835,29 +1758,23 @@ API = {
 }
 getgenv().RobScriptTS = API
 
--- Test helper: what the hub would send for the current best target.
+-- Test helper: what the aimbot currently locks on.
 API.TestAim = function(fov)
 	local entry = bestTarget(fov or S.AimFov)
 	if not entry then
 		return nil, "no target"
 	end
-	local payload = buildAimPayload(entry)
 	return {
 		model = entry.model.Name,
 		kind = entry.kind,
 		part = entry.part.Name,
 		angle = math.floor(entry.angle),
 		distance = math.floor(entry.distance),
-		origin = tostring(payload and payload.origin),
-		dir = tostring(payload and payload.dir),
 	}
 end
 
 API.State = S
 API.Runtime = RUNTIME
-API.HookInstalled = function()
-	return hookState.installed
-end
 
 -- Fast loop: movement enforcement.
 track(RunService.Heartbeat:Connect(function()
@@ -1947,10 +1864,6 @@ end)
 
 WINDOW:LoadAutoload()
 
--- Autoload may have turned aim on without running a callback.
-if S.AimOn or S.TriggerOn then
-	installHook()
-end
 if S.EspPlayers or S.EspBots then
 	refreshEsp()
 end
