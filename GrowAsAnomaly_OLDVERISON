@@ -1,0 +1,1452 @@
+-- Robscript Team - Grow As Anomaly
+-- Version 1.2 - auto farm, auto upgrades, milestones and daily spin
+-- Game: Grow As Anomaly | place 120121152269725
+-- Window toggle: RightControl | Panic: End | API: getgenv().RobScriptGrowAnomaly
+--
+-- How the farm works: this game breaks blocks when the anomaly swings at them.
+-- The attack button only sends AnomalyAttackEvent to the server, so the loop below
+-- stands the character right in front of a destructible block, turns it towards that
+-- block and sends the same remote at the game's own attack cooldown. The server carves
+-- the block in front of the character (the client version of that carve lives in
+-- ReplicatedStorage.Shared.Modules.Destruction) and pays mass for the carved volume.
+--
+-- The character is placed by CFrame instead of walking: the game's controller clears
+-- the humanoid input every frame, so MoveTo and Move do nothing, and the Climbing
+-- state keeps the character glued to trunks. Placing the character is instant and the
+-- server still accepts the swing, which is why one block costs one attack cooldown.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Drop a previous copy first so its loops and window die before the new one starts.
+do
+	local previous = getgenv().RobScriptGrowAnomaly
+	if type(previous) == "table" and type(previous.Destroy) == "function" then
+		pcall(previous.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript GrowAnomaly] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromRGB(141, 141, 153),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local SCAN_INTERVAL = 0.6
+local HUD_INTERVAL = 0.25
+local BLACKLIST_TIME = 8
+local SELL_LOCK = 1.4 -- the game refuses a sale right after a swing
+local SELL_COOLDOWN = 1.5
+local VALUABLE_WEIGHT = 4
+local STANCE_HEIGHT = 3.1 -- root height above the ground under the stance point
+local PLACE_DELAY = 0.28 -- time for the server to see the new position before swinging
+
+----- Game bindings -----
+
+local Game = {
+	stats = nil,
+	upgrades = nil,
+	milestones = nil,
+	dailySpin = nil,
+	attack = nil,
+	sellMass = nil,
+	upgrade = nil,
+	milestoneClaim = nil,
+	dailySpinEvent = nil,
+}
+
+local function bindGame()
+	if Game.attack and Game.attack.Parent then
+		return true
+	end
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	local modules = shared and shared:FindFirstChild("Modules")
+	if not modules then
+		return false
+	end
+	local attack = modules:FindFirstChild("AnomalyAttackEvent")
+	local sellMass = modules:FindFirstChild("SellMassEvent")
+	local upgrade = modules:FindFirstChild("UpgradeEvent")
+	if not (attack and sellMass) then
+		return false
+	end
+	local okStats, statsModule = pcall(function()
+		return require(modules:WaitForChild("AnomalyStats", 5))
+	end)
+	local okUpgrades, upgradesModule = pcall(function()
+		return require(modules:WaitForChild("Upgrades", 5))
+	end)
+	local okMilestones, milestonesModule = pcall(function()
+		return require(modules:WaitForChild("Milestones", 5))
+	end)
+	local okSpin, spinModule = pcall(function()
+		return require(modules:WaitForChild("DailySpin", 5))
+	end)
+	Game.attack = attack
+	Game.sellMass = sellMass
+	Game.upgrade = upgrade
+	Game.milestoneClaim = modules:FindFirstChild("MilestoneClaimEvent")
+	Game.dailySpinEvent = modules:FindFirstChild("DailySpinEvent")
+	Game.stats = okStats and statsModule or nil
+	Game.upgrades = okUpgrades and upgradesModule or nil
+	Game.milestones = okMilestones and milestonesModule or nil
+	Game.dailySpin = okSpin and spinModule or nil
+	return true
+end
+
+local function character()
+	local current = LocalPlayer.Character
+	if current and current.Parent then
+		return current
+	end
+	return nil
+end
+
+local function humanoidOf()
+	local current = character()
+	return current and current:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function rootOf()
+	local current = character()
+	return current and current:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function hiddenStat(name)
+	local hidden = LocalPlayer:FindFirstChild("HiddenStats")
+	local value = hidden and hidden:FindFirstChild(name)
+	if value and value:IsA("ValueBase") then
+		return value
+	end
+	return nil
+end
+
+local function currentMass()
+	local value = hiddenStat("CurrentMass")
+	return value and value.Value or 0
+end
+
+local function tokenCount()
+	local value = hiddenStat("UpgradeTokens")
+	return value and value.Value or 0
+end
+
+local function anomalyId()
+	local current = character()
+	local id = current and current:GetAttribute("AnomalyId")
+	if type(id) == "string" then
+		return id
+	end
+	return ""
+end
+
+local function appliedMass()
+	local current = character()
+	local value = current and current:GetAttribute("AppliedMass")
+	if type(value) == "number" and value > 0 then
+		return value
+	end
+	return 1
+end
+
+local function maxMass()
+	if Game.stats then
+		local ok, value = pcall(Game.stats.MaxMass, LocalPlayer, anomalyId())
+		if ok and type(value) == "number" and value > 0 then
+			return value
+		end
+	end
+	return 1000
+end
+
+local function attackCooldown()
+	if Game.stats then
+		local ok, value = pcall(Game.stats.AttackCooldown, LocalPlayer, anomalyId())
+		if ok and type(value) == "number" and value > 0 then
+			return value
+		end
+	end
+	return 2
+end
+
+local function hitboxRadius()
+	if Game.stats then
+		local ok, value = pcall(Game.stats.HitboxRadius, anomalyId(), appliedMass(), character(), nil)
+		if ok and type(value) == "number" and value > 0 then
+			return value
+		end
+	end
+	return 2
+end
+
+local function mapContainer()
+	local map = workspace:FindFirstChild("Map")
+	if not map then
+		return nil
+	end
+	local name = map:GetAttribute("CurrentMap")
+	local container = name and map:FindFirstChild(name)
+	if container then
+		return container
+	end
+	return nil
+end
+
+local function upgradeLevel(key)
+	if not Game.upgrades then
+		return 0
+	end
+	local ok, level = pcall(Game.upgrades.LevelOf, LocalPlayer, key)
+	if ok and type(level) == "number" then
+		return level
+	end
+	return 0
+end
+
+local function upgradeRung(key)
+	if not Game.upgrades then
+		return nil
+	end
+	local ok, rung = pcall(Game.upgrades.NextRung, key, upgradeLevel(key))
+	if ok and type(rung) == "table" and type(rung.Price) == "number" then
+		return rung
+	end
+	return nil
+end
+
+----- State -----
+
+local Farm = {
+	enabled = false,
+	target = nil,
+	targetDistance = 0,
+	state = "Idle",
+	attacks = 0,
+	massGained = 0,
+	misses = 0,
+	lastAttack = 0,
+	lastSell = 0,
+	lastUpgrade = 0,
+	lastMilestone = 0,
+	lastSpin = 0,
+	lastScan = 0,
+	blacklist = {},
+	sessionStart = 0,
+	targetSwings = 0,
+	targetMass = 0,
+}
+
+local handles = {}
+local running = true
+local farmToken = 0
+
+local EventLog = nil
+
+local function recordEvent(text)
+	if EventLog then
+		pcall(function()
+			EventLog:Push(text)
+		end)
+	end
+end
+
+-- Not every control stores its handle in handles; the library keeps every flag in
+-- Airflow.Flags, so the API can read and write the rest of them too.
+local function handleFor(name)
+	local handle = handles[name]
+	if handle then
+		return handle
+	end
+	local container = Airflow.Flags
+	local entry = container and container[name]
+	if type(entry) == "table" then
+		return entry
+	end
+	return nil
+end
+
+local function flag(name, fallback)
+	local handle = handleFor(name)
+	if not handle then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return handle.Value
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local handle = handleFor(name)
+	if not handle then
+		return false
+	end
+	return (pcall(function()
+		handle:Set(value)
+	end))
+end
+
+local function swingInterval()
+	local percent = tonumber(flag("SwingDelay", 102)) or 102
+	return attackCooldown() * (percent / 100)
+end
+
+local function standOffset()
+	return tonumber(flag("StandOffset", 2)) or 2
+end
+
+local function sellThreshold()
+	local percent = tonumber(flag("SellAt", 90)) or 90
+	return math.floor(maxMass() * percent / 100)
+end
+
+----- Blocks -----
+
+local function targetMode()
+	return flag("FarmTargets", "Valuable")
+end
+
+-- Distance to the surface of the part: a wall counts as close as its face is, not as
+-- its centre is, which keeps the character from picking a block across the street.
+local function surfaceDistance(part, position)
+	local localPosition = part.CFrame:PointToObjectSpace(position)
+	local half = part.Size * 0.5
+	local clamped = Vector3.new(
+		math.clamp(localPosition.X, -half.X, half.X),
+		math.clamp(localPosition.Y, -half.Y, half.Y),
+		math.clamp(localPosition.Z, -half.Z, half.Z)
+	)
+	return (localPosition - clamped).Magnitude
+end
+
+local function isBlocked(part, blocked)
+	for _, node in ipairs(blocked) do
+		if part:IsDescendantOf(node) then
+			return true
+		end
+	end
+	return false
+end
+
+local function scanTarget()
+	local container = mapContainer()
+	local root = rootOf()
+	if not (container and root) then
+		return nil, 0
+	end
+	local now = os.clock()
+	Farm.lastScan = now
+	local radius = tonumber(flag("FarmRadius", 300)) or 300
+	local mode = targetMode()
+	local position = root.Position
+	local blocked = CollectionService:GetTagged("Indestructible")
+	local best, bestScore, bestDistance
+	for _, part in ipairs(container:GetDescendants()) do
+		if part:IsA("BasePart") and part.Parent then
+			local valuable = part:GetAttribute("MoreMass") ~= nil
+			local wanted = valuable or mode ~= "Valuable"
+			if wanted and not isBlocked(part, blocked) then
+				local expiry = Farm.blacklist[part]
+				if not expiry or expiry < now then
+					local distance = surfaceDistance(part, position)
+					if distance <= radius then
+						local score
+						if mode == "Nearest" then
+							score = distance
+						else
+							score = valuable and (distance / VALUABLE_WEIGHT) or distance
+						end
+						if not bestScore or score < bestScore then
+							best, bestScore, bestDistance = part, score, distance
+						end
+					end
+				end
+			end
+		end
+	end
+	return best, bestDistance or 0
+end
+
+-- Where to put the character so its chest-height swing lands inside the block: right
+-- next to the nearest face, on the ground under that spot when there is any.
+local function stanceFor(target, root)
+	local position = root.Position
+	local localPosition = target.CFrame:PointToObjectSpace(position)
+	local half = target.Size * 0.5
+	local facePoint = target.CFrame:PointToWorldSpace(Vector3.new(
+		math.clamp(localPosition.X, -half.X, half.X),
+		0,
+		math.clamp(localPosition.Z, -half.Z, half.Z)
+	))
+	local away = Vector3.new(position.X - target.Position.X, 0, position.Z - target.Position.Z)
+	if away.Magnitude < 0.1 then
+		local look = target.CFrame.LookVector
+		away = Vector3.new(look.X, 0, look.Z)
+	end
+	if away.Magnitude < 0.1 then
+		away = Vector3.new(1, 0, 0)
+	end
+	local stand = facePoint + away.Unit * standOffset()
+	local ground = workspace:Raycast(
+		Vector3.new(stand.X, stand.Y + 8, stand.Z),
+		Vector3.new(0, -40, 0)
+	)
+	if ground then
+		stand = Vector3.new(stand.X, ground.Position.Y + STANCE_HEIGHT, stand.Z)
+	else
+		stand = Vector3.new(stand.X, target.Position.Y + 1, stand.Z)
+	end
+	local lookAt = Vector3.new(target.Position.X, stand.Y, target.Position.Z)
+	return stand, lookAt
+end
+
+local function blacklist(part)
+	if part then
+		Farm.blacklist[part] = os.clock() + BLACKLIST_TIME
+	end
+	Farm.target = nil
+	Farm.targetSwings = 0
+end
+
+local function pruneBlacklist()
+	local now = os.clock()
+	for part, expiry in pairs(Farm.blacklist) do
+		if expiry < now or not part.Parent then
+			Farm.blacklist[part] = nil
+		end
+	end
+end
+
+----- Actions -----
+
+local function swingOnce()
+	if not bindGame() then
+		return false
+	end
+	Farm.lastAttack = os.clock()
+	Farm.attacks = Farm.attacks + 1
+	local before = currentMass()
+	Game.attack:FireServer()
+	task.delay(0.7, function()
+		local gained = currentMass() - before
+		if gained > 0 then
+			Farm.massGained = Farm.massGained + gained
+		end
+	end)
+	return true
+end
+
+local function holdAttacksForSale()
+	if not flag("AutoSell", true) then
+		return false
+	end
+	return currentMass() >= sellThreshold()
+end
+
+local function sellStep()
+	if not flag("AutoSell", true) or not bindGame() then
+		return
+	end
+	if currentMass() < sellThreshold() then
+		return
+	end
+	local now = os.clock()
+	if now - Farm.lastAttack < SELL_LOCK or now - Farm.lastSell < SELL_COOLDOWN then
+		return
+	end
+	Farm.lastSell = now
+	local before = currentMass()
+	Game.sellMass:FireServer()
+	task.delay(0.8, function()
+		local after = currentMass()
+		if after < before then
+			recordEvent(string.format("<Success>Sold %d mass</Success>", before - after))
+		end
+	end)
+end
+
+-- Cheapest first: every stat the game sells has its own price ladder, and the loop
+-- always buys whatever level is affordable right now instead of saving up for one.
+local function cheapestUpgrade()
+	if not Game.upgrades then
+		return nil
+	end
+	local tokens = tokenCount()
+	local bestKey, bestPrice
+	for _, key in ipairs(Game.upgrades.Order) do
+		local rung = upgradeRung(key)
+		if rung and rung.Price <= tokens and (not bestPrice or rung.Price < bestPrice) then
+			bestKey, bestPrice = key, rung.Price
+		end
+	end
+	return bestKey, bestPrice
+end
+
+local function upgradeStep()
+	if not flag("AutoUpgrade", false) then
+		return
+	end
+	if not bindGame() then
+		return
+	end
+	if not (Game.upgrades and Game.upgrade) then
+		return
+	end
+	local now = os.clock()
+	if now - Farm.lastUpgrade < 1.5 then
+		return
+	end
+	local mode = flag("UpgradeStat", "Cheapest")
+	local key, price
+	if mode == "Cheapest" then
+		key, price = cheapestUpgrade()
+	else
+		local rung = upgradeRung(mode)
+		if rung and rung.Price <= tokenCount() then
+			key, price = mode, rung.Price
+		end
+	end
+	if not key then
+		return
+	end
+	Farm.lastUpgrade = now
+	Game.upgrade:FireServer(key)
+	recordEvent(string.format("<Success>%s upgraded</Success> <Muted>- %d tokens</Muted>", key, price or 0))
+end
+
+-- Milestones pay tokens, cores and potions for progress that already happened, so they
+-- are claimed as soon as Milestones.Claimable says the next rung is reached.
+local function milestoneCandidates()
+	local list = {}
+	if not Game.milestones then
+		return list
+	end
+	for _, id in ipairs(Game.milestones.Order) do
+		if Game.milestones.Claimable(LocalPlayer, id) then
+			table.insert(list, id)
+		end
+	end
+	return list
+end
+
+local function milestoneStep()
+	if not flag("AutoMilestones", true) then
+		return
+	end
+	if not bindGame() then
+		return
+	end
+	if not (Game.milestones and Game.milestoneClaim) then
+		return
+	end
+	local now = os.clock()
+	if now - Farm.lastMilestone < 2 then
+		return
+	end
+	local list = milestoneCandidates()
+	if #list == 0 then
+		return
+	end
+	Farm.lastMilestone = now
+	Game.milestoneClaim:FireServer(list[1])
+	recordEvent(string.format("<Success>Milestone %s claimed</Success>", list[1]))
+end
+
+-- The daily spin is server-side gated on group membership and on one spin per day.
+local function spinBlockedReason()
+	if not bindGame() then
+		return "Waiting for the game"
+	end
+	if not (Game.dailySpin and Game.dailySpinEvent) then
+		return "Waiting for the game"
+	end
+	local stat = hiddenStat(Game.dailySpin.StatName)
+	if not stat then
+		return "Waiting for the game"
+	end
+	if Game.dailySpin.SpunToday(stat.Value) then
+		return "Done today"
+	end
+	if LocalPlayer:GetAttribute(Game.dailySpin.GroupAttribute) ~= true then
+		return "Join the group"
+	end
+	return nil
+end
+
+local function spinStep()
+	if not flag("AutoSpin", true) then
+		return
+	end
+	if spinBlockedReason() then
+		return
+	end
+	local now = os.clock()
+	if now - Farm.lastSpin < 8 then
+		return
+	end
+	Farm.lastSpin = now
+	Game.dailySpinEvent:FireServer()
+	recordEvent("<Success>Daily spin used</Success>")
+end
+
+local function joinSpinGroup()
+	local groupId = Game.dailySpin and Game.dailySpin.GroupId or 9019804
+	task.spawn(function()
+		local ok, result = pcall(function()
+			return game:GetService("GroupService"):PromptJoinAsync(groupId)
+		end)
+		if ok then
+			recordEvent(string.format("<Success>Group prompt: %s</Success>", tostring(result)))
+		else
+			recordEvent(string.format("<Error>Group prompt failed</Error> <Muted>%s</Muted>", tostring(result)))
+		end
+	end)
+end
+
+-- Session average instead of a rolling window: selling resets the bar, and a window
+-- would read zero right after every sale even though the farm never stopped.
+local function massRate()
+	local elapsed = os.clock() - Farm.sessionStart
+	if Farm.sessionStart <= 0 or elapsed < 5 then
+		return 0
+	end
+	return math.floor(Farm.massGained / elapsed * 60 + 0.5)
+end
+
+----- Farm loop -----
+
+local function farmLoop(token)
+	while running and Farm.enabled and token == farmToken do
+		if not bindGame() then
+			Farm.state = "Waiting for the game"
+			task.wait(0.5)
+			continue
+		end
+		local humanoid = humanoidOf()
+		local root = rootOf()
+		if not (humanoid and root) then
+			Farm.state = "Waiting for character"
+			task.wait(0.5)
+			continue
+		end
+		if humanoid.Health <= 0 then
+			Farm.state = "Dead"
+			task.wait(0.5)
+			continue
+		end
+		if holdAttacksForSale() then
+			Farm.state = "Selling"
+			task.wait(0.2)
+			continue
+		end
+		if currentMass() >= maxMass() then
+			Farm.state = "Mass full"
+			task.wait(0.3)
+			continue
+		end
+		local now = os.clock()
+		if now - Farm.lastScan >= SCAN_INTERVAL then
+			pruneBlacklist()
+		end
+		local target, distance = scanTarget()
+		if not target then
+			Farm.state = "No blocks nearby"
+			Farm.target = nil
+			task.wait(0.4)
+			continue
+		end
+		Farm.target, Farm.targetDistance = target, distance
+		local stand, lookAt = stanceFor(target, root)
+		Farm.state = "Attacking"
+		root.CFrame = CFrame.lookAt(stand, lookAt)
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		task.wait(PLACE_DELAY)
+		if not (running and Farm.enabled and token == farmToken) then
+			break
+		end
+		local before = currentMass()
+		if not swingOnce() then
+			break
+		end
+		Farm.targetSwings = Farm.targetSwings + 1
+		task.wait(swingInterval() - PLACE_DELAY)
+		if currentMass() <= before then
+			-- Nothing was carved: either the block is out of reach or it is a floor tile.
+			Farm.misses = Farm.misses + 1
+			blacklist(target)
+		else
+			Farm.targetSwings = 0
+		end
+	end
+	Farm.state = "Idle"
+	Farm.target = nil
+end
+
+local function startFarm()
+	if Farm.enabled then
+		return
+	end
+	Farm.enabled = true
+	Farm.state = "Starting"
+	Farm.sessionStart = os.clock()
+	Farm.massGained = 0
+	Farm.blacklist = {}
+	Farm.misses = 0
+	farmToken = farmToken + 1
+	recordEvent("<Success>Farm enabled</Success>")
+	task.spawn(farmLoop, farmToken)
+end
+
+local function stopFarm()
+	if not Farm.enabled then
+		return
+	end
+	Farm.enabled = false
+	farmToken = farmToken + 1
+	Farm.state = "Idle"
+	Farm.target = nil
+	recordEvent("<Muted>Farm disabled</Muted>")
+end
+
+----- HUD -----
+
+local hud = nil
+local hudLabel = nil
+
+local function hudParent()
+	-- PlayerGui is a normal container, so the panel can be read and written from any
+	-- of the script's threads. Roblox refuses property access on some of the executor
+	-- CoreGui parents from those threads.
+	return LocalPlayer:FindFirstChild("PlayerGui")
+end
+
+local function createHud()
+	if hud then
+		return
+	end
+	local parent = hudParent()
+	if not parent then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RSGrowAnomalyHud"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 20
+	gui.Parent = parent
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.Position = UDim2.new(0, 16, 0, 90)
+	frame.Size = UDim2.fromOffset(230, 64)
+	frame.BackgroundColor3 = THEME.Background
+	frame.BackgroundTransparency = 0.15
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = THEME.Stroke
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local accent = Instance.new("Frame")
+	accent.Size = UDim2.new(0, 3, 1, -16)
+	accent.Position = UDim2.new(0, 6, 0, 8)
+	accent.BackgroundColor3 = THEME.Accent
+	accent.BorderSizePixel = 0
+	accent.Parent = frame
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Text"
+	label.BackgroundTransparency = 1
+	label.Position = UDim2.new(0, 16, 0, 6)
+	label.Size = UDim2.new(1, -24, 1, -12)
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 13
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.RichText = true
+	label.TextColor3 = THEME.Text
+	label.Text = "Mass 0 / 0"
+	label.Parent = frame
+
+	hud = gui
+	hudLabel = label
+end
+
+local function destroyHud()
+	if hud then
+		pcall(function()
+			hud:Destroy()
+		end)
+	end
+	hud, hudLabel = nil, nil
+end
+
+local function updateHud()
+	if not flag("Hud", true) then
+		destroyHud()
+		return
+	end
+	createHud()
+	if not hudLabel then
+		return
+	end
+	hudLabel.Text = string.format(
+		"<font color=\"#FF3B7F\">Mass</font> %d / %d\n<font color=\"#8D8D99\">Rate</font> %d / min · <font color=\"#8D8D99\">Tokens</font> %d\n<font color=\"#8D8D99\">%s</font>",
+		currentMass(),
+		maxMass(),
+		massRate(),
+		tokenCount(),
+		Farm.state
+	)
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "grow as anomaly - auto farm",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptGrowAnomaly" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "v1.2",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- Farm tab -----
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "coins" })
+local AutomationBox = FarmTab:CreateGroupbox({ Name = "Automation", Side = "Left" })
+local StatusBox = FarmTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+handles.AutoFarm = AutomationBox:CreateToggle({
+	Name = "Auto farm",
+	Desc = "Breaks the nearest block, then the next one",
+	Flag = "AutoFarm",
+	CurrentValue = false,
+	Callback = function(on)
+		if on then
+			startFarm()
+		else
+			stopFarm()
+		end
+	end,
+})
+
+AutomationBox:CreateDropdown({
+	Name = "Targets",
+	Desc = "Valuable blocks pay four times more mass",
+	Options = { "Valuable", "Nearest", "Everything" },
+	CurrentOption = "Valuable",
+	Flag = "FarmTargets",
+})
+
+AutomationBox:CreateSlider({
+	Name = "Search radius",
+	Range = { 50, 800 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = 300,
+	Flag = "FarmRadius",
+})
+
+AutomationBox:CreateSlider({
+	Name = "Stand offset",
+	Desc = "How far from the block face the character is placed",
+	Range = { 1, 5 },
+	Increment = 0.5,
+	Suffix = " studs",
+	CurrentValue = 2,
+	Flag = "StandOffset",
+})
+
+AutomationBox:CreateSlider({
+	Name = "Swing delay",
+	Desc = "Percent of the game's own attack cooldown",
+	Range = { 90, 150 },
+	Increment = 2,
+	Suffix = "%",
+	CurrentValue = 102,
+	Flag = "SwingDelay",
+})
+
+AutomationBox:CreateDivider()
+
+handles.AutoSell = AutomationBox:CreateToggle({
+	Name = "Auto sell",
+	Desc = "Turns mass into tokens when the bar is almost full",
+	Flag = "AutoSell",
+	CurrentValue = true,
+})
+
+AutomationBox:CreateSlider({
+	Name = "Sell at",
+	Range = { 30, 100 },
+	Increment = 5,
+	Suffix = "%",
+	CurrentValue = 90,
+	Flag = "SellAt",
+	DependsOn = "AutoSell",
+})
+
+AutomationBox:CreateDivider()
+
+handles.AutoUpgrade = AutomationBox:CreateToggle({
+	Name = "Auto upgrade",
+	Desc = "Buys the cheapest stat the tokens can pay for",
+	Flag = "AutoUpgrade",
+	CurrentValue = false,
+})
+
+AutomationBox:CreateDropdown({
+	Name = "Upgrade",
+	Desc = "Cheapest picks whatever is affordable right now",
+	Options = { "Cheapest", "AttackSpeed", "MaxMass", "MassMultiplier", "WalkSpeed", "Luck" },
+	CurrentOption = "Cheapest",
+	Flag = "UpgradeStat",
+	DependsOn = "AutoUpgrade",
+})
+
+StatusBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.25,
+	Update = function()
+		return string.format("<Accent>%s</Accent>", Farm.state)
+	end,
+})
+
+handles.MassBar = StatusBox:CreateProgress({
+	Name = "Mass bar",
+	CurrentValue = 0,
+})
+
+StatusBox:CreateStatus({
+	Name = "Mass",
+	Style = "Row",
+	UpdateRate = 0.25,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>/ %d</Muted>", currentMass(), maxMass())
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Rate",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Text>%d</Text> <Muted>mass / min</Muted>", massRate())
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Tokens",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Text>%d</Text>", tokenCount())
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if not Farm.target or not Farm.target.Parent then
+			return "<Muted>none</Muted>"
+		end
+		local valuable = Farm.target:GetAttribute("MoreMass") ~= nil
+		return string.format(
+			"%s <Muted>· %d studs</Muted>",
+			valuable and "<Warning>valuable</Warning>" or "<Text>block</Text>",
+			math.floor(Farm.targetDistance)
+		)
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Swings",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Text>%d</Text> <Muted>· %d mass · %d misses</Muted>", Farm.attacks, Farm.massGained, Farm.misses)
+	end,
+})
+
+StatusBox:CreateDivider()
+
+handles.Hud = StatusBox:CreateToggle({
+	Name = "HUD",
+	Desc = "Small panel with mass and rate while the window is closed",
+	Flag = "Hud",
+	CurrentValue = true,
+	Callback = function(on)
+		if not on then
+			destroyHud()
+		end
+	end,
+})
+
+StatusBox:CreateButton({
+	Name = "Swing once",
+	Desc = "Send one attack to check that remotes are alive",
+	Callback = function()
+		if not swingOnce() then
+			Window:Notify({ Title = "Not ready", Content = "Game remotes not found yet", Type = "Warning" })
+		end
+	end,
+})
+
+StatusBox:CreateButton({
+	Name = "Sell now",
+	Desc = "Sell the mass bar right away",
+	Callback = function()
+		if not bindGame() then
+			return
+		end
+		if os.clock() - Farm.lastAttack < SELL_LOCK then
+			Window:Notify({ Title = "Too soon", Content = "Wait a moment after the last swing", Type = "Warning" })
+			return
+		end
+		Game.sellMass:FireServer()
+	end,
+})
+
+EventLog = StatusBox:CreateLog({
+	Name = "Events",
+	MaxEntries = 100,
+	MaxRows = 6,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----- Rewards tab -----
+
+local RewardsTab = Window:CreateTab({ Name = "Rewards", Icon = "gift" })
+local MilestonesBox = RewardsTab:CreateGroupbox({ Name = "Milestones", Side = "Left" })
+local SpinBox = RewardsTab:CreateGroupbox({ Name = "Daily spin", Side = "Right" })
+
+handles.AutoMilestones = MilestonesBox:CreateToggle({
+	Name = "Auto claim milestones",
+	Desc = "Claims Grow, Destroy and Summon rewards as soon as they are ready",
+	Flag = "AutoMilestones",
+	CurrentValue = true,
+	Callback = function(on)
+		if on then
+			recordEvent("<Success>Milestone claim enabled</Success>")
+		end
+	end,
+})
+
+MilestonesBox:CreateStatus({
+	Name = "Claimable",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if not Game.milestones then
+			return "<Muted>waiting for the game</Muted>"
+		end
+		local list = milestoneCandidates()
+		if #list == 0 then
+			return "<Muted>nothing ready</Muted>"
+		end
+		local text = table.concat(list, ", ")
+		return string.format("<Success>%d</Success> <Muted>%s</Muted>", #list, text)
+	end,
+})
+
+MilestonesBox:CreateStatusList({
+	Rows = { "Grow", "Destroy", "Summon" },
+	MaxRows = 3,
+	UpdateRate = 1,
+	Update = function()
+		local rows = {}
+		if not Game.milestones then
+			return rows
+		end
+		for _, id in ipairs(Game.milestones.Order) do
+			local progress = Game.milestones.Progress(LocalPlayer, id)
+			local claimed = Game.milestones.Claimed(LocalPlayer, id)
+			local requirement = Game.milestones.Requirement(id, claimed + 1) or 0
+			local ready = Game.milestones.Claimable(LocalPlayer, id)
+			table.insert(rows, string.format(
+				"%s <Muted>%d / %d · claimed %d</Muted>%s",
+				id,
+				math.floor(progress),
+				math.floor(requirement),
+				claimed,
+				ready and " <Success>ready</Success>" or ""
+			))
+		end
+		return rows
+	end,
+})
+
+handles.AutoSpin = SpinBox:CreateToggle({
+	Name = "Auto daily spin",
+	Desc = "Uses the free daily wheel spin when the server allows it",
+	Flag = "AutoSpin",
+	CurrentValue = true,
+})
+
+SpinBox:CreateStatus({
+	Name = "Today",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local reason = spinBlockedReason()
+		if reason == nil then
+			return "<Success>ready</Success>"
+		end
+		if reason == "Done today" then
+			return "<Muted>already spun</Muted>"
+		end
+		return string.format("<Warning>%s</Warning>", reason)
+	end,
+})
+
+SpinBox:CreateStatus({
+	Name = "Group",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if LocalPlayer:GetAttribute("InSpinGroup") == true then
+			return "<Success>member</Success>"
+		end
+		return "<Warning>not a member</Warning> <Muted>· spin needs the group</Muted>"
+	end,
+})
+
+SpinBox:CreateButton({
+	Name = "Join group",
+	Desc = "Opens the game's group prompt; the spin unlocks after joining",
+	Callback = function()
+		joinSpinGroup()
+	end,
+})
+
+SpinBox:CreateButton({
+	Name = "Spin now",
+	Desc = "One manual attempt",
+	Callback = function()
+		if not bindGame() then
+			return
+		end
+		local reason = spinBlockedReason()
+		if reason then
+			Window:Notify({ Title = "Spin blocked", Content = tostring(reason), Type = "Warning" })
+			return
+		end
+		Game.dailySpinEvent:FireServer()
+		recordEvent("<Success>Daily spin used</Success>")
+	end,
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local ActionsBox = SettingsTab:CreateGroupbox({ Name = "Actions", Side = "Left" })
+ActionsBox:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop the farm",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptGrowAnomaly
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
+AboutBox:CreateParagraph({
+	Title = "Auto farm",
+	Content = "The script breaks blocks the way the attack button does: it sends the game's own attack event while the character stands in front of a block. The character is placed next to the block instead of walking, because this game clears humanoid movement every frame. Upgrades, milestones and the daily spin use the same remotes as the shop and the wheel, and only fire when the game reports something claimable.",
+})
+AboutBox:CreateParagraph({
+	Title = "Controls",
+	Content = "RightControl opens and closes the window. End turns the farm off and hides the interface.",
+})
+
+----- Runtime -----
+
+local upgradeAccumulator = 0
+local hudAccumulator = 0
+local lastError = nil
+
+local function safeCall(fn, ...)
+	local ok, result = pcall(fn, ...)
+	if not ok then
+		local message = tostring(result)
+		if lastError ~= message then
+			lastError = message
+			warn("[RobScript GrowAnomaly] " .. message)
+		end
+	end
+	return ok
+end
+
+-- Reward pickups run even when the farm is off: they cost nothing and only fire when
+-- the game itself reports something claimable.
+local rewardAccumulator = 0
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	upgradeAccumulator = upgradeAccumulator + deltaTime
+	rewardAccumulator = rewardAccumulator + deltaTime
+	hudAccumulator = hudAccumulator + deltaTime
+
+	if Farm.enabled then
+		if upgradeAccumulator >= 2 then
+			upgradeAccumulator = 0
+			safeCall(upgradeStep)
+		end
+		safeCall(sellStep)
+	end
+
+	if rewardAccumulator >= 1 then
+		rewardAccumulator = 0
+		safeCall(milestoneStep)
+		safeCall(spinStep)
+	end
+
+	if hudAccumulator >= HUD_INTERVAL then
+		hudAccumulator = 0
+		local cap = maxMass()
+		local mass = currentMass()
+		if handles.MassBar then
+			pcall(function()
+				handles.MassBar:Set(cap > 0 and math.clamp(mass / cap, 0, 1) or 0)
+			end)
+		end
+		safeCall(updateHud)
+	end
+end)
+
+local panicInput = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			stopFarm()
+			setFlag("AutoFarm", false)
+			destroyHud()
+			Window:Toggle(false)
+		end)
+	end
+end)
+
+----- API -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	Farm.enabled = false
+	farmToken = farmToken + 1
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		panicInput:Disconnect()
+	end)
+	pcall(destroyHud)
+	pcall(function()
+		Window:Destroy()
+	end)
+	local env = getgenv()
+	if type(env) == "table" then
+		env.RobScriptGrowAnomaly = nil
+	end
+end
+
+getgenv().RobScriptGrowAnomaly = {
+	Version = "1.2",
+	Get = function(name)
+		return flag(name, nil)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	StartFarm = function()
+		setFlag("AutoFarm", true)
+		startFarm()
+	end,
+	StopFarm = function()
+		setFlag("AutoFarm", false)
+		stopFarm()
+	end,
+	ToggleFarm = function(on)
+		if on == nil then
+			on = not Farm.enabled
+		end
+		setFlag("AutoFarm", on)
+		if on then
+			startFarm()
+		else
+			stopFarm()
+		end
+		return on
+	end,
+	GetFarm = function()
+		return {
+			enabled = Farm.enabled,
+			state = Farm.state,
+			attacks = Farm.attacks,
+			misses = Farm.misses,
+			mass = currentMass(),
+			maxMass = maxMass(),
+			rate = massRate(),
+			tokens = tokenCount(),
+			target = Farm.target and Farm.target:GetFullName() or nil,
+			distance = Farm.targetDistance,
+		}
+	end,
+	GetRewards = function()
+		bindGame()
+		local milestones = {}
+		if Game.milestones then
+			for _, id in ipairs(Game.milestones.Order) do
+				milestones[id] = {
+					progress = Game.milestones.Progress(LocalPlayer, id),
+					claimed = Game.milestones.Claimed(LocalPlayer, id),
+					claimable = Game.milestones.Claimable(LocalPlayer, id),
+				}
+			end
+		end
+		return {
+			milestones = milestones,
+			spin = spinBlockedReason() or "ready",
+			group = LocalPlayer:GetAttribute("InSpinGroup") == true,
+			upgrades = (function()
+				local list = {}
+				if Game.upgrades then
+					for _, key in ipairs(Game.upgrades.Order) do
+						local rung = upgradeRung(key)
+						list[key] = {
+							level = upgradeLevel(key),
+							price = rung and rung.Price or nil,
+						}
+					end
+				end
+				return list
+			end)(),
+		}
+	end,
+	ClaimMilestones = function()
+		if not bindGame() then
+			return 0
+		end
+		local list = milestoneCandidates()
+		for _, id in ipairs(list) do
+			Game.milestoneClaim:FireServer(id)
+		end
+		return #list
+	end,
+	SpinNow = function()
+		if not bindGame() then
+			return false
+		end
+		local reason = spinBlockedReason()
+		if reason then
+			return false, reason
+		end
+		Game.dailySpinEvent:FireServer()
+		return true
+	end,
+	JoinGroup = function()
+		if not bindGame() then
+			return false
+		end
+		joinSpinGroup()
+		return true
+	end,
+	SelectTab = function(name)
+		if type(name) ~= "string" then
+			return false
+		end
+		for _, tab in ipairs({ FarmTab, RewardsTab, SettingsTab }) do
+			if tab and tab.Name == name then
+				Window:SelectTab(tab)
+				return true
+			end
+		end
+		return false
+	end,
+	GetLastError = function()
+		return lastError
+	end,
+	Destroy = destroy,
+}
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+Window:Notify({ Title = "Robscript Team", Content = "Grow As Anomaly auto farm loaded", Type = "Success" })
