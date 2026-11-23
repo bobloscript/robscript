@@ -1,0 +1,1218 @@
+-- Robscript Team - RoofLine
+-- Version 1.3 - movement, no fall damage and roof-index teleports
+-- Game: [QUESTS] RoofLine [ALPHA] | place 101491736266699
+-- Window toggle: RightControl | Panic: End | API: getgenv().RobScriptRoofLine
+--
+-- Everything here is client side. Walk speed and jump power are plain humanoid property
+-- writes, infinite jump just re-requests the jump, and fly is a LinearVelocity on the
+-- character, which the client owns. No game remote is involved, so the server never sees
+-- a value to reject. The game's stamina controller rewrites WalkSpeed every frame, so the
+-- override is written every frame from RenderStepped as well - a connection made last
+-- runs last and wins the race.
+--
+-- Fall damage is prevented by capping the downward speed while airborne: the server reads
+-- the replicated impact speed, and a landing below the threshold deals no damage and no
+-- injuries. The no-shake camera experiment was dropped - intercepting the game's camera
+-- writes also removed its first-person positioning, so it is not shipped here.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Drop a previous copy first so its loops and window die before the new one starts.
+do
+	local previous = getgenv().RobScriptRoofLine
+	if type(previous) == "table" and type(previous.Destroy) == "function" then
+		pcall(previous.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript RoofLine] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromRGB(141, 141, 153),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local JUMP_POWER_TO_HEIGHT = 7.2 -- JumpHeight of the default 50 JumpPower
+local DEFAULT_WALK = 16
+local HUD_INTERVAL = 0.25
+local FALL_SPEED_LIMIT = -25 -- studs/s on the way down; the game damages above this
+
+----- State -----
+
+local Movement = {
+	walkEnabled = false,
+	walkSpeed = 32,
+	jumpEnabled = false,
+	jumpPower = 60,
+	infJump = false,
+	fly = false,
+	flySpeed = 60,
+	baseWalk = nil,
+	baseJumpPower = nil,
+	baseJumpHeight = nil,
+	baseUseJumpPower = nil,
+	character = nil,
+}
+
+local Camera = {
+	noFall = true,
+}
+
+local handles = {}
+local running = true
+local EventLog = nil
+
+local flyState = {
+	velocity = nil,
+	attachment = nil,
+	connection = nil,
+}
+
+local function recordEvent(text)
+	if EventLog then
+		pcall(function()
+			EventLog:Push(text)
+		end)
+	end
+end
+
+----- Helpers -----
+
+local function character()
+	local current = LocalPlayer.Character
+	if current and current.Parent then
+		return current
+	end
+	return nil
+end
+
+local function humanoidOf()
+	local current = character()
+	return current and current:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function rootOf()
+	local current = character()
+	return current and current:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- Not every control stores its handle in handles; the library keeps every flag in
+-- Airflow.Flags, and a Dropdown only answers through Get().
+local function handleFor(name)
+	local handle = handles[name]
+	if handle then
+		return handle
+	end
+	local container = Airflow.Flags
+	local entry = container and container[name]
+	if type(entry) == "table" then
+		return entry
+	end
+	return nil
+end
+
+local function flag(name, fallback)
+	local handle = handleFor(name)
+	if not handle then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		if type(handle.Get) == "function" then
+			return handle:Get()
+		end
+		return handle.Value
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local handle = handleFor(name)
+	if not handle then
+		return false
+	end
+	return (pcall(function()
+		handle:Set(value, true)
+	end))
+end
+
+----- Jump -----
+
+local function desiredJumpHeight(power)
+	return JUMP_POWER_TO_HEIGHT * (power / 50) ^ 2
+end
+
+-- The game rewrites the humanoid speed from its own stamina controller, so the vanilla
+-- values are captured once, before the first override, and restored from here.
+local function ensureBase(humanoid)
+	if not humanoid then
+		return
+	end
+	if Movement.baseWalk == nil then
+		Movement.baseWalk = humanoid.WalkSpeed
+	end
+	if Movement.baseUseJumpPower == nil then
+		Movement.baseUseJumpPower = humanoid.UseJumpPower
+		Movement.baseJumpPower = humanoid.JumpPower
+		Movement.baseJumpHeight = humanoid.JumpHeight
+	end
+end
+
+local function applyJump(humanoid)
+	if not humanoid then
+		return
+	end
+	ensureBase(humanoid)
+	if humanoid.UseJumpPower then
+		humanoid.JumpPower = Movement.jumpPower
+	else
+		humanoid.JumpHeight = desiredJumpHeight(Movement.jumpPower)
+	end
+end
+
+local function restoreJump(humanoid)
+	if not humanoid then
+		return
+	end
+	if Movement.baseUseJumpPower ~= nil then
+		humanoid.UseJumpPower = Movement.baseUseJumpPower
+	end
+	if Movement.baseJumpPower then
+		humanoid.JumpPower = Movement.baseJumpPower
+	end
+	if Movement.baseJumpHeight then
+		humanoid.JumpHeight = Movement.baseJumpHeight
+	end
+end
+
+local function applyWalk(humanoid)
+	if humanoid and Movement.walkEnabled then
+		ensureBase(humanoid)
+		humanoid.WalkSpeed = Movement.walkSpeed
+	end
+end
+
+----- Fly -----
+
+local function stopFly()
+	if flyState.connection then
+		pcall(function()
+			flyState.connection:Disconnect()
+		end)
+		flyState.connection = nil
+	end
+	if flyState.velocity then
+		pcall(function()
+			flyState.velocity:Destroy()
+		end)
+		flyState.velocity = nil
+	end
+	if flyState.attachment then
+		pcall(function()
+			flyState.attachment:Destroy()
+		end)
+		flyState.attachment = nil
+	end
+	local humanoid = humanoidOf()
+	if humanoid then
+		pcall(function()
+			humanoid.PlatformStand = false
+		end)
+	end
+	local root = rootOf()
+	if root then
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.zero
+		end)
+	end
+	Movement.fly = false
+end
+
+local function startFly()
+	local humanoid, root = humanoidOf(), rootOf()
+	if not (humanoid and root) then
+		return false, "Waiting for character"
+	end
+	if Movement.fly and flyState.velocity then
+		return true
+	end
+	Movement.fly = true
+	humanoid.PlatformStand = true
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "RSFlyAttachment"
+	attachment.Parent = root
+
+	local velocity = Instance.new("LinearVelocity")
+	velocity.Name = "RSFlyVelocity"
+	velocity.Attachment0 = attachment
+	velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	velocity.MaxForce = math.huge
+	velocity.VectorVelocity = Vector3.zero
+	velocity.Parent = root
+
+	flyState.attachment = attachment
+	flyState.velocity = velocity
+	flyState.connection = RunService.RenderStepped:Connect(function()
+		if not (running and Movement.fly and flyState.velocity) then
+			return
+		end
+		local currentRoot = rootOf()
+		local camera = workspace.CurrentCamera
+		if not (currentRoot and camera) then
+			return
+		end
+		local direction = Vector3.zero
+		if not UserInputService:GetFocusedTextBox() then
+			local look = camera.CFrame.LookVector
+			local right = camera.CFrame.RightVector
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+				direction = direction + look
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+				direction = direction - look
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+				direction = direction + right
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+				direction = direction - right
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+				direction = direction + Vector3.yAxis
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+				direction = direction - Vector3.yAxis
+			end
+		end
+		if direction.Magnitude > 0 then
+			direction = direction.Unit
+		end
+		flyState.velocity.VectorVelocity = direction * Movement.flySpeed
+	end)
+	return true
+end
+
+local function restoreAll()
+	Movement.walkEnabled = false
+	Movement.jumpEnabled = false
+	Movement.infJump = false
+	stopFly()
+	local humanoid = humanoidOf()
+	if humanoid then
+		if Movement.baseWalk then
+			humanoid.WalkSpeed = Movement.baseWalk
+		end
+		restoreJump(humanoid)
+	end
+end
+
+----- Falls -----
+
+-- Fall damage in this game is decided from the impact speed the server sees, so capping
+-- the downward speed while airborne removes both the health loss and the injuries.
+local function applyFallGuard()
+	if not (running and Camera.noFall) then
+		return
+	end
+	local humanoid, root = humanoidOf(), rootOf()
+	if not (humanoid and root) then
+		return
+	end
+	if humanoid.FloorMaterial ~= Enum.Material.Air then
+		return
+	end
+	local velocity = root.AssemblyLinearVelocity
+	if velocity.Y < FALL_SPEED_LIMIT then
+		root.AssemblyLinearVelocity = Vector3.new(velocity.X, FALL_SPEED_LIMIT, velocity.Z)
+	end
+end
+
+----- Roof index -----
+
+-- The phone index lists every roof with its reward and the map publishes an anchor for
+-- each one, so this tab is a picker that simply moves the character onto the roof.
+local Roofs = {
+	entries = {},
+	options = {},
+	stamp = 0,
+}
+
+local roofPoints = nil
+
+local function roofEntries()
+	local list = {}
+	for line in string.gmatch(workspace:GetAttribute("RoofList") or "", "[^\n]+") do
+		local id, name, sub, tier, reward = line:match("^(.-)|(.-)|(.-)|(%d+)|(%d+)$")
+		if id then
+			list[#list + 1] = {
+				id = id,
+				name = name,
+				tier = tonumber(tier) or 1,
+				reward = tonumber(reward) or 0,
+			}
+		end
+	end
+	return list
+end
+
+local function roofsDone()
+	local ok, decoded = pcall(function()
+		return game:GetService("HttpService"):JSONDecode(LocalPlayer:GetAttribute("RoofsDone") or "{}")
+	end)
+	if ok and type(decoded) == "table" then
+		return decoded
+	end
+	return {}
+end
+
+local function roofPositions()
+	if roofPoints then
+		return roofPoints
+	end
+	local points = {}
+	for line in string.gmatch(workspace:GetAttribute("RoofPos") or "", "[^\n]+") do
+		local id, x, z = line:match("^(.-)|(-?[%d%.]+)|(-?[%d%.]+)|")
+		if id then
+			points[id] = { x = tonumber(x), z = tonumber(z) }
+		end
+	end
+	roofPoints = points
+	return points
+end
+
+-- A house model includes its yard, so its bounding box top is a booth or a chimney rather
+-- than the roof. The anchor is therefore the largest horizontal part named like a roof,
+-- with the highest clean part as a fallback for maps that name them differently.
+local function roofPoint(id)
+	local model = workspace:FindFirstChild(id)
+	if model then
+		local best, bestArea, fallback, fallbackY
+		for _, part in ipairs(model:GetDescendants()) do
+			if part:IsA("BasePart") and part.CFrame.UpVector.Y > 0.7 then
+				local name = string.lower(part.Name)
+				local area = part.Size.X * part.Size.Z
+				if string.find(name, "roof", 1, true) then
+					if not bestArea or area > bestArea then
+						best, bestArea = part, area
+					end
+				end
+				local ground = string.find(name, "otmostka", 1, true)
+					or string.find(name, "grass", 1, true)
+					or string.find(name, "asphalt", 1, true)
+					or string.find(name, "ground", 1, true)
+					or string.find(name, "road", 1, true)
+					or string.find(name, "pavement", 1, true)
+				if not ground and part.Position.Y > 8 and area >= 50 then
+					if not fallbackY or part.Position.Y > fallbackY then
+						fallback, fallbackY = part, part.Position.Y
+					end
+				end
+			end
+		end
+		local chosen = best or fallback
+		if chosen then
+			return chosen.Position + Vector3.new(0, chosen.Size.Y * 0.5, 0)
+		end
+		return nil
+	end
+	local point = roofPositions()[id]
+	if not point then
+		return nil
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LocalPlayer.Character }
+	local hit = workspace:Raycast(Vector3.new(point.x, 800, point.z), Vector3.new(0, -2000, 0), params)
+	-- A hit at ground level means the roof is not actually placed in this map.
+	if not hit or hit.Position.Y < 5 then
+		return nil
+	end
+	return hit.Position
+end
+
+local function teleportToRoof(id)
+	local center = roofPoint(id)
+	if not center then
+		return false, "No anchor for " .. tostring(id)
+	end
+	local current = character()
+	if not current then
+		return false, "No character"
+	end
+	current:PivotTo(CFrame.new(center + Vector3.new(0, 4, 0)))
+	local root = rootOf()
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	recordEvent(string.format("<Success>Teleported to %s</Success>", tostring(id)))
+	return true
+end
+
+local function refreshRoofs(force)
+	local now = os.clock()
+	if not force and Roofs.stamp > 0 and now - Roofs.stamp < 5 then
+		return Roofs.options
+	end
+	local entries = roofEntries()
+	local options, points = {}, {}
+	for _, entry in ipairs(entries) do
+		local point = roofPoint(entry.id)
+		if point then
+			points[entry.id] = point
+			options[#options + 1] = entry.id
+		end
+	end
+	Roofs.entries = entries
+	Roofs.options = options
+	Roofs.points = points
+	Roofs.stamp = now
+	if handles.RoofSelect then
+		pcall(function()
+			handles.RoofSelect:SetOptions(options, { KeepSelection = true, Silent = true })
+		end)
+	end
+	return options
+end
+
+----- Character -----
+
+local function onCharacter(added)
+	-- typeof, not type: type() answers "userdata" for every Instance.
+	if typeof(added) ~= "Instance" then
+		return
+	end
+	Movement.character = added
+	local humanoid = added:WaitForChild("Humanoid", 10)
+	if not humanoid then
+		return
+	end
+	Movement.baseWalk = humanoid.WalkSpeed
+	Movement.baseJumpPower = humanoid.JumpPower
+	Movement.baseJumpHeight = humanoid.JumpHeight
+	Movement.baseUseJumpPower = humanoid.UseJumpPower
+
+	if Movement.fly then
+		-- The old rig is gone; fly has to be attached to the new one.
+		stopFly()
+		task.defer(startFly)
+	else
+		applyWalk(humanoid)
+		if Movement.jumpEnabled then
+			applyJump(humanoid)
+		end
+	end
+end
+
+LocalPlayer.CharacterAdded:Connect(onCharacter)
+if LocalPlayer.Character then
+	task.spawn(onCharacter, LocalPlayer.Character)
+end
+LocalPlayer.CharacterRemoving:Connect(function()
+	stopFly()
+end)
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "roofline - movement",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(720, 500),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptRoofLine" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "v1.3",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local MovementTab = Window:CreateTab({ Name = "Movement", Icon = "move" })
+local CharacterBox = MovementTab:CreateGroupbox({ Name = "Character", Side = "Left" })
+local FlyBox = MovementTab:CreateGroupbox({ Name = "Fly", Side = "Right" })
+local StatusBox = MovementTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+handles.MovementWalk = CharacterBox:CreateToggle({
+	Name = "Walk speed",
+	Desc = "Overrides the humanoid walk speed",
+	Flag = "MovementWalk",
+	CurrentValue = false,
+	Callback = function(on)
+		Movement.walkEnabled = on
+		local humanoid = humanoidOf()
+		if on then
+			applyWalk(humanoid)
+			recordEvent(string.format("<Success>Walk speed %d</Success>", Movement.walkSpeed))
+		elseif humanoid then
+			humanoid.WalkSpeed = Movement.baseWalk or DEFAULT_WALK
+			recordEvent("<Muted>Walk speed restored</Muted>")
+		end
+	end,
+})
+
+handles.WalkSpeed = CharacterBox:CreateSlider({
+	Name = "Speed",
+	Range = { 16, 200 },
+	Increment = 1,
+	Suffix = " studs/s",
+	CurrentValue = 32,
+	Flag = "WalkSpeed",
+	DependsOn = "MovementWalk",
+	Callback = function(value)
+		Movement.walkSpeed = value
+		applyWalk(humanoidOf())
+	end,
+})
+
+handles.MovementJump = CharacterBox:CreateToggle({
+	Name = "Jump power",
+	Desc = "Overrides the humanoid jump",
+	Flag = "MovementJump",
+	CurrentValue = false,
+	Callback = function(on)
+		Movement.jumpEnabled = on
+		local humanoid = humanoidOf()
+		if on then
+			applyJump(humanoid)
+			recordEvent(string.format("<Success>Jump power %d</Success>", Movement.jumpPower))
+		else
+			restoreJump(humanoid)
+			recordEvent("<Muted>Jump power restored</Muted>")
+		end
+	end,
+})
+
+handles.JumpPower = CharacterBox:CreateSlider({
+	Name = "Power",
+	Range = { 50, 300 },
+	Increment = 5,
+	Suffix = "%",
+	CurrentValue = 60,
+	Flag = "JumpPower",
+	DependsOn = "MovementJump",
+	Callback = function(value)
+		Movement.jumpPower = value
+		applyJump(humanoidOf())
+	end,
+})
+
+handles.InfiniteJump = CharacterBox:CreateToggle({
+	Name = "Infinite jump",
+	Desc = "Every jump press works again in mid air",
+	Flag = "InfiniteJump",
+	CurrentValue = false,
+	Callback = function(on)
+		Movement.infJump = on
+		recordEvent(on and "<Success>Infinite jump on</Success>" or "<Muted>Infinite jump off</Muted>")
+	end,
+})
+
+handles.Fly = FlyBox:CreateToggle({
+	Name = "Fly",
+	Desc = "WASD + Space / LeftControl, key below toggles it",
+	Flag = "Fly",
+	CurrentValue = false,
+	Callback = function(on)
+		if on then
+			local ok, reason = startFly()
+			if not ok then
+				setFlag("Fly", false)
+				Window:Notify({ Title = "Fly", Content = tostring(reason or "No character"), Type = "Warning" })
+				return
+			end
+			recordEvent("<Success>Fly enabled</Success>")
+		else
+			stopFly()
+			recordEvent("<Muted>Fly disabled</Muted>")
+		end
+	end,
+})
+
+handles.FlySpeed = FlyBox:CreateSlider({
+	Name = "Fly speed",
+	Range = { 20, 300 },
+	Increment = 5,
+	Suffix = " studs/s",
+	CurrentValue = 60,
+	Flag = "FlySpeed",
+	DependsOn = "Fly",
+	Callback = function(value)
+		Movement.flySpeed = value
+	end,
+})
+
+handles.FlyKey = FlyBox:CreateKeybind({
+	Name = "Fly key",
+	Desc = "Toggles fly while the game is focused",
+	CurrentKeybind = "F",
+	Flag = "FlyKey",
+})
+
+StatusBox:CreateStatus({
+	Name = "Mode",
+	Style = "Row",
+	UpdateRate = 0.25,
+	Update = function()
+		if Movement.fly then
+			return "<Accent>flying</Accent>"
+		end
+		if Movement.walkEnabled or Movement.jumpEnabled then
+			return "<Success>modified</Success>"
+		end
+		return "<Muted>vanilla</Muted>"
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Walk",
+	Style = "Row",
+	UpdateRate = 0.25,
+	Update = function()
+		local humanoid = humanoidOf()
+		if not humanoid then
+			return "<Muted>no character</Muted>"
+		end
+		return string.format("<Text>%.1f</Text> <Muted>/ base %.1f</Muted>", humanoid.WalkSpeed, Movement.baseWalk or DEFAULT_WALK)
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Jump",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local humanoid = humanoidOf()
+		if not humanoid then
+			return "<Muted>no character</Muted>"
+		end
+		if humanoid.UseJumpPower then
+			return string.format("<Text>%.0f</Text> <Muted>power</Muted>", humanoid.JumpPower)
+		end
+		return string.format("<Text>%.1f</Text> <Muted>height</Muted>", humanoid.JumpHeight)
+	end,
+})
+
+StatusBox:CreateButton({
+	Name = "Reset movement",
+	Desc = "Restores walk speed, jump and turns fly off",
+	Callback = function()
+		restoreAll()
+		for _, name in ipairs({ "MovementWalk", "MovementJump", "InfiniteJump", "Fly" }) do
+			setFlag(name, false)
+		end
+		recordEvent("<Muted>Movement reset</Muted>")
+	end,
+})
+
+EventLog = StatusBox:CreateLog({
+	Name = "Events",
+	MaxEntries = 60,
+	MaxRows = 5,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----- Utility tab -----
+
+local UtilityTab = Window:CreateTab({ Name = "Utility", Icon = "shield" })
+local FallBox = UtilityTab:CreateGroupbox({ Name = "Falls", Side = "Left" })
+
+handles.NoFallDamage = FallBox:CreateToggle({
+	Name = "No fall damage",
+	Desc = "Caps the fall speed so a landing never hurts",
+	Flag = "NoFallDamage",
+	CurrentValue = true,
+	Callback = function(on)
+		Camera.noFall = on
+		recordEvent(on and "<Success>Fall damage off</Success>" or "<Muted>Fall damage on</Muted>")
+	end,
+})
+
+FallBox:CreateStatus({
+	Name = "Fall limit",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		if not Camera.noFall then
+			return "<Muted>off</Muted>"
+		end
+		local root = rootOf()
+		if not root then
+			return "<Muted>no character</Muted>"
+		end
+		local speed = math.floor(root.AssemblyLinearVelocity.Y)
+		if speed < FALL_SPEED_LIMIT then
+			return string.format("<Warning>%d</Warning> <Muted>studs/s</Muted>", speed)
+		end
+		return string.format("<Text>%d</Text> <Muted>studs/s</Muted>", speed)
+	end,
+})
+
+----- Teleport tab -----
+
+local TeleportTab = Window:CreateTab({ Name = "Teleport", Icon = "map-pin" })
+local RoofBox = TeleportTab:CreateGroupbox({ Name = "Roof index", Side = "Left" })
+local RoofInfoBox = TeleportTab:CreateGroupbox({ Name = "Roof", Side = "Right" })
+
+local roofOptions = refreshRoofs(true)
+if #roofOptions == 0 then
+	roofOptions = { "-" }
+end
+
+handles.RoofSelect = RoofBox:CreateDropdown({
+	Name = "Roof",
+	Desc = "Every roof from the phone index",
+	Options = roofOptions,
+	CurrentOption = roofOptions[1],
+	Flag = "RoofTarget",
+	MaxRows = 10,
+})
+
+RoofBox:CreateButton({
+	Name = "Teleport",
+	Desc = "Move the character onto the selected roof",
+	Style = "Primary",
+	Callback = function()
+		local id = flag("RoofTarget", nil)
+		if type(id) ~= "string" or id == "" or id == "-" then
+			Window:Notify({ Title = "Teleport", Content = "Pick a roof first", Type = "Warning" })
+			return
+		end
+		local ok, reason = teleportToRoof(id)
+		if not ok then
+			Window:Notify({ Title = "Teleport", Content = tostring(reason), Type = "Warning" })
+		end
+	end,
+})
+
+RoofBox:CreateButton({
+	Name = "Next roof",
+	Desc = "Selects the next roof in the list and jumps there",
+	Callback = function()
+		local options = Roofs.options
+		if #options == 0 then
+			return
+		end
+		local current = flag("RoofTarget", nil)
+		local index = table.find(options, current) or 0
+		local nextId = options[index % #options + 1]
+		setFlag("RoofTarget", nextId)
+		teleportToRoof(nextId)
+	end,
+})
+
+RoofInfoBox:CreateStatus({
+	Name = "Selected",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local id = flag("RoofTarget", nil)
+		if type(id) ~= "string" then
+			return "<Muted>none</Muted>"
+		end
+		for _, entry in ipairs(Roofs.entries) do
+			if entry.id == id then
+				return string.format("<Text>%s</Text> <Muted>t%d · %d RF</Muted>", entry.id, entry.tier, entry.reward)
+			end
+		end
+		return string.format("<Text>%s</Text>", id)
+	end,
+})
+
+RoofInfoBox:CreateStatus({
+	Name = "Name",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local id = flag("RoofTarget", nil)
+		if type(id) ~= "string" then
+			return "<Muted>-</Muted>"
+		end
+		for _, entry in ipairs(Roofs.entries) do
+			if entry.id == id then
+				return string.format("<Muted>%s</Muted>", tostring(entry.name))
+			end
+		end
+		return "<Muted>-</Muted>"
+	end,
+})
+
+RoofInfoBox:CreateStatus({
+	Name = "Done",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local done = roofsDone()
+		local count = 0
+		for _, entry in ipairs(Roofs.entries) do
+			if done[entry.id] then
+				count = count + 1
+			end
+		end
+		return string.format("<Text>%d</Text> <Muted>/ %d</Muted>", count, #Roofs.entries)
+	end,
+})
+
+RoofInfoBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local id = flag("RoofTarget", nil)
+		if type(id) ~= "string" then
+			return "<Muted>-</Muted>"
+		end
+		local done = roofsDone()
+		if done[id] then
+			return "<Success>done</Success>"
+		end
+		return "<Warning>not done</Warning>"
+	end,
+})
+
+workspace:GetAttributeChangedSignal("RoofList"):Connect(function()
+	roofPoints = nil
+	refreshRoofs(true)
+end)
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+local ActionsBox = SettingsTab:CreateGroupbox({ Name = "Actions", Side = "Left" })
+ActionsBox:CreateButton({
+	Name = "Unload",
+	Desc = "Restore movement and close the interface",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptRoofLine
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+local AboutBox = SettingsTab:CreateGroupbox({ Name = "About", Side = "Right" })
+AboutBox:CreateParagraph({
+	Title = "Movement",
+	Content = "Walk speed and jump power are written straight to the humanoid, and re-applied every frame from RenderStepped because the game's stamina controller resets them. Fly attaches a LinearVelocity to the character and sets PlatformStand, so the humanoid stops walking while it is on.",
+})
+AboutBox:CreateParagraph({
+	Title = "Utility",
+	Content = "Fall damage is prevented by capping the downward speed while airborne, which keeps both the health loss and the injuries away.",
+})
+AboutBox:CreateParagraph({
+	Title = "Teleport",
+	Content = "The phone index lists every roof with its RF reward, and the map publishes an anchor for each one. The tab is a picker over that list: Teleport drops the character on the roof, Next roof walks the list. Roofs are anchored at the top centre of their model, or from the published RoofPos with a raycast when the map keeps only the preview model.",
+})
+AboutBox:CreateParagraph({
+	Title = "Controls",
+	Content = "RightControl opens and closes the window. End turns everything off and hides the interface. Fly is toggled by its own key (F by default) and moves with WASD, Space up, LeftControl down.",
+})
+
+----- Runtime -----
+
+local lastError = nil
+local hudAccumulator = 0
+
+local function safeCall(fn, ...)
+	local ok, result = pcall(fn, ...)
+	if not ok then
+		local message = tostring(result)
+		if lastError ~= message then
+			lastError = message
+			warn("[RobScript RoofLine] " .. message)
+		end
+	end
+	return ok
+end
+
+-- The game's own stamina controller writes WalkSpeed every frame, so the override has to
+-- be written every frame as well, and this connection is made last, which makes it win.
+local walkStepper = RunService.RenderStepped:Connect(function()
+	applyFallGuard()
+	if not (running and (Movement.walkEnabled or Movement.jumpEnabled)) then
+		return
+	end
+	local humanoid = humanoidOf()
+	if not humanoid then
+		return
+	end
+	if Movement.walkEnabled then
+		humanoid.WalkSpeed = Movement.walkSpeed
+	end
+	if Movement.jumpEnabled then
+		if humanoid.UseJumpPower then
+			humanoid.JumpPower = Movement.jumpPower
+		else
+			humanoid.JumpHeight = desiredJumpHeight(Movement.jumpPower)
+		end
+	end
+end)
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	hudAccumulator = hudAccumulator + deltaTime
+	if hudAccumulator >= HUD_INTERVAL then
+		hudAccumulator = 0
+		if Movement.fly and not flyState.velocity then
+			-- The rig changed or the constraint was destroyed: rebuild it.
+			stopFly()
+			startFly()
+		end
+	end
+end)
+
+local jumpRequest = UserInputService.JumpRequest:Connect(function()
+	if not (running and Movement.infJump) then
+		return
+	end
+	local humanoid = humanoidOf()
+	if humanoid and humanoid.Health > 0 then
+		-- Humanoid.Jump is swallowed by this game's controller; forcing the state is what
+		-- actually launches the character, and it works in mid air too.
+		pcall(function()
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end)
+	end
+end)
+
+local keyInput = UserInputService.InputBegan:Connect(function(input, processed)
+	if not running or processed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			restoreAll()
+			Camera.noFall = false
+			for _, name in ipairs({ "MovementWalk", "MovementJump", "InfiniteJump", "Fly", "NoFallDamage" }) do
+				setFlag(name, false)
+			end
+			Window:Toggle(false)
+		end)
+		return
+	end
+	local binding = flag("FlyKey", Enum.KeyCode.F)
+	if input.KeyCode == binding then
+		local nextState = not Movement.fly
+		setFlag("Fly", nextState)
+		if nextState then
+			local ok = startFly()
+			if not ok then
+				setFlag("Fly", false)
+			end
+		else
+			stopFly()
+		end
+	end
+end)
+
+----- API -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	restoreAll()
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		walkStepper:Disconnect()
+	end)
+	pcall(function()
+		jumpRequest:Disconnect()
+	end)
+	pcall(function()
+		keyInput:Disconnect()
+	end)
+	pcall(function()
+		Window:Destroy()
+	end)
+	local env = getgenv()
+	if type(env) == "table" then
+		env.RobScriptRoofLine = nil
+	end
+end
+
+getgenv().RobScriptRoofLine = {
+	Version = "1.3",
+	Get = function(name)
+		return flag(name, nil)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	SetWalkSpeed = function(value)
+		Movement.walkSpeed = tonumber(value) or Movement.walkSpeed
+		Movement.walkEnabled = true
+		setFlag("MovementWalk", true)
+		setFlag("WalkSpeed", Movement.walkSpeed)
+		applyWalk(humanoidOf())
+		return Movement.walkSpeed
+	end,
+	SetJumpPower = function(value)
+		Movement.jumpPower = tonumber(value) or Movement.jumpPower
+		Movement.jumpEnabled = true
+		setFlag("MovementJump", true)
+		setFlag("JumpPower", Movement.jumpPower)
+		applyJump(humanoidOf())
+		return Movement.jumpPower
+	end,
+	SetInfiniteJump = function(on)
+		Movement.infJump = on ~= false
+		setFlag("InfiniteJump", Movement.infJump)
+		return Movement.infJump
+	end,
+	SetFly = function(on)
+		if on == nil then
+			on = not Movement.fly
+		end
+		setFlag("Fly", on)
+		if on then
+			local ok, reason = startFly()
+			if not ok then
+				setFlag("Fly", false)
+				return false, reason
+			end
+		else
+			stopFly()
+		end
+		return Movement.fly
+	end,
+	SetNoFallDamage = function(on)
+		Camera.noFall = on ~= false
+		setFlag("NoFallDamage", Camera.noFall)
+		return Camera.noFall
+	end,
+	TeleportToRoof = function(id)
+		return teleportToRoof(id)
+	end,
+	NextRoof = function()
+		local options = Roofs.options
+		if #options == 0 then
+			return false, "no roofs"
+		end
+		local current = flag("RoofTarget", nil)
+		local index = table.find(options, current) or 0
+		local nextId = options[index % #options + 1]
+		setFlag("RoofTarget", nextId)
+		return teleportToRoof(nextId)
+	end,
+	GetRoofs = function()
+		local done = roofsDone()
+		local list = {}
+		for _, entry in ipairs(Roofs.entries) do
+			list[#list + 1] = {
+				id = entry.id,
+				name = entry.name,
+				tier = entry.tier,
+				reward = entry.reward,
+				done = done[entry.id] ~= nil,
+			}
+		end
+		return list
+	end,
+	GetState = function()
+		local humanoid = humanoidOf()
+		return {
+			fly = Movement.fly,
+			walkEnabled = Movement.walkEnabled,
+			walkSpeed = humanoid and humanoid.WalkSpeed or nil,
+			jumpEnabled = Movement.jumpEnabled,
+			jumpPower = humanoid and humanoid.JumpPower or nil,
+			infiniteJump = Movement.infJump,
+			noFallDamage = Camera.noFall,
+			baseWalk = Movement.baseWalk,
+			baseJumpPower = Movement.baseJumpPower,
+		}
+	end,
+	Reset = function()
+		restoreAll()
+	end,
+	GetLastError = function()
+		return lastError
+	end,
+	Destroy = destroy,
+}
+
+-- Configs restore flags without firing callbacks, so the state is read back once after
+-- autoload; otherwise a saved "walk speed" toggle would look on but do nothing.
+local function syncFromFlags()
+	Movement.walkSpeed = tonumber(flag("WalkSpeed", Movement.walkSpeed)) or Movement.walkSpeed
+	Movement.jumpPower = tonumber(flag("JumpPower", Movement.jumpPower)) or Movement.jumpPower
+	Movement.flySpeed = tonumber(flag("FlySpeed", Movement.flySpeed)) or Movement.flySpeed
+	Movement.walkEnabled = flag("MovementWalk", false) == true
+	Movement.jumpEnabled = flag("MovementJump", false) == true
+	Movement.infJump = flag("InfiniteJump", false) == true
+	Camera.noFall = flag("NoFallDamage", true) ~= false
+	-- Fly is never restored silently: it needs a live rig to attach to.
+	if flag("Fly", false) then
+		setFlag("Fly", false)
+	end
+	local humanoid = humanoidOf()
+	applyWalk(humanoid)
+	if Movement.jumpEnabled then
+		applyJump(humanoid)
+	end
+end
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+pcall(syncFromFlags)
+Window:Notify({ Title = "Robscript Team", Content = "RoofLine movement loaded", Type = "Success" })
