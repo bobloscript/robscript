@@ -1,0 +1,2074 @@
+-- Robscript Team - Throw Food For Baddies
+-- Game: Throw Food For Baddies | placeId 89727004942007 | gameId 10773616048
+-- Window: RightControl | Unload: Settings -> Unload | API: getgenv().RobScriptTFFB
+--
+-- What it does:
+--   One switch. "Auto farm" runs the whole chain: throw with the power meter pinned to the top,
+--   put the caught baddie into the pen, keep the best baddies in the pen, sell the leftovers,
+--   buy the best fruit you can afford, upgrade the pen and the pull-up bar.
+--   Rotation adds bar phases on a timer, where the same chain keeps the pen tidy and trains
+--   Throwing Strength.
+--
+-- How it works: the game is fully remote driven and every remote is reachable from the client.
+--   Throw.Begin(false) opens a throw session and returns the server MeterStart. The power meter is
+--   a triangle wave (MeterAt in ThrowConfig, period 1.6 s, peak 0.8 s after MeterStart) and the
+--   server computes the meter from the timestamp sent in Throw.Tap, so tapping exactly on the peak
+--   gives meter ~0.99 and max power. The game's own auto throw asks the server for a random low
+--   AutoMeter, that is why it feels weak.
+--   A caught baddie becomes a HeldBaddie tool; Pen.Place(Vector3) drops it into the pen, so the
+--   script only has to hand over a point inside your own pen. Pen.EquipBest, Pen.Unequip,
+--   FoodShop.Buy/Equip, Upgrade.PenPress, PullUp.Start/Stop and the Sell stall check the distance
+--   server side, so the script teleports to the matching station, does the action and comes back.
+--   Sell.Sell takes an array of baddie uids and needs you to stand at the hub Sell stall.
+
+do
+	local existing = getgenv().RobScriptTFFB
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local VirtualUser = nil
+if game:FindService("VirtualUser") then
+	pcall(function()
+		VirtualUser = game:GetService("VirtualUser")
+	end)
+end
+
+local VERSION = "1.1.0"
+local PLACE_ID = 89727004942007
+local GAME_ID = 10773616048
+
+local RUNNING = true
+local CONNECTIONS = {}
+
+local function track(connection)
+	if connection then
+		table.insert(CONNECTIONS, connection)
+	end
+	return connection
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[TFFB] Airflow UI could not be loaded")
+end
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Texts -----
+
+local RU_STRINGS = {
+	["Farm"] = "Фарм",
+	["Bar"] = "Бар",
+	["Rotation"] = "Ротация",
+	["Settings"] = "Настройки",
+	["Activity"] = "События",
+	["Automation"] = "Автоматизация",
+	["Pen"] = "Пен",
+	["Fruit"] = "Фрукты",
+	["Right Now"] = "Сейчас",
+	["Strength"] = "Сила",
+	["Upgrades"] = "Улучшения",
+	["Timer"] = "Таймер",
+	["Save and load"] = "Сохранение",
+	["Appearance"] = "Внешний вид",
+	["Other"] = "Прочее",
+	["What happened"] = "Что произошло",
+	["Auto farm"] = "Авто фарм",
+	["Throws, places, sells, buys fruit and upgrades on its own"] = "Бросает, ставит, продаёт, покупает фрукты и улучшает сам",
+	["Auto throw"] = "Авто бросок",
+	["Max power every throw, the meter is pinned to the top"] = "Каждый бросок на максимум, шкала прижата к верху",
+	["Auto place"] = "Авто размещение",
+	["Puts every caught baddie into your pen"] = "Ставит каждого пойманного бэдди в пен",
+	["Equip best"] = "Лучшие в пен",
+	["Keeps your highest income baddies inside the pen"] = "Держит в пене бэдди с самым большим доходом",
+	["Sell spare"] = "Продажа лишних",
+	["Sells the baddies that did not fit, right after each catch"] = "Продаёт бэдди, которым не хватило места, сразу после улова",
+	["Keep favorites"] = "Не трогать избранных",
+	["Favorites are never sold"] = "Избранные бэдди не продаются",
+	["Auto fruit"] = "Авто фрукт",
+	["Buys and equips the best fruit you can afford"] = "Покупает и надевает лучший доступный фрукт",
+	["Auto upgrade plot"] = "Авто улучшение плота",
+	["Upgrades the pen when there is money for it"] = "Улучшает пен, когда хватает денег",
+	["Auto upgrade bar"] = "Авто улучшение бара",
+	["Upgrades the pull-up bar when there is money for it"] = "Улучшает турник, когда хватает денег",
+	["Auto bar"] = "Авто бар",
+	["Trains Throwing Strength in bar phases"] = "Качает силу броска в фазах бара",
+	["Claim boosts"] = "Забирать буст",
+	["Takes the double XP boost when it shows on the bar"] = "Берёт двойной опыт, когда на баре появляется буст",
+	["Switches between throwing and the bar on a timer"] = "Переключает броски и турник по таймеру",
+	["Stay in game"] = "Не выкидывать из игры",
+	["Keeps the session alive when you are idle"] = "Держит сессию живой при бездействии",
+	["Train time"] = "Время на баре",
+	["Seconds on the bar each time"] = "Сколько секунд висим на турнике",
+	["Throw time"] = "Время бросков",
+	["Seconds of throwing in the rotation"] = "Сколько секунд бросаем в ротации",
+	["Bar time"] = "Время бара",
+	["Seconds of bar work in the rotation"] = "Сколько секунд работаем на баре в ротации",
+	["Start with"] = "Начать с",
+	["Which phase the rotation starts on"] = "С какой фазы начинается ротация",
+	["Throw"] = "Броски",
+	["Doing"] = "Занятие",
+	["Phase"] = "Фаза",
+	["Next switch"] = "Следующее переключение",
+	["Cash"] = "Деньги",
+	["Active"] = "В пене",
+	["Spare"] = "Лишние",
+	["Throw strength"] = "Сила броска",
+	["Last catch"] = "Последний улов",
+	["Best fruit"] = "Лучший фрукт",
+	["Next pen"] = "След. пен",
+	["Next bar"] = "След. бар",
+	["Off"] = "Выкл",
+	["Idle"] = "Ожидание",
+	["Throwing"] = "Бросаю",
+	["Placing"] = "Ставлю",
+	["Selling"] = "Продаю",
+	["Training"] = "Качаюсь на баре",
+	["Buying fruit"] = "Покупаю фрукт",
+	["Upgrading"] = "Улучшаю",
+	["Equipping"] = "Сортирую пен",
+	["Waiting"] = "Жду",
+	["Check my game"] = "Проверить игру",
+	["Unload"] = "Выключить",
+	["Buy now"] = "Купить сейчас",
+	["Equip best now"] = "Лучшие в пен сейчас",
+	["Sell spare now"] = "Продать лишних сейчас",
+	["Train now"] = "Пойти на бар",
+	["Upgrade bar now"] = "Улучшить бар",
+	["Upgrade pen now"] = "Улучшить пен",
+	["Loaded"] = "Загружено",
+	["Ready, good luck!"] = "Готово, удачи!",
+	["This script is for Throw Food For Baddies"] = "Этот скрипт для Throw Food For Baddies",
+	["Wrong game"] = "Другая игра",
+	["Caught %s"] = "Пойман %s",
+	["Sold %d for %s"] = "Продано %d за %s",
+	["Pen upgraded"] = "Пен улучшен",
+	["Bar upgraded"] = "Бар улучшен",
+	["Fruit bought: %s"] = "Куплен фрукт: %s",
+	["No room in the pen"] = "В пене нет места",
+	["Baddie in hand, Auto place is off"] = "В руках бэдди, авто размещение выключено",
+	["Throw failed, retrying"] = "Бросок не прошёл, повторяем",
+	["Remotes found"] = "Ремоуты найдены",
+	["Remotes missing"] = "Ремоуты не найдены",
+	["Rotation: bar phase"] = "Ротация: фаза бара",
+	["Rotation: throw phase"] = "Ротация: фаза бросков",
+	["Nothing yet"] = "Пока ничего",
+	["none"] = "нет",
+	["waiting"] = "ждут",
+	["favorites kept"] = "избранные остались",
+	["maxed"] = "максимум",
+}
+
+Airflow:AddLanguage("ru", {
+	Name = "Русский",
+	Flag = "ru",
+	Strings = RU_STRINGS,
+})
+
+----- Constants -----
+
+local METER_PERIOD = 1.6
+local METER_PEAK = 0.8
+local TELEPORT_GAP = 0.28
+local CATCH_TIMEOUT = 2.5
+local TRAIN_CHUNK = 8
+local SPARE_BATCH = 2
+
+local PEN_BASE_SLOTS = 10
+local PEN_SLOTS_PER_TIER = 2
+local PEN_MAX_TIER = 6
+
+local LOG_BUFFER = {}
+local LOG_HANDLE = nil
+
+local function log(text)
+	if LOG_HANDLE then
+		LOG_HANDLE:Push(text)
+	else
+		table.insert(LOG_BUFFER, text)
+	end
+end
+
+----- Helpers -----
+
+local function now()
+	return os.clock()
+end
+
+local function waitUntil(predicate, timeout)
+	local deadline = now() + (timeout or 2)
+	repeat
+		local ok, result = pcall(predicate)
+		if ok and result then
+			return true
+		end
+		task.wait(0.05)
+	until now() >= deadline
+	return false
+end
+
+local function formatMoney(value)
+	if type(value) ~= "number" then
+		return "$0"
+	end
+	if value >= 1e15 then
+		return string.format("$%.2fQa", value / 1e15)
+	elseif value >= 1e12 then
+		return string.format("$%.2fT", value / 1e12)
+	elseif value >= 1e9 then
+		return string.format("$%.2fB", value / 1e9)
+	elseif value >= 1e6 then
+		return string.format("$%.2fM", value / 1e6)
+	elseif value >= 1e3 then
+		return string.format("$%.1fK", value / 1e3)
+	end
+	return string.format("$%d", math.floor(value))
+end
+
+local function getCash()
+	local value = LocalPlayer:GetAttribute("Cash")
+	if type(value) == "number" then
+		return value
+	end
+	local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+	local money = leaderstats and leaderstats:FindFirstChild("Money/s")
+	if money then
+		local parsed = tonumber((tostring(money.Value):gsub("[^%d%.]", "")))
+		if parsed then
+			return parsed
+		end
+	end
+	return 0
+end
+
+----- Remotes -----
+
+local REMOTE_PATHS = {
+	ThrowBegin = { "Throw", "Begin" },
+	ThrowTap = { "Throw", "Tap" },
+	ThrowFinish = { "Throw", "Finish" },
+	ThrowSetAuto = { "Throw", "SetAuto" },
+	PenPlace = { "Pen", "Place" },
+	PenEquip = { "Pen", "Equip" },
+	PenUnequip = { "Pen", "Unequip" },
+	PenEquipBest = { "Pen", "EquipBest" },
+	PenUnequipAll = { "Pen", "UnequipAll" },
+	SellSell = { "Sell", "Sell" },
+	FoodBuy = { "FoodShop", "Buy" },
+	FoodEquip = { "FoodShop", "Equip" },
+	PenPress = { "Upgrade", "PenPress" },
+	PullUpStart = { "PullUp", "Start" },
+	PullUpStop = { "PullUp", "Stop" },
+	PullUpRep = { "PullUp", "Rep" },
+	PullUpBoostOffer = { "PullUp", "BoostOffer" },
+	PullUpBoostClaim = { "PullUp", "BoostClaim" },
+	NotifyShow = { "Notify", "Show" },
+}
+
+local R = {}
+
+local function resolveRemotes()
+	for key, path in pairs(REMOTE_PATHS) do
+		local folder = ReplicatedStorage:FindFirstChild(path[1])
+		if not folder then
+			local ok, result = pcall(function()
+				return ReplicatedStorage:WaitForChild(path[1], 6)
+			end)
+			folder = ok and result or nil
+		end
+		local remote = folder and folder:FindFirstChild(path[2])
+		if remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
+			R[key] = remote
+		else
+			R[key] = nil
+		end
+	end
+end
+
+resolveRemotes()
+
+----- Game modules -----
+
+local CONFIG_CACHE = {}
+
+local function getConfig(name)
+	if CONFIG_CACHE[name] ~= nil then
+		return CONFIG_CACHE[name] or nil
+	end
+	local system = ReplicatedStorage:FindFirstChild("BaddieSystem")
+	local module = system and system:FindFirstChild(name)
+	if not module then
+		CONFIG_CACHE[name] = false
+		return nil
+	end
+	local ok, value = pcall(require, module)
+	CONFIG_CACHE[name] = (ok and type(value) == "table") and value or false
+	return CONFIG_CACHE[name] or nil
+end
+
+local function applyThrowConfig()
+	local folder = ReplicatedStorage:FindFirstChild("ThrowCinematic")
+	local module = folder and folder:FindFirstChild("ThrowConfig")
+	if not module then
+		return
+	end
+	local ok, config = pcall(require, module)
+	if ok and type(config) == "table" and type(config.MeterPeriod) == "number" and config.MeterPeriod > 0.2 then
+		METER_PERIOD = config.MeterPeriod
+		METER_PEAK = METER_PERIOD / 2
+	end
+end
+
+applyThrowConfig()
+
+----- World -----
+
+local function hubFolder()
+	local map = Workspace:FindFirstChild("Map")
+	return map and map:FindFirstChild("Hub")
+end
+
+local function penModel()
+	local hub = hubFolder()
+	local pens = hub and hub:FindFirstChild("Pens")
+	local index = LocalPlayer:GetAttribute("PenIndex") or 1
+	if not pens then
+		return nil
+	end
+	return pens:FindFirstChild("Pen" .. tostring(index))
+end
+
+local function penPart()
+	local pen = LocalPlayer:FindFirstChild("Pen")
+	local value = pen and pen.Value
+	if value and value:IsA("BasePart") then
+		return value
+	end
+	return nil
+end
+
+local function station(name)
+	local pen = penModel()
+	local stations = pen and pen:FindFirstChild("Stations")
+	return stations and stations:FindFirstChild(name)
+end
+
+local function partPosition(instance)
+	if not instance then
+		return nil
+	end
+	if instance:IsA("BasePart") then
+		return instance.Position
+	end
+	local part = instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function throwZone()
+	local hub = hubFolder()
+	local strip = hub and hub:FindFirstChild("ThrowStrip")
+	return strip and strip:FindFirstChild("ThrowZone")
+end
+
+local function sellStall()
+	local hub = hubFolder()
+	local stations = hub and hub:FindFirstChild("Stations")
+	return stations and stations:FindFirstChild("Sell")
+end
+
+local function barPrompt()
+	local bar = station("BarUpgrade")
+	local button = bar and bar:FindFirstChild("Button")
+	local prompt = button and button:FindFirstChild("UpgradePrompt")
+	if prompt and prompt:IsA("ProximityPrompt") then
+		return prompt
+	end
+	return nil
+end
+
+----- Character -----
+
+local function character()
+	local char = LocalPlayer.Character
+	if char and char:FindFirstChild("HumanoidRootPart") then
+		return char
+	end
+	return nil
+end
+
+local function humanoidRootPart()
+	local char = character()
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function heldBaddie()
+	local char = character()
+	return char and char:FindFirstChild("HeldBaddie")
+end
+
+local function training()
+	local char = character()
+	return char ~= nil and char:GetAttribute("Training") == true
+end
+
+local function throwing()
+	local char = character()
+	return char ~= nil and char:GetAttribute("Throwing") == true
+end
+
+local function teleport(position)
+	if not position then
+		return false
+	end
+	local hrp = humanoidRootPart()
+	if not hrp then
+		return false
+	end
+	hrp.CFrame = CFrame.new(position)
+	task.wait(TELEPORT_GAP)
+	return true
+end
+
+local function stopTraining()
+	if not training() then
+		return true
+	end
+	if R.PullUpStop then
+		pcall(function()
+			R.PullUpStop:FireServer()
+		end)
+	end
+	return waitUntil(function()
+		return not training()
+	end, 2)
+end
+
+----- Baddies -----
+
+local function baddieList()
+	local list = {}
+	local inventory = LocalPlayer:FindFirstChild("BaddieInventory")
+	if not inventory then
+		return list
+	end
+	for _, child in ipairs(inventory:GetChildren()) do
+		if child:IsA("Folder") then
+			table.insert(list, {
+				uid = child.Name,
+				id = child:GetAttribute("BaddieId") or "?",
+				income = child:GetAttribute("Income") or 0,
+				equipped = child:GetAttribute("Equipped") == true,
+				pending = child:GetAttribute("Pending") == true,
+				favorite = child:GetAttribute("Favorite") == true,
+				mutation = child:GetAttribute("Mutation") or "None",
+				size = child:GetAttribute("Size") or "Normal",
+			})
+		end
+	end
+	return list
+end
+
+local function countEquipped(list)
+	local total = 0
+	for _, baddie in ipairs(list or baddieList()) do
+		if baddie.equipped then
+			total += 1
+		end
+	end
+	return total
+end
+
+local function countPending(list)
+	local total = 0
+	for _, baddie in ipairs(list or baddieList()) do
+		if baddie.pending then
+			total += 1
+		end
+	end
+	return total
+end
+
+local function penTier()
+	return LocalPlayer:GetAttribute("PenTier") or 0
+end
+
+local function penSlotCount()
+	local tier = math.clamp(penTier(), 0, PEN_MAX_TIER)
+	local config = getConfig("PenConfig")
+	if config and type(config.Slots) == "function" then
+		local ok, value = pcall(config.Slots, tier)
+		if ok and type(value) == "number" then
+			return value
+		end
+	end
+	return PEN_BASE_SLOTS + PEN_SLOTS_PER_TIER * tier
+end
+
+local function penTierName()
+	local config = getConfig("PenConfig")
+	local names = config and config.TierNames
+	local index = math.clamp(penTier(), 0, PEN_MAX_TIER)
+	if type(names) == "table" and (names[index + 1] or names[index]) then
+		return names[index + 1] or names[index]
+	end
+	return "Pen " .. tostring(index)
+end
+
+local function worstEquipped(list)
+	local worst = nil
+	for _, baddie in ipairs(list or baddieList()) do
+		if baddie.equipped and not baddie.pending then
+			if not worst or baddie.income < worst.income then
+				worst = baddie
+			end
+		end
+	end
+	return worst
+end
+
+local function sellableExtras(list)
+	local result = {}
+	for _, baddie in ipairs(list or baddieList()) do
+		if not baddie.equipped and not baddie.pending then
+			table.insert(result, baddie)
+		end
+	end
+	table.sort(result, function(a, b)
+		return a.income < b.income
+	end)
+	return result
+end
+
+local function spareCounts()
+	local total, favorites = 0, 0
+	for _, baddie in ipairs(sellableExtras()) do
+		total += 1
+		if baddie.favorite then
+			favorites += 1
+		end
+	end
+	return total, favorites
+end
+
+----- Pen placement -----
+
+local function penWorldPosition(localOffset)
+	local pen = penPart()
+	if not pen then
+		return nil
+	end
+	local world = pen.CFrame * CFrame.new(localOffset.X, 0, localOffset.Y)
+	return Vector3.new(world.X, pen.Position.Y - 0.2, world.Z)
+end
+
+local function freePenPosition()
+	local pen = penPart()
+	if not pen then
+		return nil
+	end
+	local halfX = math.max(5, pen.Size.X / 2 - 3)
+	local halfZ = math.max(5, pen.Size.Z / 2 - 3)
+
+	local taken = {}
+	local penBaddies = Workspace:FindFirstChild("PenBaddies")
+	if penBaddies then
+		for _, model in ipairs(penBaddies:GetChildren()) do
+			local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+			if part then
+				local relative = pen.CFrame:PointToObjectSpace(part.Position)
+				if math.abs(relative.X) <= halfX + 2 and math.abs(relative.Z) <= halfZ + 2 then
+					table.insert(taken, Vector2.new(relative.X, relative.Z))
+				end
+			end
+		end
+	end
+
+	local candidates = {}
+	local step = 5
+	local x = -halfX
+	while x <= halfX do
+		local z = -halfZ
+		while z <= halfZ do
+			table.insert(candidates, Vector2.new(x, z))
+			z += step
+		end
+		x += step
+	end
+	table.sort(candidates, function(a, b)
+		return a.Magnitude < b.Magnitude
+	end)
+
+	for _, candidate in ipairs(candidates) do
+		local isFree = true
+		for _, point in ipairs(taken) do
+			if (point - candidate).Magnitude < 3.8 then
+				isFree = false
+				break
+			end
+		end
+		if isFree then
+			return penWorldPosition(candidate)
+		end
+	end
+
+	return nil
+end
+
+local function placeHeld()
+	if not heldBaddie() then
+		return false
+	end
+	if countEquipped() >= penSlotCount() then
+		return false
+	end
+	local position = freePenPosition()
+	if not position or not R.PenPlace then
+		return false
+	end
+	pcall(function()
+		R.PenPlace:FireServer(position)
+	end)
+	task.wait(0.45)
+	return true
+end
+
+----- Actions -----
+
+local function equipBest()
+	if not R.PenEquipBest then
+		return false
+	end
+	pcall(function()
+		R.PenEquipBest:FireServer()
+	end)
+	task.wait(0.7)
+	return true
+end
+
+local function sellUids(uids)
+	if #uids == 0 or not R.SellSell then
+		return 0
+	end
+	stopTraining()
+	local position = partPosition(sellStall())
+	if position then
+		teleport(Vector3.new(position.X, position.Y + 3, position.Z + 6))
+	end
+	local ok, result = pcall(function()
+		return R.SellSell:InvokeServer(uids)
+	end)
+	task.wait(0.3)
+	if ok and type(result) == "number" and result > 0 then
+		return result
+	end
+	return 0
+end
+
+local function sellSpare(keepFavorites)
+	local uids = {}
+	for _, baddie in ipairs(sellableExtras()) do
+		if not (keepFavorites and baddie.favorite) then
+			table.insert(uids, baddie.uid)
+		end
+	end
+	if #uids == 0 then
+		return 0, 0
+	end
+	return #uids, sellUids(uids)
+end
+
+local function foodsOwnedSet()
+	local set = {}
+	local owned = LocalPlayer:GetAttribute("FoodsOwned") or ""
+	for id in string.gmatch(owned, "[^,]+") do
+		set[id] = true
+	end
+	return set
+end
+
+local function foodEntries()
+	local config = getConfig("FoodConfig")
+	if not config or type(config.List) ~= "table" then
+		return {}
+	end
+	return config.List
+end
+
+local function bestAffordableFood()
+	local cash = getCash()
+	local owned = foodsOwnedSet()
+	local best = nil
+	for _, food in ipairs(foodEntries()) do
+		if not food.Exclusive and type(food.Price) == "number" and food.Price > 0 and food.Price <= cash and not owned[food.Id] then
+			if not best or (food.Tier or 0) > (best.Tier or 0) then
+				best = food
+			end
+		end
+	end
+	return best
+end
+
+local function bestOwnedFood()
+	local owned = foodsOwnedSet()
+	local best = nil
+	for _, food in ipairs(foodEntries()) do
+		if owned[food.Id] and not food.Exclusive then
+			if not best or (food.Tier or 0) > (best.Tier or 0) then
+				best = food
+			end
+		end
+	end
+	return best
+end
+
+local function goToFoodShop()
+	local position = partPosition(station("FoodShop"))
+	if position then
+		teleport(Vector3.new(position.X + 2, position.Y + 3, position.Z + 6))
+	end
+end
+
+local function buyFood(food)
+	if not food or not R.FoodBuy then
+		return false
+	end
+	goToFoodShop()
+	local ok, result = pcall(function()
+		return R.FoodBuy:InvokeServer(food.Id)
+	end)
+	task.wait(0.25)
+	if ok and result then
+		if R.FoodEquip then
+			pcall(function()
+				R.FoodEquip:InvokeServer(food.Id)
+			end)
+			task.wait(0.2)
+		end
+		return true
+	end
+	return false
+end
+
+local function equipOwnedFood()
+	local best = bestOwnedFood()
+	if not best or not R.FoodEquip then
+		return false
+	end
+	if (LocalPlayer:GetAttribute("EquippedFood") or "") == best.Id then
+		return false
+	end
+	goToFoodShop()
+	pcall(function()
+		R.FoodEquip:InvokeServer(best.Id)
+	end)
+	task.wait(0.25)
+	return true
+end
+
+local function plotUpgradePrice()
+	local tier = penTier()
+	if tier >= PEN_MAX_TIER then
+		return nil
+	end
+	local config = getConfig("PenConfig")
+	if config and type(config.UpgradePrice) == "function" then
+		local ok, price = pcall(config.UpgradePrice, tier + 1)
+		if ok and type(price) == "number" then
+			return price
+		end
+	end
+	if config and type(config.UpgradePrices) == "table" and type(config.UpgradePrices[tier + 1]) == "number" then
+		return config.UpgradePrices[tier + 1]
+	end
+	return nil
+end
+
+local function upgradePlot()
+	local price = plotUpgradePrice()
+	if not price or getCash() < price or not R.PenPress then
+		return false
+	end
+	local position = partPosition(station("UpgradeSign"))
+	if position then
+		teleport(Vector3.new(position.X, position.Y + 1, position.Z + 5))
+	else
+		local pen = penPart()
+		if pen then
+			teleport(pen.Position + Vector3.new(0, 3, 0))
+		end
+	end
+	pcall(function()
+		R.PenPress:FireServer()
+	end)
+	task.wait(1.1)
+	return true
+end
+
+local function barUpgradePrice()
+	local level = LocalPlayer:GetAttribute("BarLevel") or 1
+	local config = getConfig("PullUpConfig")
+	if config and type(config.List) == "table" and config.List[level + 1] and type(config.List[level + 1].Price) == "number" then
+		return config.List[level + 1].Price
+	end
+	local balance = getConfig("BalanceConfig")
+	if balance and type(balance.BarPrices) == "table" then
+		return balance.BarPrices[level + 1]
+	end
+	return nil
+end
+
+local function upgradeBar()
+	local price = barUpgradePrice()
+	if not price or getCash() < price then
+		return false
+	end
+	local position = partPosition(station("BarUpgrade"))
+	if position then
+		teleport(Vector3.new(position.X, position.Y + 2, position.Z + 7))
+	else
+		local pen = penPart()
+		if pen then
+			teleport(pen.Position + Vector3.new(0, 3, 6))
+		end
+	end
+	local prompt = barPrompt()
+	if prompt and prompt.Enabled then
+		local ok = pcall(function()
+			fireproximityprompt(prompt)
+		end)
+		if not ok then
+			pcall(function()
+				prompt:InputHoldBegin()
+				prompt:InputHoldEnd()
+			end)
+		end
+	elseif R.PenPress then
+		pcall(function()
+			R.PenPress:FireServer()
+		end)
+	end
+	task.wait(1.0)
+	return true
+end
+
+----- Bar -----
+
+local function pullUpRing()
+	local folder = station("PullUp")
+	return folder and folder:FindFirstChild("Ring")
+end
+
+local function trainSlice(seconds)
+	if not R.PullUpStart then
+		return false
+	end
+	local position = partPosition(pullUpRing())
+	if position then
+		teleport(Vector3.new(position.X, position.Y + 3.2, position.Z))
+	else
+		local barPosition = partPosition(station("PullUp"))
+		if barPosition then
+			teleport(Vector3.new(barPosition.X, barPosition.Y + 3.2, barPosition.Z + 4))
+		end
+	end
+	pcall(function()
+		R.PullUpStart:FireServer()
+	end)
+	if not waitUntil(function()
+		return training()
+	end, 2) then
+		return false
+	end
+	local deadline = now() + (seconds or TRAIN_CHUNK)
+	while now() < deadline and RUNNING do
+		task.wait(0.2)
+		if not training() then
+			break
+		end
+	end
+	if R.PullUpStop then
+		pcall(function()
+			R.PullUpStop:FireServer()
+		end)
+	end
+	waitUntil(function()
+		return not training()
+	end, 2)
+	return true
+end
+
+----- Throw -----
+
+local CATCH = {
+	count = 0,
+	last = nil,
+}
+
+local function inventoryCount()
+	local inventory = LocalPlayer:FindFirstChild("BaddieInventory")
+	return inventory and #inventory:GetChildren() or 0
+end
+
+local function beginThrow()
+	for attempt = 1, 3 do
+		local ok, result = pcall(function()
+			return R.ThrowBegin:InvokeServer(false)
+		end)
+		if ok and type(result) == "table" and type(result.MeterStart) == "number" then
+			return result
+		end
+		task.wait(0.25)
+	end
+	return nil
+end
+
+local function tapAtPeak(meterStart)
+	local target = meterStart + METER_PEAK
+	local serverNow = Workspace:GetServerTimeNow()
+	while target <= serverNow + 0.02 do
+		target += METER_PERIOD
+	end
+	local deadline = now() + (target - serverNow) + 1
+	while RUNNING do
+		local remaining = target - Workspace:GetServerTimeNow()
+		if remaining <= 0.003 or now() > deadline then
+			break
+		end
+		task.wait(math.min(remaining * 0.5, 0.05))
+	end
+	local tapTime = Workspace:GetServerTimeNow()
+	if tapTime > target + 0.02 then
+		tapTime = target
+	end
+	local ok, result = pcall(function()
+		return R.ThrowTap:InvokeServer(tapTime, false)
+	end)
+	if ok and type(result) == "table" then
+		return result
+	end
+	return nil
+end
+
+local function throwOnce()
+	local zone = throwZone()
+	if not zone then
+		return false, "no throw zone"
+	end
+	stopTraining()
+	if throwing() then
+		if R.ThrowFinish then
+			pcall(function()
+				R.ThrowFinish:FireServer()
+			end)
+		end
+		waitUntil(function()
+			return not throwing()
+		end, 2)
+	end
+	if heldBaddie() then
+		return false, "baddie in hand"
+	end
+
+	teleport(zone.CFrame.Position)
+	local session = beginThrow()
+	if not session then
+		return false, "throw did not start"
+	end
+
+	local before = inventoryCount()
+	local result = tapAtPeak(session.MeterStart)
+	if R.ThrowFinish then
+		pcall(function()
+			R.ThrowFinish:FireServer()
+		end)
+	end
+	if not result then
+		waitUntil(function()
+			return not throwing()
+		end, 2)
+		return false, "tap failed"
+	end
+
+	waitUntil(function()
+		return inventoryCount() > before or countPending() > 0 or heldBaddie() ~= nil
+	end, CATCH_TIMEOUT)
+	waitUntil(function()
+		return not throwing()
+	end, 2)
+
+	local reward = result.Reward
+	if type(reward) == "table" then
+		CATCH.count += 1
+		CATCH.last = {
+			id = tostring(reward.Id or "?"),
+			income = reward.Income or 0,
+			mutation = tostring(reward.Mutation or "None"),
+			oneIn = reward.OneIn,
+			size = tostring(reward.Size or "Normal"),
+			good = reward.Good == true,
+			new = reward.New == true,
+		}
+		if CATCH.last.good or CATCH.last.new or CATCH.last.mutation ~= "None" then
+			local name = CATCH.last.id
+			if CATCH.last.mutation ~= "None" then
+				name = CATCH.last.mutation .. " " .. name
+			end
+			if type(CATCH.last.oneIn) == "number" then
+				name = name .. string.format(" (1 in %d)", CATCH.last.oneIn)
+			end
+			log(string.format("Caught %s", name))
+		end
+	end
+	return true, result
+end
+
+----- Forward declarations -----
+
+local flagValue
+local masterOn
+local updateThrowGuard
+local diagnose
+local destroy
+
+----- State -----
+
+local ROT = {
+	phase = "Throw",
+	startedAt = 0,
+	endsAt = 0,
+	active = false,
+}
+
+local TIMERS = {
+	food = 0,
+	plot = 0,
+	bar = 0,
+	sweep = 0,
+	hint = 0,
+}
+
+local GUARD = {
+	gui = nil,
+	owned = false,
+}
+
+local DOING = "Idle"
+
+local function setDoing(text)
+	DOING = text
+end
+
+----- Flag access -----
+
+function flagValue(name, fallback)
+	local handle = Airflow.Flags[name]
+	if not handle then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		if type(handle.Get) == "function" then
+			return handle:Get()
+		end
+		return handle.Value
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+function masterOn()
+	return flagValue("AutoFarm", false) == true
+end
+
+local function on(name, fallback)
+	if not masterOn() then
+		return false
+	end
+	return flagValue(name, fallback) == true
+end
+
+----- Rotation helpers -----
+
+local function rotationOn()
+	return flagValue("Rotation", false) == true
+end
+
+local function rotationDuration(phase)
+	if phase == "Bar" then
+		return flagValue("BarTime", 60)
+	end
+	return flagValue("ThrowTime", 120)
+end
+
+local function rotationStart()
+	ROT.active = true
+	ROT.phase = flagValue("RotationStart", "Throw") == "Bar" and "Bar" or "Throw"
+	ROT.startedAt = now()
+	ROT.endsAt = ROT.startedAt + rotationDuration(ROT.phase)
+end
+
+local function rotationRecompute()
+	if not ROT.active then
+		return
+	end
+	ROT.endsAt = ROT.startedAt + rotationDuration(ROT.phase)
+end
+
+local function rotationReset()
+	ROT.active = false
+	ROT.phase = "Throw"
+	ROT.endsAt = 0
+end
+
+local function phaseLabel()
+	if rotationOn() and ROT.active then
+		return ROT.phase == "Bar" and "<Warning>Bar</Warning>" or "<Success>Throw</Success>"
+	end
+	if flagValue("AutoThrow", true) then
+		return "<Success>Throw</Success>"
+	end
+	return "<Muted>Idle</Muted>"
+end
+
+local function nextSwitchLabel()
+	if not rotationOn() or not ROT.active then
+		return "<Muted>Off</Muted>"
+	end
+	local left = math.max(0, math.floor(ROT.endsAt - now()))
+	return string.format("%s <Muted>%d:%02d</Muted>", ROT.phase == "Bar" and "to throw" or "to bar", math.floor(left / 60), left % 60)
+end
+
+----- UI -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team - TFFB",
+	LoadingSubtitle = "farm, pen, bar, rotation",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptTFFB" },
+	Home = {
+		Title = "Robscript Team - TFFB",
+		Welcome = "Welcome back,",
+		Tier = "v" .. VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "sprout" })
+local FarmBox = FarmTab:CreateGroupbox({ Name = "Automation", Side = "Left" })
+local PenBox = FarmTab:CreateGroupbox({ Name = "Pen", Side = "Left" })
+local FruitBox = FarmTab:CreateGroupbox({ Name = "Fruit", Side = "Left" })
+local StatusBox = FarmTab:CreateGroupbox({ Name = "Right Now", Side = "Right" })
+
+local BarTab = Window:CreateTab({ Name = "Bar", Icon = "dumbbell" })
+local TrainBox = BarTab:CreateGroupbox({ Name = "Strength", Side = "Left" })
+local UpgradeBox = BarTab:CreateGroupbox({ Name = "Upgrades", Side = "Right" })
+
+local RotationTab = Window:CreateTab({ Name = "Rotation", Icon = "refresh-cw" })
+local TimerBox = RotationTab:CreateGroupbox({ Name = "Timer", Side = "Left" })
+local TimerInfoBox = RotationTab:CreateGroupbox({ Name = "Right Now", Side = "Right" })
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+local SettingsConfig = SettingsTab:CreateGroupbox({ Name = "Save and load", Side = "Left" })
+local SettingsTheme = SettingsTab:CreateGroupbox({ Name = "Appearance", Side = "Right" })
+local SettingsOther = SettingsTab:CreateGroupbox({ Name = "Other", Side = "Left" })
+
+local ActivityTab = Window:CreateTab({ Name = "Activity", Icon = "scroll-text" })
+local ActivityBox = ActivityTab:CreateGroupbox({ Name = "What happened", Side = "Left" })
+
+LOG_HANDLE = ActivityBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 13,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+for _, text in ipairs(LOG_BUFFER) do
+	LOG_HANDLE:Push(text)
+end
+LOG_BUFFER = {}
+
+----- Elements -----
+
+FarmBox:CreateToggle({
+	Name = "Auto farm",
+	Desc = "Throws, places, sells, buys fruit and upgrades on its own",
+	Flag = "AutoFarm",
+	CurrentValue = false,
+	Callback = function(value)
+		if not value then
+			stopTraining()
+		end
+		updateThrowGuard()
+	end,
+})
+
+FarmBox:CreateToggle({
+	Name = "Auto throw",
+	Desc = "Max power every throw, the meter is pinned to the top",
+	Flag = "AutoThrow",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+FarmBox:CreateToggle({
+	Name = "Auto place",
+	Desc = "Puts every caught baddie into your pen",
+	Flag = "AutoPlace",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+PenBox:CreateToggle({
+	Name = "Equip best",
+	Desc = "Keeps your highest income baddies inside the pen",
+	Flag = "EquipBest",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+PenBox:CreateToggle({
+	Name = "Sell spare",
+	Desc = "Sells the baddies that did not fit, right after each catch",
+	Flag = "SellSpare",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+PenBox:CreateToggle({
+	Name = "Keep favorites",
+	Desc = "Favorites are never sold",
+	Flag = "KeepFavorites",
+	CurrentValue = true,
+	DependsOn = "SellSpare",
+})
+
+PenBox:CreateButton({
+	Name = "Equip best now",
+	Icon = "arrow-up-narrow-wide",
+	Callback = function()
+		task.spawn(function()
+			setDoing("Equipping")
+			equipBest()
+			setDoing("Idle")
+		end)
+	end,
+})
+
+PenBox:CreateButton({
+	Name = "Sell spare now",
+	Icon = "trash-2",
+	Callback = function()
+		task.spawn(function()
+			setDoing("Selling")
+			local count, earned = sellSpare(flagValue("KeepFavorites", true))
+			if count > 0 then
+				log(string.format("Sold %d for %s", count, formatMoney(earned)))
+			end
+			setDoing("Idle")
+		end)
+	end,
+})
+
+FruitBox:CreateToggle({
+	Name = "Auto fruit",
+	Desc = "Buys and equips the best fruit you can afford",
+	Flag = "AutoFruit",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+FruitBox:CreateButton({
+	Name = "Buy now",
+	Icon = "shopping-basket",
+	Callback = function()
+		task.spawn(function()
+			setDoing("Buying fruit")
+			local food = bestAffordableFood()
+			if food and buyFood(food) then
+				log(string.format("Fruit bought: %s", food.Name or food.Id))
+			end
+			setDoing("Idle")
+		end)
+	end,
+})
+
+TrainBox:CreateToggle({
+	Name = "Auto bar",
+	Desc = "Trains Throwing Strength in bar phases",
+	Flag = "AutoBar",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+TrainBox:CreateSlider({
+	Name = "Train time",
+	Desc = "Seconds on the bar each time",
+	Range = { 10, 300 },
+	Increment = 10,
+	Suffix = " s",
+	CurrentValue = 60,
+	Flag = "TrainTime",
+})
+
+TrainBox:CreateToggle({
+	Name = "Claim boosts",
+	Desc = "Takes the double XP boost when it shows on the bar",
+	Flag = "ClaimBoosts",
+	CurrentValue = true,
+})
+
+TrainBox:CreateButton({
+	Name = "Train now",
+	Icon = "dumbbell",
+	Callback = function()
+		task.spawn(function()
+			if not masterOn() then
+				return
+			end
+			stopTraining()
+			setDoing("Training")
+			trainSlice(flagValue("TrainTime", 60))
+			setDoing("Idle")
+		end)
+	end,
+})
+
+UpgradeBox:CreateToggle({
+	Name = "Auto upgrade plot",
+	Desc = "Upgrades the pen when there is money for it",
+	Flag = "AutoUpgradePlot",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+UpgradeBox:CreateToggle({
+	Name = "Auto upgrade bar",
+	Desc = "Upgrades the pull-up bar when there is money for it",
+	Flag = "AutoUpgradeBar",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+	DependsMode = "Disable",
+})
+
+UpgradeBox:CreateButton({
+	Name = "Upgrade pen now",
+	Icon = "fence",
+	Callback = function()
+		task.spawn(function()
+			if upgradePlot() then
+				log("Pen upgraded")
+			end
+		end)
+	end,
+})
+
+UpgradeBox:CreateButton({
+	Name = "Upgrade bar now",
+	Icon = "arrow-big-up",
+	Callback = function()
+		task.spawn(function()
+			if upgradeBar() then
+				log("Bar upgraded")
+			end
+		end)
+	end,
+})
+
+TimerBox:CreateToggle({
+	Name = "Rotation",
+	Desc = "Switches between throwing and the bar on a timer",
+	Flag = "Rotation",
+	CurrentValue = false,
+	Callback = function(value)
+		if value then
+			rotationStart()
+		else
+			rotationReset()
+			stopTraining()
+		end
+	end,
+})
+
+TimerBox:CreateSlider({
+	Name = "Throw time",
+	Desc = "Seconds of throwing in the rotation",
+	Range = { 15, 900 },
+	Increment = 15,
+	Suffix = " s",
+	CurrentValue = 120,
+	Flag = "ThrowTime",
+	DependsOn = "Rotation",
+	Callback = function()
+		rotationRecompute()
+	end,
+	OnRelease = function()
+		rotationRecompute()
+	end,
+})
+
+TimerBox:CreateSlider({
+	Name = "Bar time",
+	Desc = "Seconds of bar work in the rotation",
+	Range = { 15, 900 },
+	Increment = 15,
+	Suffix = " s",
+	CurrentValue = 60,
+	Flag = "BarTime",
+	DependsOn = "Rotation",
+	Callback = function()
+		rotationRecompute()
+	end,
+	OnRelease = function()
+		rotationRecompute()
+	end,
+})
+
+TimerBox:CreateDropdown({
+	Name = "Start with",
+	Desc = "Which phase the rotation starts on",
+	Options = { "Throw", "Bar" },
+	CurrentOption = "Throw",
+	Flag = "RotationStart",
+	DependsOn = "Rotation",
+	Callback = function()
+		if rotationOn() then
+			rotationReset()
+			rotationStart()
+		end
+	end,
+})
+
+SettingsOther:CreateToggle({
+	Name = "Stay in game",
+	Desc = "Keeps the session alive when you are idle",
+	Flag = "StayInGame",
+	CurrentValue = true,
+})
+
+SettingsOther:CreateButton({
+	Name = "Check my game",
+	Icon = "stethoscope",
+	Callback = function()
+		diagnose()
+	end,
+})
+
+SettingsOther:CreateButton({
+	Name = "Unload",
+	Icon = "power",
+	Style = "Primary",
+	Callback = function()
+		destroy()
+	end,
+})
+
+SettingsConfig:CreateConfigManager({ Name = "Configs" })
+SettingsTheme:CreateThemeManager({ Name = "Theme" })
+
+----- Statuses -----
+
+StatusBox:CreateStatus({
+	Name = "Doing",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		if not masterOn() then
+			return "<Muted>Off</Muted>"
+		end
+		if DOING == "Idle" then
+			return "<Muted>Waiting</Muted>"
+		end
+		return "<Accent>" .. DOING .. "</Accent>"
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Phase",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		if not masterOn() then
+			return "<Muted>Off</Muted>"
+		end
+		return phaseLabel()
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Next switch",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		if not masterOn() then
+			return "<Muted>Off</Muted>"
+		end
+		return nextSwitchLabel()
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return "<Success>" .. formatMoney(getCash()) .. "</Success>"
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Active",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local used = countEquipped()
+		local slots = penSlotCount()
+		local color = used >= slots and "Error" or "Text"
+		return string.format("<%s>%d / %d</%s> <Muted>%s</Muted>", color, used, slots, color, penTierName())
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Spare",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local total, favorites = spareCounts()
+		if total == 0 then
+			return "<Muted>none</Muted>"
+		end
+		if favorites > 0 and favorites == total then
+			return string.format("%d <Muted>favorites kept</Muted>", total)
+		end
+		return string.format("%d <Muted>waiting</Muted>", total)
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Throw strength",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local strength = LocalPlayer:GetAttribute("Strength") or 0
+		local level = LocalPlayer:GetAttribute("Level") or 0
+		return string.format("%d <Muted>(level %d)</Muted>", math.floor(strength), math.floor(level))
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Last catch",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if not CATCH.last then
+			return "<Muted>Nothing yet</Muted>"
+		end
+		local name = CATCH.last.id
+		if CATCH.last.mutation ~= "None" then
+			name = CATCH.last.mutation .. " " .. name
+		end
+		return string.format("%s <Muted>+$%d/s</Muted>", name, math.floor(CATCH.last.income))
+	end,
+})
+
+FruitBox:CreateStatus({
+	Name = "Best fruit",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local best = bestAffordableFood()
+		local equipped = LocalPlayer:GetAttribute("EquippedFood") or "?"
+		if best then
+			return string.format("%s <Muted>equipped %s</Muted>", tostring(best.Name or best.Id), equipped)
+		end
+		return string.format("<Muted>equipped %s</Muted>", equipped)
+	end,
+})
+
+UpgradeBox:CreateStatus({
+	Name = "Next pen",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local price = plotUpgradePrice()
+		if not price then
+			return "<Muted>maxed</Muted>"
+		end
+		return formatMoney(price)
+	end,
+})
+
+UpgradeBox:CreateStatus({
+	Name = "Next bar",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local price = barUpgradePrice()
+		if not price then
+			return "<Muted>maxed</Muted>"
+		end
+		return formatMoney(price)
+	end,
+})
+
+TimerInfoBox:CreateStatus({
+	Name = "Phase",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return phaseLabel()
+	end,
+})
+
+TimerInfoBox:CreateStatus({
+	Name = "Next switch",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return nextSwitchLabel()
+	end,
+})
+
+TimerInfoBox:CreateStatus({
+	Name = "Cash",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return formatMoney(getCash())
+	end,
+})
+
+TimerInfoBox:CreateStatus({
+	Name = "Active",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("%d / %d", countEquipped(), penSlotCount())
+	end,
+})
+
+----- Throw guard -----
+
+function updateThrowGuard()
+	if not RUNNING then
+		return
+	end
+	local enabled = masterOn() and flagValue("AutoThrow", true) == true
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then
+		return
+	end
+	if enabled and not GUARD.gui then
+		local existing = playerGui:FindFirstChild("WelcomeBackGui")
+		if existing then
+			GUARD.gui = existing
+			GUARD.owned = #existing:GetChildren() == 0
+		else
+			local gui = Instance.new("ScreenGui")
+			gui.Name = "WelcomeBackGui"
+			gui.ResetOnSpawn = false
+			gui.Enabled = false
+			gui.Parent = playerGui
+			GUARD.gui = gui
+			GUARD.owned = true
+		end
+	elseif not enabled and GUARD.gui then
+		if GUARD.owned or #GUARD.gui:GetChildren() == 0 then
+			pcall(function()
+				GUARD.gui:Destroy()
+			end)
+		end
+		GUARD.gui = nil
+		GUARD.owned = false
+	end
+end
+
+----- Pipeline -----
+
+function settlePen(forceSell)
+	local placed = false
+	local guard = 0
+	while heldBaddie() and guard < 8 do
+		guard += 1
+		setDoing("Placing")
+		if not placeHeld() then
+			local worst = worstEquipped()
+			if not worst or not R.PenUnequip then
+				log("No room in the pen")
+				break
+			end
+			pcall(function()
+				R.PenUnequip:FireServer(worst.uid)
+			end)
+			task.wait(0.45)
+			if not placeHeld() then
+				log("No room in the pen")
+				break
+			end
+		end
+		placed = true
+	end
+
+	local spare = #sellableExtras()
+	if spare > 0 and (forceSell or spare >= SPARE_BATCH) and flagValue("SellSpare", true) then
+		setDoing("Selling")
+		local count, earned = sellSpare(flagValue("KeepFavorites", true))
+		if count > 0 and earned > 0 then
+			log(string.format("Sold %d for %s", count, formatMoney(earned)))
+		end
+	end
+	return placed
+end
+
+function housekeeping()
+	local stamp = now()
+
+	if on("AutoFruit", true) and stamp >= TIMERS.food then
+		TIMERS.food = stamp + 6
+		local food = bestAffordableFood()
+		if food then
+			setDoing("Buying fruit")
+			if buyFood(food) then
+				log(string.format("Fruit bought: %s", food.Name or food.Id))
+			end
+		else
+			equipOwnedFood()
+		end
+	end
+
+	if on("AutoUpgradePlot", true) and stamp >= TIMERS.plot then
+		TIMERS.plot = stamp + 5
+		setDoing("Upgrading")
+		if upgradePlot() then
+			log("Pen upgraded")
+		end
+	end
+
+	if on("AutoUpgradeBar", true) and stamp >= TIMERS.bar then
+		TIMERS.bar = stamp + 5
+		setDoing("Upgrading")
+		if upgradeBar() then
+			log("Bar upgraded")
+		end
+	end
+
+	if on("EquipBest", true) and stamp >= TIMERS.sweep then
+		TIMERS.sweep = stamp + 20
+		equipBest()
+	end
+
+	setDoing("Idle")
+end
+
+local function rotationTick()
+	if not rotationOn() then
+		ROT.active = false
+		return
+	end
+	if not ROT.active then
+		rotationStart()
+		log(ROT.phase == "Bar" and "Rotation: bar phase" or "Rotation: throw phase")
+	end
+	if now() >= ROT.endsAt then
+		if ROT.phase == "Throw" then
+			settlePen(true)
+		end
+		ROT.phase = ROT.phase == "Throw" and "Bar" or "Throw"
+		ROT.startedAt = now()
+		ROT.endsAt = ROT.startedAt + rotationDuration(ROT.phase)
+		stopTraining()
+		log(ROT.phase == "Bar" and "Rotation: bar phase" or "Rotation: throw phase")
+		if ROT.phase == "Bar" then
+			housekeeping()
+		end
+	end
+end
+
+local function step()
+	if not masterOn() then
+		if DOING ~= "Idle" then
+			setDoing("Idle")
+		end
+		task.wait(0.25)
+		return
+	end
+
+	rotationTick()
+
+	if rotationOn() and ROT.active and ROT.phase == "Bar" then
+		if not on("AutoBar", true) then
+			setDoing("Idle")
+			task.wait(0.3)
+			return
+		end
+		setDoing("Training")
+		local slice = math.max(1, math.min(TRAIN_CHUNK, ROT.endsAt - now()))
+		trainSlice(slice)
+		return
+	end
+
+	if not rotationOn() and not flagValue("AutoThrow", true) and on("AutoBar", true) then
+		setDoing("Training")
+		trainSlice(math.min(TRAIN_CHUNK, flagValue("TrainTime", 60)))
+		return
+	end
+
+	if on("AutoPlace", true) then
+		if settlePen(false) then
+			setDoing("Idle")
+			return
+		end
+	elseif heldBaddie() then
+		if now() - TIMERS.hint > 30 then
+			TIMERS.hint = now()
+			log("<Warning>Baddie in hand, Auto place is off</Warning>")
+		end
+		setDoing("Idle")
+		task.wait(0.4)
+		return
+	end
+
+	housekeeping()
+
+	if flagValue("AutoThrow", true) then
+		setDoing("Throwing")
+		local ok, reason = throwOnce()
+		if not ok then
+			if reason ~= "baddie in hand" then
+				log("Throw failed, retrying")
+			end
+			setDoing("Idle")
+			task.wait(0.5)
+		end
+		return
+	end
+
+	setDoing("Idle")
+	task.wait(0.25)
+end
+
+local function mainLoop()
+	while RUNNING do
+		local ok, err = pcall(step)
+		if not ok then
+			log("<Error>Error: " .. tostring(err) .. "</Error>")
+			task.wait(1)
+		end
+		task.wait(0.05)
+	end
+end
+
+----- Diagnostics -----
+
+function diagnose()
+	log("<Accent>Check my game</Accent>")
+	log(string.format("placeId %d, version %s", game.PlaceId, VERSION))
+	local missing = {}
+	for key, path in pairs(REMOTE_PATHS) do
+		if not R[key] then
+			table.insert(missing, path[1] .. "/" .. path[2])
+		end
+	end
+	if #missing == 0 then
+		log("Remotes found")
+	else
+		log("<Warning>Remotes missing: " .. table.concat(missing, ", ") .. "</Warning>")
+	end
+	log(string.format("Throw zone %s", throwZone() and "ok" or "<Error>missing</Error>"))
+	log(string.format("Pen %s, part %s", penModel() and penModel().Name or "<Error>missing</Error>", penPart() and "ok" or "<Error>missing</Error>"))
+	log(string.format("Sell stall %s, bar prompt %s", sellStall() and "ok" or "<Error>missing</Error>", barPrompt() and "ok" or "<Error>missing</Error>"))
+	log(string.format("Meter period %.2f s", METER_PERIOD))
+	log(string.format("Cash %s, strength %d, level %d", formatMoney(getCash()), math.floor(LocalPlayer:GetAttribute("Strength") or 0), math.floor(LocalPlayer:GetAttribute("Level") or 0)))
+	log(string.format("Pen tier %d (%s), slots %d, bar level %d", penTier(), penTierName(), penSlotCount(), math.floor(LocalPlayer:GetAttribute("BarLevel") or 0)))
+	log(string.format("Baddies %d, equipped %d, spare %d, pending %d", #baddieList(), countEquipped(), select(1, spareCounts()), countPending()))
+	log(string.format("Master %s, rotation %s (%s)", tostring(masterOn()), tostring(rotationOn()), ROT.phase))
+end
+
+----- Anti AFK -----
+
+local function startBoostWatcher()
+	if not R.PullUpBoostOffer or not R.PullUpBoostClaim then
+		return
+	end
+	track(R.PullUpBoostOffer.OnClientEvent:Connect(function(token)
+		if not RUNNING or not flagValue("ClaimBoosts", true) then
+			return
+		end
+		task.delay(0.12, function()
+			if RUNNING and training() and R.PullUpBoostClaim then
+				pcall(function()
+					R.PullUpBoostClaim:FireServer(token)
+				end)
+			end
+		end)
+	end))
+end
+
+local function startAntiAfk()
+	if not VirtualUser then
+		return
+	end
+	track(LocalPlayer.Idled:Connect(function()
+		if not RUNNING or not flagValue("StayInGame", true) then
+			return
+		end
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end))
+end
+
+----- Lifecycle -----
+
+function destroy()
+	RUNNING = false
+	pcall(function()
+		stopTraining()
+	end)
+	if GUARD.gui and (GUARD.owned or #GUARD.gui:GetChildren() == 0) then
+		pcall(function()
+			GUARD.gui:Destroy()
+		end)
+	end
+	GUARD.gui = nil
+	GUARD.owned = false
+	for _, connection in ipairs(CONNECTIONS) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(CONNECTIONS)
+	pcall(function()
+		Window:Destroy()
+	end)
+	local genv = getgenv and getgenv() or _G
+	if genv.RobScriptTFFB then
+		genv.RobScriptTFFB = nil
+	end
+end
+
+local genv = getgenv and getgenv() or _G
+genv.RobScriptTFFB = {
+	Version = VERSION,
+	Destroy = destroy,
+	Toggle = function()
+		Window:Toggle()
+	end,
+	Check = function()
+		diagnose()
+	end,
+	SellNow = function()
+		return sellSpare(flagValue("KeepFavorites", true))
+	end,
+	Get = function(name)
+		return flagValue(name, nil)
+	end,
+	Set = function(name, value)
+		local handle = Airflow.Flags[name]
+		if handle then
+			handle:Set(value)
+			return true
+		end
+		return false
+	end,
+}
+
+----- Start -----
+
+if game.PlaceId ~= PLACE_ID and game.GameId ~= GAME_ID then
+	Window:Notify({
+		Title = "Wrong game",
+		Content = "This script is for Throw Food For Baddies",
+		Type = "Warning",
+	})
+	destroy()
+	return
+end
+
+Window:LoadAutoload()
+
+if rotationOn() then
+	rotationStart()
+end
+
+updateThrowGuard()
+startAntiAfk()
+startBoostWatcher()
+
+task.spawn(mainLoop)
+
+log("<Accent>Robscript Team - TFFB</Accent>")
+log("Ready, good luck!")
+
+Window:Notify({
+	Title = "Loaded",
+	Content = "Ready, good luck!",
+	Type = "Success",
+})
