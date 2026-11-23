@@ -1,0 +1,1280 @@
+-- Robscript Team - Symphony Orchestra Simulator
+-- Game: Symphony Orchestra Simulator | placeId 120009540834199 | universeId 10772237634
+-- Window: RightControl | Unload: Settings -> Unload | API: getgenv().RobScriptTS
+--
+-- What it does:
+--   Auto Play - hits every note of your part with perfect timing, hold notes included.
+--   Auto Game - joins the orchestra, takes a free part, votes for the next song and can
+--               force a difficulty, so a session keeps running with no input at all.
+--   Session   - songs played, coins earned, level, XP and live judgement counters.
+--
+-- How it works: judging in this game is fully client side. RhythmClient keeps the
+-- hittable notes in a local list and laneDown(lane) picks the nearest unjudged note of
+-- that lane, compares it with the local song clock and calls registerHit. The script
+-- finds that laneDown closure inside the live client (structural scan over getgc: the
+-- only RhythmClient closure that captures the game Config table, three server clock
+-- numbers and a note list), then calls it on the frames where a note is due. No key
+-- simulation, no remote rewriting, no hooks.
+
+do
+	local existing = getgenv().RobScriptTS
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local VERSION = "1.0.0"
+local RUNNING = true
+local CONNECTIONS = {}
+
+local function track(connection)
+	if connection then
+		table.insert(CONNECTIONS, connection)
+	end
+	return connection
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[Robscript] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+pcall(function()
+	Airflow.ThemePresets.Robscript = THEME
+	Airflow:SetDefaultTheme(THEME)
+end)
+
+local RU_STRINGS = {
+	["autoplay, lobby, session"] = "автоплей, лобби, статистика",
+	["Auto Play"] = "Автоигра нот",
+	["Auto Game"] = "Автоматизация лобби",
+	["Session"] = "Сессия",
+	["Settings"] = "Настройки",
+	["Playback"] = "Исполнение",
+	["Lobby"] = "Лобби",
+	["Live"] = "Сейчас",
+	["Progress"] = "Прогресс",
+	["Activity"] = "Действия",
+	["Diagnostics"] = "Диагностика",
+	["Play every note of your part"] = "Играет все ноты вашей партии",
+	["Timing offset"] = "Смещение тайминга",
+	["Natural timing"] = "Живой тайминг",
+	["Jitter"] = "Разброс",
+	["Auto Join"] = "Вступать в оркестр",
+	["Preferred part"] = "Желаемая партия",
+	["Auto Vote"] = "Голосовать за песню",
+	["Vote strategy"] = "Стратегия голоса",
+	["Difficulty"] = "Сложность",
+	["Force everything on"] = "Включить всё",
+	["Unload"] = "Выгрузить",
+	["Phase"] = "Фаза",
+	["Song"] = "Песня",
+	["Your part"] = "Ваша партия",
+	["Judgements"] = "Попадания",
+	["Accuracy"] = "Точность",
+	["Combo"] = "Комбо",
+	["Score"] = "Счёт",
+	["Notes in flight"] = "Нот в полёте",
+	["Songs played"] = "Песен сыграно",
+	["Coins earned"] = "Монет заработано",
+	["Level"] = "Уровень",
+	["Title"] = "Титул",
+	["Rank"] = "Ранг",
+	["Idle"] = "Ожидание",
+	["OK"] = "Готово",
+}
+
+pcall(function()
+	Airflow:AddLanguage("ru", {
+		Name = "Русский",
+		Flag = "ru",
+		Strings = RU_STRINGS,
+	})
+end)
+
+----- Game access -----
+
+local Orchestra = ReplicatedStorage:FindFirstChild("Orchestra") or ReplicatedStorage:WaitForChild("Orchestra", 30)
+
+if not Orchestra then
+	error("[Robscript] Orchestra folder not found - is this Symphony Orchestra Simulator?")
+end
+
+local Config = nil
+do
+	local ok, result = pcall(function()
+		return require(Orchestra:WaitForChild("Config"))
+	end)
+	if ok and type(result) == "table" then
+		Config = result
+	end
+end
+
+if not Config then
+	error("[Robscript] Orchestra Config could not be required")
+end
+
+local Remotes = Orchestra:WaitForChild("Remotes")
+local RequestRemote = Remotes:WaitForChild("Request")
+local StateRemote = Remotes:WaitForChild("State")
+
+local SongCache = nil
+pcall(function()
+	SongCache = require(Orchestra:WaitForChild("SongCache"))
+end)
+
+----- Settings mirrored from the UI -----
+
+local settings = {
+	autoplay = false,
+	offsetMs = 0,
+	naturalTiming = false,
+	jitterMs = 0,
+	autoJoin = true,
+	autoVote = true,
+	preferredPart = "Any",
+	voteStrategy = "Best grade gap",
+	forcedDifficulty = "Keep",
+}
+
+-- Airflow only runs an element callback on real interaction, and a loaded config
+-- changes element values without calling it. The logic therefore re-reads the live
+-- element values instead of trusting the callbacks alone.
+local syncFromUI = function() end
+
+----- Runtime state -----
+
+local runtime = {
+	laneDown = nil,
+	resolveNote = "",
+	notesIndex = nil,
+	statsIndex = nil,
+	state = nil,
+	startTime = nil,
+	songId = nil,
+	phase = "",
+	part = nil,
+	stats = nil,
+	hits = 0,
+	attempts = 0,
+	errors = 0,
+	songsPlayed = 0,
+	coinsAtStart = nil,
+	lastRound = nil,
+	lastVoteKey = nil,
+	votedFor = nil,
+	lastDifficultyAt = 0,
+	clockSource = "none",
+	resolvedAt = 0,
+}
+
+local session = {
+	songs = 0,
+	coinsStart = LocalPlayer:GetAttribute("OrchestraCoins") or 0,
+}
+
+----- Upvalue access -----
+
+local valueOnlyUpvalues = false
+do
+	local token = {}
+	local probe = function()
+		return token
+	end
+	local pack = table.pack(pcall(debug.getupvalue, probe, 1))
+	if pack[1] then
+		if rawequal(pack[2], token) then
+			valueOnlyUpvalues = true
+		elseif rawequal(pack[3], token) then
+			valueOnlyUpvalues = false
+		else
+			valueOnlyUpvalues = (pack.n < 3)
+		end
+	end
+end
+
+local function readUpvalue(target, index)
+	local ok, first, second = pcall(debug.getupvalue, target, index)
+	if not ok then
+		return false, nil
+	end
+	if valueOnlyUpvalues then
+		return true, first
+	end
+	return true, second
+end
+
+----- Finding laneDown inside the live client -----
+
+local SOURCE_SUFFIX = "PlayerScripts.RhythmClient"
+
+local function looksLikeConfig(value)
+	return type(value) == "table" and value.PerfectWindow ~= nil and value.GoodWindow ~= nil and value.SoloBonus ~= nil
+end
+
+local function looksLikeSong(value)
+	return type(value) == "table" and (value.SecondsPerBeat ~= nil or value.Title ~= nil) and value.Charts ~= nil
+end
+
+local function isServerClock(value)
+	return type(value) == "number" and value > 1.0e9 and value < 4.0e9
+end
+
+local function collectCandidates()
+	if type(getgc) ~= "function" then
+		return nil, "getgc is not available in this executor"
+	end
+
+	local found = {}
+	local ok, err = pcall(function()
+		for _, item in ipairs(getgc()) do
+			if type(item) == "function" then
+				local okInfo, source = pcall(debug.info, item, "s")
+				if okInfo and type(source) == "string" and #source >= #SOURCE_SUFFIX then
+					if string.sub(source, -#SOURCE_SUFFIX) == SOURCE_SUFFIX then
+						table.insert(found, item)
+					end
+				end
+			end
+		end
+	end)
+
+	if not ok then
+		return nil, tostring(err)
+	end
+
+	return found, nil
+end
+
+local function resolveLaneDown()
+	local candidates, collectError = collectCandidates()
+
+	if not candidates then
+		runtime.resolveNote = tostring(collectError)
+		return nil
+	end
+
+	local best = nil
+	local bestScore = -math.huge
+
+	for _, candidate in ipairs(candidates) do
+		local total = 0
+		local functions = 0
+		local instances = 0
+		local clocks = 0
+		local hasConfig = false
+		local hasSong = false
+
+		for index = 1, 64 do
+			local ok, value = readUpvalue(candidate, index)
+			if not ok then
+				break
+			end
+			if value ~= nil then
+				total = total + 1
+				local kind = typeof(value)
+				if kind == "table" then
+					if rawequal(value, Config) or looksLikeConfig(value) then
+						hasConfig = true
+					end
+					if looksLikeSong(value) then
+						hasSong = true
+					end
+				elseif kind == "function" then
+					functions = functions + 1
+				elseif kind == "Instance" then
+					instances = instances + 1
+				elseif kind == "number" and isServerClock(value) then
+					clocks = clocks + 1
+				end
+			end
+		end
+
+		if hasConfig and not hasSong and total >= 12 and total <= 24 and functions >= 2 and clocks >= 2 then
+			local score = 100 - math.abs(total - 16) * 5 + clocks * 2 + functions
+			if score > bestScore then
+				bestScore = score
+				best = candidate
+			end
+		end
+	end
+
+	if not best then
+		runtime.resolveNote = string.format("no candidate among %d RhythmClient closures", #candidates)
+		return nil
+	end
+
+	runtime.laneDown = best
+	runtime.notesIndex = nil
+	runtime.statsIndex = nil
+	runtime.resolvedAt = os.clock()
+	runtime.resolveNote = string.format("resolved (%d closures)", #candidates)
+	return best
+end
+
+----- Reading the live note list and counters -----
+
+local function resolveIndexes()
+	local laneDown = runtime.laneDown
+	if not laneDown then
+		return
+	end
+
+	for index = 1, 32 do
+		local ok, value = readUpvalue(laneDown, index)
+		if not ok then
+			break
+		end
+		if type(value) == "table" then
+			if runtime.statsIndex == nil and value.Perfect ~= nil and value.Score ~= nil and value.Miss ~= nil then
+				runtime.statsIndex = index
+			end
+			if runtime.notesIndex == nil then
+				local first = rawget(value, 1)
+				if type(first) == "table" and first.Time ~= nil and first.Lane ~= nil then
+					runtime.notesIndex = index
+				end
+			end
+		end
+	end
+end
+
+local function getNotes()
+	if not runtime.laneDown then
+		return nil
+	end
+
+	if runtime.notesIndex then
+		local ok, value = readUpvalue(runtime.laneDown, runtime.notesIndex)
+		if ok and type(value) == "table" then
+			return value
+		end
+		runtime.notesIndex = nil
+	end
+
+	resolveIndexes()
+
+	if runtime.notesIndex then
+		local ok, value = readUpvalue(runtime.laneDown, runtime.notesIndex)
+		if ok and type(value) == "table" then
+			return value
+		end
+	end
+
+	return nil
+end
+
+local function getStats()
+	if not runtime.laneDown or not runtime.statsIndex then
+		resolveIndexes()
+	end
+	if not runtime.laneDown or not runtime.statsIndex then
+		return nil
+	end
+	local ok, value = readUpvalue(runtime.laneDown, runtime.statsIndex)
+	if ok and type(value) == "table" then
+		return value
+	end
+	runtime.statsIndex = nil
+	return nil
+end
+
+----- Song clock -----
+
+local function audioOffsetSeconds()
+	local playerOffset = LocalPlayer:GetAttribute("OrchestraAudioOffset") or 0
+	if type(playerOffset) ~= "number" then
+		playerOffset = 0
+	end
+	local base = Config.AudioOffset or 0
+	if type(base) ~= "number" then
+		base = 0
+	end
+	return base + playerOffset / 1000
+end
+
+local function songClock()
+	local start = runtime.startTime
+	if not start then
+		return nil
+	end
+	return Workspace:GetServerTimeNow() - start - audioOffsetSeconds()
+end
+
+----- Server state mirror -----
+
+local function partLabel(part)
+	if not part or part == "" then
+		return "-"
+	end
+	local ok, label = pcall(function()
+		return Config.DisplayName(part)
+	end)
+	if ok and type(label) == "string" and label ~= "" then
+		return label
+	end
+	return tostring(part)
+end
+
+local function songLabel(songId)
+	if not songId then
+		return "-"
+	end
+	if SongCache then
+		local ok, title = pcall(function()
+			return SongCache.Info(songId)
+		end)
+		if ok and type(title) == "string" and title ~= "" then
+			return title
+		end
+	end
+	return tostring(songId)
+end
+
+local function mySeat(state)
+	local seats = state and state.Seats
+	if type(seats) ~= "table" then
+		return nil
+	end
+	for part, userId in pairs(seats) do
+		if userId == LocalPlayer.UserId then
+			return part
+		end
+	end
+	return nil
+end
+
+local ActivityLog = nil
+
+local function log(text)
+	if ActivityLog then
+		pcall(function()
+			ActivityLog:Push(text)
+		end)
+	end
+end
+
+local function onState(payload)
+	if type(payload) ~= "table" then
+		return
+	end
+
+	runtime.state = payload
+	runtime.phase = tostring(payload.Phase or "")
+	runtime.songId = payload.SongId
+	runtime.part = mySeat(payload)
+
+	if payload.Phase == "Playing" then
+		if payload.Round ~= runtime.lastRound then
+			runtime.lastRound = payload.Round
+			runtime.startTime = nil
+			session.songs = session.songs + 1
+			log(string.format("<Muted>now playing:</Muted> %s", songLabel(payload.SongId)))
+		end
+		if payload.StartTime then
+			runtime.startTime = payload.StartTime
+		end
+		runtime.clockSource = runtime.startTime and "state" or "waiting"
+	else
+		runtime.clockSource = "idle"
+	end
+end
+
+track(StateRemote.OnClientEvent:Connect(function(payload)
+	local ok, err = pcall(onState, payload)
+	if not ok then
+		runtime.errors = runtime.errors + 1
+		warn("[Robscript] state handler: " .. tostring(err))
+	end
+end))
+
+----- Auto play -----
+
+local MAX_HIT_LATENESS = 0.12
+
+local function autoplayTick(deltaTime)
+	local laneDown = runtime.laneDown
+	if not laneDown then
+		return
+	end
+
+	local notes = getNotes()
+	if not notes or #notes == 0 then
+		return
+	end
+
+	local clock = songClock()
+	if not clock or clock < -5 or clock > 900 then
+		return
+	end
+
+	local lead = math.min(deltaTime * 0.5, 0.03)
+	if settings.naturalTiming and settings.jitterMs > 0 then
+		lead = lead + (math.random() * 2 - 1) * (settings.jitterMs / 1000)
+	end
+	lead = lead + settings.offsetMs / 1000
+
+	local moment = clock + lead
+	local snapshot = table.clone(notes)
+
+	for index = 1, #snapshot do
+		local note = snapshot[index]
+		if type(note) == "table" and not note.Judged and type(note.Time) == "number" and type(note.Lane) == "number" then
+			local delta = moment - note.Time
+			if delta >= 0 and delta <= MAX_HIT_LATENESS then
+				local ok = pcall(laneDown, note.Lane)
+				if ok then
+					if note.Judged then
+						runtime.hits = runtime.hits + 1
+					else
+						runtime.attempts = runtime.attempts + 1
+					end
+				else
+					runtime.errors = runtime.errors + 1
+				end
+			end
+		end
+	end
+end
+
+----- Automation -----
+
+local GRADE_RANK = { S = 6, A = 5, B = 4, C = 3, D = 2 }
+
+local function myGrades()
+	local map = {}
+	local raw = LocalPlayer:GetAttribute("OrchestraBestGrades")
+	if type(raw) == "string" and raw ~= "" then
+		for songId, grade in string.gmatch(raw, "([%w_]+)=(%a)") do
+			map[songId] = grade
+		end
+	end
+	return map
+end
+
+local function chooseVote(options)
+	if type(options) ~= "table" or #options == 0 then
+		return nil
+	end
+
+	if settings.voteStrategy == "Random" then
+		return options[math.random(#options)]
+	end
+
+	local grades = myGrades()
+	local bestIndex = nil
+	local bestRank = math.huge
+
+	for index, songId in ipairs(options) do
+		local grade = grades[songId]
+		local rank = grade and (GRADE_RANK[grade] or 1) or 0
+
+		if settings.voteStrategy == "Unplayed first" then
+			if grade == nil then
+				return songId
+			end
+		else
+			if rank < bestRank then
+				bestRank = rank
+				bestIndex = index
+			end
+		end
+	end
+
+	if bestIndex then
+		return options[bestIndex]
+	end
+
+	return options[1]
+end
+
+local function pickPart(state)
+	if settings.preferredPart ~= "Any" then
+		return settings.preferredPart
+	end
+
+	local seats = state and state.Seats
+	if type(seats) ~= "table" then
+		seats = {}
+	end
+
+	for _, part in ipairs(Config.PartOrder or {}) do
+		if seats[part] == nil then
+			return part
+		end
+	end
+
+	return ""
+end
+
+local function automationTick()
+	syncFromUI()
+
+	local state = runtime.state
+	if not state then
+		return
+	end
+
+	local phase = tostring(state.Phase or "")
+	local member = LocalPlayer:GetAttribute("OrchestraMember")
+	local seat = mySeat(state)
+	runtime.part = seat
+
+	if settings.autoJoin and (phase == "Lobby" or phase == "Results") then
+		if not member then
+			RequestRemote:FireServer("JoinOrchestra", pickPart(state))
+			log("<Muted>joining the orchestra as</Muted> " .. partLabel(pickPart(state)))
+		elseif not seat then
+			RequestRemote:FireServer("PickPart", pickPart(state))
+			log("<Muted>picking a part:</Muted> " .. partLabel(pickPart(state)))
+		end
+	end
+
+	if settings.autoVote and phase == "Lobby" and type(state.VoteOptions) == "table" and #state.VoteOptions > 0 then
+		local key = table.concat(state.VoteOptions, ",")
+		if key ~= runtime.lastVoteKey then
+			runtime.lastVoteKey = key
+			runtime.votedFor = nil
+		end
+
+		local choice = chooseVote(state.VoteOptions)
+		if choice and choice ~= runtime.votedFor then
+			runtime.votedFor = choice
+			RequestRemote:FireServer("Vote", choice)
+			log("<Muted>voted for</Muted> " .. songLabel(choice))
+		end
+	end
+
+	if settings.forcedDifficulty ~= "Keep" then
+		local current = LocalPlayer:GetAttribute("OrchestraDifficulty")
+		if current ~= settings.forcedDifficulty and (os.clock() - runtime.lastDifficultyAt) > 10 then
+			runtime.lastDifficultyAt = os.clock()
+			RequestRemote:FireServer("SetMyDifficulty", settings.forcedDifficulty)
+			log("<Muted>difficulty set to</Muted> " .. tostring(settings.forcedDifficulty))
+		end
+	end
+
+	local stats = getStats()
+	if stats then
+		runtime.stats = {
+			Perfect = stats.Perfect or 0,
+			Good = stats.Good or 0,
+			Miss = stats.Miss or 0,
+			Score = stats.Score or 0,
+			Combo = stats.Combo or 0,
+			MaxCombo = stats.MaxCombo or 0,
+		}
+	end
+end
+
+----- Resolve + loops -----
+
+resolveLaneDown()
+
+task.spawn(function()
+	if not runtime.laneDown and RUNNING then
+		for _ = 1, 30 do
+			if not RUNNING then
+				return
+			end
+			task.wait(1)
+			if resolveLaneDown() then
+				break
+			end
+		end
+	end
+end)
+
+track(RunService.PreRender:Connect(function(deltaTime)
+	if not RUNNING or not settings.autoplay then
+		return
+	end
+	if not runtime.laneDown then
+		return
+	end
+	local ok, err = pcall(autoplayTick, deltaTime)
+	if not ok then
+		runtime.errors = runtime.errors + 1
+		warn("[Robscript] autoplay: " .. tostring(err))
+		if runtime.errors > 25 then
+			runtime.errors = 0
+			settings.autoplay = false
+			local handle = Airflow.Flags and Airflow.Flags.Autoplay
+			if handle and type(handle.Set) == "function" then
+				pcall(function()
+					handle:Set(false, true)
+				end)
+			end
+			log("<Error>Auto Play stopped after repeated errors</Error>")
+		end
+	end
+end))
+
+task.spawn(function()
+	while RUNNING do
+		local ok, err = pcall(automationTick)
+		if not ok then
+			warn("[Robscript] automation: " .. tostring(err))
+		end
+		task.wait(0.75)
+	end
+end)
+
+task.spawn(function()
+	task.wait(1.5)
+	pcall(function()
+		RequestRemote:FireServer("Sync")
+	end)
+end)
+
+----- UI -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript",
+	LoadingSubtitle = "symphony orchestra, autoplay",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(800, 560),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobscriptOrchestra" },
+	Home = {
+		Title = "Symphony Orchestra",
+		Welcome = "Welcome back,",
+		Tier = "v" .. VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Executor" },
+	},
+})
+
+local function accuracyText()
+	local stats = runtime.stats
+	if not stats then
+		return "-"
+	end
+	local judged = stats.Perfect + stats.Good + stats.Miss
+	if judged == 0 then
+		return "100.0%"
+	end
+	return string.format("%.1f%%", (stats.Perfect + stats.Good * 0.6) / judged * 100)
+end
+
+local function phaseText()
+	local phase = runtime.phase
+	if phase == "Playing" then
+		return "<Success>Playing</Success>"
+	elseif phase == "Lobby" then
+		return "<Muted>Lobby</Muted>"
+	elseif phase == "Results" then
+		return "<Muted>Results</Muted>"
+	elseif phase == "" then
+		return "<Muted>Idle</Muted>"
+	end
+	return "<Muted>" .. phase .. "</Muted>"
+end
+
+----- Tab: Auto Play -----
+
+local PlayTab = Window:CreateTab({ Name = "Auto Play", Icon = "music" })
+local PlayBox = PlayTab:CreateGroupbox({ Name = "Playback", Side = "Left" })
+local LiveBox = PlayTab:CreateGroupbox({ Name = "Live", Side = "Right" })
+
+PlayBox:CreateToggle({
+	Name = "Auto Play",
+	Desc = "Play every note of your part",
+	Flag = "Autoplay",
+	CurrentValue = false,
+	Callback = function(value)
+		settings.autoplay = value
+		if value then
+			if not runtime.laneDown then
+				resolveLaneDown()
+			end
+			log("<Success>Auto Play on</Success>")
+		else
+			log("<Muted>Auto Play off</Muted>")
+		end
+	end,
+})
+
+PlayBox:CreateSlider({
+	Name = "Timing offset",
+	Range = { -100, 100 },
+	Increment = 5,
+	Suffix = " ms",
+	CurrentValue = 0,
+	Flag = "TimingOffset",
+	Callback = function(value)
+		settings.offsetMs = value
+	end,
+})
+
+PlayBox:CreateToggle({
+	Name = "Natural timing",
+	Desc = "Small random spread on every hit",
+	Flag = "NaturalTiming",
+	CurrentValue = false,
+	Callback = function(value)
+		settings.naturalTiming = value
+	end,
+})
+
+PlayBox:CreateSlider({
+	Name = "Jitter",
+	Range = { 0, 40 },
+	Increment = 5,
+	Suffix = " ms",
+	CurrentValue = 15,
+	Flag = "Jitter",
+	Callback = function(value)
+		settings.jitterMs = value
+	end,
+})
+
+LiveBox:CreateStatus({
+	Name = "Phase",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = phaseText,
+})
+
+LiveBox:CreateStatus({
+	Name = "Song",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return songLabel(runtime.songId)
+	end,
+})
+
+LiveBox:CreateStatus({
+	Name = "Your part",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return partLabel(runtime.part)
+	end,
+})
+
+LiveBox:CreateStatus({
+	Name = "Judgements",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local stats = runtime.stats
+		if not stats then
+			return "-"
+		end
+		return string.format("%d / %d / %d", stats.Perfect, stats.Good, stats.Miss)
+	end,
+})
+
+LiveBox:CreateStatus({
+	Name = "Accuracy",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = accuracyText,
+})
+
+LiveBox:CreateStatus({
+	Name = "Combo",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local stats = runtime.stats
+		if not stats then
+			return "-"
+		end
+		return string.format("%d (max %d)", stats.Combo, stats.MaxCombo)
+	end,
+})
+
+LiveBox:CreateStatus({
+	Name = "Score",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local stats = runtime.stats
+		return stats and tostring(stats.Score) or "-"
+	end,
+})
+
+LiveBox:CreateStatus({
+	Name = "Notes in flight",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local notes = getNotes()
+		return notes and tostring(#notes) or "-"
+	end,
+})
+
+----- Tab: Auto Game -----
+
+local AutoTab = Window:CreateTab({ Name = "Auto Game", Icon = "repeat" })
+local LobbyBox = AutoTab:CreateGroupbox({ Name = "Lobby", Side = "Left" })
+local SessionBox = AutoTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+
+LobbyBox:CreateToggle({
+	Name = "Auto Join",
+	Desc = "Join the orchestra and take a free part",
+	Flag = "AutoJoin",
+	CurrentValue = true,
+	Callback = function(value)
+		settings.autoJoin = value
+	end,
+})
+
+local PARTS = { "Any" }
+for _, part in ipairs(Config.PartOrder or {}) do
+	table.insert(PARTS, part)
+end
+
+LobbyBox:CreateDropdown({
+	Name = "Preferred part",
+	Options = PARTS,
+	CurrentOption = "Any",
+	Flag = "PreferredPart",
+	Callback = function(value)
+		settings.preferredPart = value
+	end,
+})
+
+LobbyBox:CreateToggle({
+	Name = "Auto Vote",
+	Desc = "Vote for the next song every lobby",
+	Flag = "AutoVote",
+	CurrentValue = true,
+	Callback = function(value)
+		settings.autoVote = value
+	end,
+})
+
+LobbyBox:CreateDropdown({
+	Name = "Vote strategy",
+	Options = { "Best grade gap", "Unplayed first", "Random" },
+	CurrentOption = "Best grade gap",
+	Flag = "VoteStrategy",
+	Callback = function(value)
+		settings.voteStrategy = value
+	end,
+})
+
+LobbyBox:CreateDropdown({
+	Name = "Difficulty",
+	Desc = "Ultra pays 2x coins",
+	Options = { "Keep", "Easy", "Normal", "Extreme", "Ultra" },
+	CurrentOption = "Keep",
+	Flag = "Difficulty",
+	Callback = function(value)
+		settings.forcedDifficulty = value
+	end,
+})
+
+	LobbyBox:CreateButton({
+	Name = "Force everything on",
+	Style = "Primary",
+	Callback = function()
+		settings.autoplay = true
+		settings.autoJoin = true
+		settings.autoVote = true
+		if not runtime.laneDown then
+			resolveLaneDown()
+		end
+		local flags = Airflow.Flags
+		if type(flags) == "table" then
+			for _, name in ipairs({ "Autoplay", "AutoJoin", "AutoVote" }) do
+				local handle = flags[name]
+				if handle and type(handle.Set) == "function" then
+					pcall(function()
+						handle:Set(true)
+					end)
+				end
+			end
+		end
+		log("<Success>everything on</Success>")
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Songs played",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(session.songs)
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Coins earned",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local coins = LocalPlayer:GetAttribute("OrchestraCoins") or 0
+		return tostring(math.max(0, coins - session.coinsStart))
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Level",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local level = LocalPlayer:GetAttribute("OrchestraLevel") or 0
+		local into = LocalPlayer:GetAttribute("OrchestraLevelInto") or 0
+		local need = LocalPlayer:GetAttribute("OrchestraLevelNeed") or 0
+		return string.format("%d (%d/%d)", level, into, need)
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Title",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(LocalPlayer:GetAttribute("OrchestraTitle") or "-")
+	end,
+})
+
+SessionBox:CreateStatus({
+	Name = "Rank",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(LocalPlayer:GetAttribute("OrchestraRank") or "-")
+	end,
+})
+
+ActivityLog = SessionBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 200,
+	MaxRows = 8,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----- Tab: Info -----
+
+local InfoTab = Window:CreateTab({ Name = "Info", Icon = "info" })
+local DiagBox = InfoTab:CreateGroupbox({ Name = "Diagnostics", Side = "Left" })
+local ToolsBox = InfoTab:CreateGroupbox({ Name = "Tools", Side = "Right" })
+
+ToolsBox:CreateButton({
+	Name = "Rescan game functions",
+	Callback = function()
+		if resolveLaneDown() then
+			log("<Success>laneDown resolved</Success>")
+		else
+			log("<Error>laneDown not found: </Error>" .. runtime.resolveNote)
+		end
+	end,
+})
+
+ToolsBox:CreateButton({
+	Name = "Unload",
+	Style = "Primary",
+	Confirm = true,
+	Callback = function()
+		local existing = getgenv().RobScriptTS
+		if type(existing) == "table" and type(existing.Destroy) == "function" then
+			existing.Destroy()
+		end
+	end,
+})
+
+DiagBox:CreateStatus({
+	Name = "Hit function",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if runtime.laneDown then
+			return "<Success>resolved</Success>"
+		end
+		return "<Error>missing</Error>"
+	end,
+})
+
+DiagBox:CreateStatus({
+	Name = "Note list",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if runtime.notesIndex then
+			return "index " .. runtime.notesIndex
+		end
+		return "<Muted>waiting</Muted>"
+	end,
+})
+
+DiagBox:CreateStatus({
+	Name = "Clock",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if runtime.startTime then
+			return string.format("%s, %.1fs in", runtime.clockSource, (Workspace:GetServerTimeNow() - runtime.startTime))
+		end
+		return "<Muted>" .. runtime.clockSource .. "</Muted>"
+	end,
+})
+
+DiagBox:CreateStatus({
+	Name = "Notes hit",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("%d (%d skipped)", runtime.hits, runtime.attempts)
+	end,
+})
+
+DiagBox:CreateParagraph({
+	Title = "How this works",
+	Content = "Judging in this game is client side: laneDown(lane) picks the nearest unjudged note of that lane and compares it with the local song clock. The script finds that function inside the running client and calls it on the frame where each note is due. No keys are simulated and no remote is rewritten.",
+})
+
+DiagBox:CreateStatus({
+	Name = "Resolution",
+	Style = "Plain",
+	UpdateRate = 2,
+	Update = function()
+		return tostring(runtime.resolveNote)
+	end,
+})
+
+----- Tab: Settings -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----- Public API -----
+
+local FLAG_MAP = {
+	{ flag = "Autoplay", key = "autoplay" },
+	{ flag = "TimingOffset", key = "offsetMs" },
+	{ flag = "NaturalTiming", key = "naturalTiming" },
+	{ flag = "Jitter", key = "jitterMs" },
+	{ flag = "AutoJoin", key = "autoJoin" },
+	{ flag = "AutoVote", key = "autoVote" },
+	{ flag = "PreferredPart", key = "preferredPart" },
+	{ flag = "VoteStrategy", key = "voteStrategy" },
+	{ flag = "Difficulty", key = "forcedDifficulty" },
+}
+
+syncFromUI = function()
+	local flags = Airflow.Flags
+	if type(flags) ~= "table" then
+		return
+	end
+	for _, entry in ipairs(FLAG_MAP) do
+		local handle = flags[entry.flag]
+		if handle and type(handle.Get) == "function" then
+			local ok, value = pcall(function()
+				return handle:Get()
+			end)
+			if ok and value ~= nil then
+				settings[entry.key] = value
+			end
+		end
+	end
+end
+
+local api = {}
+
+function api.Destroy()
+	if not RUNNING then
+		return
+	end
+	RUNNING = false
+	for _, connection in ipairs(CONNECTIONS) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	CONNECTIONS = {}
+	pcall(function()
+		Window:Destroy()
+	end)
+	if getgenv().RobScriptTS == api then
+		getgenv().RobScriptTS = nil
+	end
+end
+
+api.Window = Window
+api.Runtime = runtime
+api.Airflow = Airflow
+api.Settings = settings
+
+function api.Resolve()
+	return resolveLaneDown()
+end
+
+getgenv().RobScriptTS = api
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+syncFromUI()
+
+Window:Notify({
+	Title = "Loaded",
+	Content = "Symphony Orchestra ready. Auto Play hits every note.",
+	Type = "Success",
+})
+
+if not runtime.laneDown then
+	Window:Notify({
+		Title = "Game not recognised",
+		Content = "The note function was not found. Press Rescan in Settings.",
+		Type = "Warning",
+	})
+end
