@@ -1,0 +1,1756 @@
+-- Robscript Team - Forest Arena
+-- Game: Forest Arena | placeId 114049917609380
+-- Window: RightControl | Unload: Settings -> Unload | API: getgenv().RobScriptFA
+--
+-- What it does:
+--   Visuals  - player, loot, animal, resource and water ESP built from the game's own
+--              attributes (CombatStats, Highlightable loot, Wildlife species).
+--   Survival - live hunger/thirst/oxygen/health readout plus auto eat, drink, heal and
+--              craft through the game's own server calls (ConsumeItem / CraftItem).
+--   Combat   - aim assist with FOV circle; shots are redirected by patching the game's
+--              CameraRig.aimPoint, the same function the game uses to build ShotFired.
+--   World    - phase, alive count, barrier timer, disasters, nearest water, map info.
+--
+-- Everything client side. Health, hunger, inventory and the AntiCheat are server owned,
+-- so the hub never fakes values: movement cheats are deliberately absent because the
+-- game rewrites WalkSpeed and counts strikes.
+
+do
+	local existing = getgenv().RobScriptFA
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local STOP = false
+local CONNECTIONS = {}
+
+local function track(connection)
+	if connection then
+		table.insert(CONNECTIONS, connection)
+	end
+	return connection
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript FA] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Language -----
+
+Airflow:AddLanguage("ru", {
+	Name = "Русский",
+	Flag = "ru",
+	Strings = {
+		["visuals, survival, combat"] = "визуалы, выживание, бой",
+		["Visuals"] = "Визуалы",
+		["Survival"] = "Выживание",
+		["Combat"] = "Бой",
+		["World"] = "Мир",
+		["Settings"] = "Настройки",
+		["Players"] = "Игроки",
+		["Player ESP"] = "ESP игроков",
+		["Boxes names, health, weapon and distance"] = "Имена, здоровье, оружие и дистанция",
+		["Health"] = "Здоровье",
+		["Weapon"] = "Оружие",
+		["Distance"] = "Дистанция",
+		["Loot"] = "Лут",
+		["Loot ESP"] = "ESP лута",
+		["Ground items and resources, filtered by type"] = "Предметы на земле и ресурсы, с фильтром по типу",
+		["Types"] = "Типы",
+		["Range"] = "Дальность",
+		["# studs"] = "# стадов",
+		["Max markers"] = "Лимит маркеров",
+		["Pick up loot"] = "Подбирать лут",
+		["Grabs nearby loot and resources through the game prompt"] = "Подбирает лут и ресурсы игровым промптом",
+		["Pickup range"] = "Радиус подбора",
+		["Animals"] = "Животные",
+		["Animal ESP"] = "ESP животных",
+		["Species, health and distance for every animal"] = "Вид, здоровье и дистанция для каждого зверя",
+		["Hostile color"] = "Цвет хищников",
+		["Water"] = "Вода",
+		["Water ESP"] = "ESP воды",
+		["Marks every water source around you"] = "Помечает все источники воды рядом",
+		["Meters"] = "Показатели",
+		["Vitals"] = "Живучесть",
+		["Hunger"] = "Голод",
+		["Thirst"] = "Жажда",
+		["Oxygen"] = "Кислород",
+		["Stamina"] = "Станина",
+		["Alive"] = "Жив",
+		["Automation"] = "Автоматизация",
+		["Auto eat"] = "Авто-еда",
+		["Eats the best food when hunger drops below the threshold"] = "Ест лучшую еду, когда голод ниже порога",
+		["Auto drink"] = "Авто-питьё",
+		["Drinks from a bottle when thirst drops below the threshold"] = "Пьёт из фляги, когда жажда ниже порога",
+		["Auto heal"] = "Авто-лечение",
+		["Uses medicine and bandages when health drops"] = "Использует аптечку и бинты при низком здоровье",
+		["Auto craft"] = "Авто-крафт",
+		["Crafts ammo, bandages and a torch at a crafting station"] = "Крафтит патроны, бинты и факел у станции",
+		["Eat below"] = "Есть при",
+		["Drink below"] = "Пить при",
+		["Heal below"] = "Лечиться при",
+		["Aim"] = "Прицел",
+		["Aim assist"] = "Аим-ассист",
+		["Redirects your shots to the closest target inside the FOV"] = "Наводит выстрелы на ближайшую цель внутри FOV",
+		["Aim part"] = "Точка прицела",
+		["Head"] = "Голова",
+		["Chest"] = "Корпус",
+		["FOV"] = "FOV",
+		["# deg"] = "# град",
+		["Only while aiming"] = "Только при прицеливании",
+		["Field of view circle"] = "Круг FOV",
+		["Target"] = "Цель",
+		["Match"] = "Матч",
+		["Phase"] = "Фаза",
+		["Map"] = "Карта",
+		["Barrier"] = "Барьер",
+		["Barrier timer"] = "Таймер барьера",
+		["Distance to the safe zone edge"] = "Дистанция до края безопасной зоны",
+		["Disasters"] = "Бедствия",
+		["Weather and disaster alerts"] = "Погода и предупреждения о бедствиях",
+		["Water finder"] = "Поиск воды",
+		["Nearest water sources"] = "Ближайшие источники воды",
+		["Status"] = "Статус",
+		["State"] = "Состояние",
+		["Loading game data"] = "Загружаю данные игры",
+		["Ready"] = "Готов",
+		["Idle"] = "Ожидание",
+		["Running"] = "Работает",
+		["Unload"] = "Выгрузить",
+		["Removes the hub and restores the game"] = "Убирает хаб и возвращает игру",
+		["Configs"] = "Конфиги",
+		["Theme"] = "Тема",
+		["Activity"] = "Активность",
+		["Nothing yet"] = "Пока пусто",
+		["Loaded"] = "Загружено",
+		["Forest Arena hub is ready"] = "Хаб Forest Arena готов",
+		["No target"] = "Нет цели",
+		["None"] = "Нет",
+		["Safe"] = "Безопасно",
+		["Outside the zone"] = "Вне зоны",
+		["Barrier closing"] = "Барьер сжимается",
+		["Aimed"] = "Наведён",
+		["Ate %s"] = "Съедено: %s",
+		["Drank water"] = "Выпил воду",
+		["Healed with %s"] = "Полечился: %s",
+		["Crafted %s"] = "Скрафчено: %s",
+		["Tornado"] = "Торнадо",
+		["Meteor"] = "Метеор",
+		["Storm"] = "Гроза",
+		["Famine"] = "Голод",
+		["Drought"] = "Засуха",
+		["Forest fire"] = "Лесной пожар",
+		["Rain"] = "Дождь",
+	},
+})
+
+----- Game data -----
+
+local Shared = ReplicatedStorage:FindFirstChild("Shared")
+
+local function need(path)
+	if not Shared then
+		return nil
+	end
+	local node = Shared
+	local ok = pcall(function()
+		for _, part in ipairs(path) do
+			node = node[part]
+		end
+	end)
+	return ok and node or nil
+end
+
+local function optional(path)
+	local module = need(path)
+	if not module then
+		return nil
+	end
+	local ok, result = pcall(function()
+		return require(module)
+	end)
+	if ok then
+		return result
+	end
+	return nil
+end
+
+local Entity = optional({ "types", "Entity" })
+local Meters = optional({ "survival", "Meters" })
+local Items = optional({ "constants", "Items" })
+local Survival = optional({ "constants", "Survival" })
+local Movement = optional({ "constants", "Movement" })
+local Crafting = optional({ "constants", "Crafting" })
+local Inventory = optional({ "constants", "Inventory" })
+local BarrierConst = optional({ "constants", "Barrier" })
+local WildlifeConst = optional({ "constants", "Wildlife" })
+
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts", 20)
+local Network = nil
+local InventoryClient = nil
+local CameraRig = nil
+
+local function loadClientModule(folder, name)
+	if not PlayerScripts then
+		return nil
+	end
+	local node = PlayerScripts
+	if folder then
+		for _, part in ipairs(folder) do
+			local child = node:FindFirstChild(part)
+			if not child then
+				return nil
+			end
+			node = child
+		end
+	end
+	local module = node:FindFirstChild(name)
+	if not module then
+		return nil
+	end
+	local ok, result = pcall(function()
+		return require(module)
+	end)
+	return ok and result or nil
+end
+
+Network = loadClientModule({ "common" }, "Network")
+InventoryClient = loadClientModule({ "common", "items" }, "InventoryClient")
+CameraRig = loadClientModule({ "common", "camera" }, "CameraRig")
+
+local ATTR = (Entity and Entity.Attr) or {
+	Health = "Health",
+	MaxHealth = "MaxHealth",
+	Hunger = "Hunger",
+	Thirst = "Thirst",
+	Oxygen = "Oxygen",
+	MeterAt = "MeterAt",
+	Equipped = "Equipped",
+	Status = "Status",
+	Perks = "Perks",
+	Species = "Species",
+	Locked = "Locked",
+	Drawing = "Drawing",
+	StaminaAnchor = "StaminaAnchor",
+	Sprinting = "Sprinting",
+	TorchLit = "TorchLit",
+}
+
+local HOSTILE_SPECIES = {
+	Wolf = true,
+	Panther = true,
+	Bear = true,
+	PolarBear = true,
+	Alligator = true,
+	Shark = true,
+	Wasp = true,
+	Mosquito = true,
+	Snake = true,
+	Zombie = true,
+	Bat = true,
+}
+
+local CATEGORY_COLORS = {
+	Weapon = Color3.fromRGB(255, 86, 86),
+	Ammo = Color3.fromRGB(255, 190, 60),
+	Consumable = Color3.fromRGB(96, 220, 140),
+	Resource = Color3.fromRGB(120, 180, 255),
+	Utility = Color3.fromRGB(198, 140, 255),
+	Upgrade = Color3.fromRGB(110, 255, 255),
+}
+
+local CATEGORY_NAMES = { "Weapons", "Ammo", "Consumables", "Resources", "Utility" }
+local CATEGORY_KIND = {
+	Weapons = "Weapon",
+	Ammo = "Ammo",
+	Consumables = "Consumable",
+	Resources = "Resource",
+	Utility = "Utility",
+}
+
+local FOOD_PRIORITY = { "Cooked Meat", "Corn", "Bread", "Coconut", "Crab", "Mushroom", "Apple", "Raw Meat", "Blackberry", "Blueberry", "Grape", "Darkberry" }
+local HEAL_PRIORITY = { "Medicine", "Bandage" }
+local DRINK_ITEMS = { "Bottle" }
+
+----- Helpers -----
+
+local function flag(name, fallback)
+	if not Airflow.Flags then
+		return fallback
+	end
+	local handle = Airflow.Flags[name]
+	if not handle then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		if type(handle.Get) == "function" then
+			return handle:Get()
+		end
+		return handle.Value
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function character()
+	local current = LocalPlayer.Character
+	if not current or not current.Parent then
+		return nil
+	end
+	return current
+end
+
+local function rootPart()
+	local current = character()
+	if not current then
+		return nil
+	end
+	return current:FindFirstChild("HumanoidRootPart")
+end
+
+local function humanoid()
+	local current = character()
+	if not current then
+		return nil
+	end
+	return current:FindFirstChildOfClass("Humanoid")
+end
+
+local function statsOf(model)
+	if not model then
+		return nil
+	end
+	local stats = model:FindFirstChild("CombatStats")
+	if stats and stats:IsA("Configuration") then
+		return stats
+	end
+	return nil
+end
+
+local function positionOf(model)
+	if not model then
+		return nil
+	end
+	local part = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+	if part and part:IsA("BasePart") then
+		return part.Position
+	end
+	return nil
+end
+
+local function nearest(position, list)
+	local best, bestDistance = nil, math.huge
+	for _, entry in ipairs(list) do
+		if entry.position then
+			local distance = (entry.position - position).Magnitude
+			if distance < bestDistance then
+				best, bestDistance = entry, distance
+			end
+		end
+	end
+	return best, bestDistance
+end
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return tostring(math.floor(studs))
+end
+
+----- ESP engine -----
+
+local ESP = {
+	groups = {},
+	connections = {},
+}
+
+local function ensureGroup(name, options)
+	local group = ESP.groups[name]
+	if not group then
+		group = {
+			options = options,
+			entries = {},
+		}
+		ESP.groups[name] = group
+	end
+	return group
+end
+
+local function removeEntry(group, instance)
+	local entry = group.entries[instance]
+	if not entry then
+		return
+	end
+	if entry.gui then
+		entry.gui:Destroy()
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	group.entries[instance] = nil
+end
+
+local function createEntry(group, instance)
+	local options = group.options
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "RT_ESP"
+	gui.Adornee = instance
+	gui.AlwaysOnTop = true
+	gui.LightInfluence = 0
+	gui.ResetOnSpawn = false
+	gui.Size = options.size or UDim2.fromOffset(150, 24)
+	gui.StudsOffset = options.offset or Vector3.new(0, 2.2, 0)
+	gui.MaxDistance = options.maxDistance or 600
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Text"
+	label.BackgroundTransparency = 0.45
+	label.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+	label.BorderSizePixel = 0
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = options.textSize or 12
+	label.TextColor3 = options.color or Color3.fromRGB(255, 255, 255)
+	label.TextStrokeTransparency = 0.65
+	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	label.Text = ""
+	label.Parent = gui
+	gui.Parent = instance
+
+	local highlight
+	if options.highlight then
+		highlight = Instance.new("Highlight")
+		highlight.Name = "RT_ESP_HL"
+		highlight.Adornee = instance
+		highlight.FillColor = options.color or Color3.fromRGB(255, 255, 255)
+		highlight.FillTransparency = 0.78
+		highlight.OutlineColor = options.color or Color3.fromRGB(255, 255, 255)
+		highlight.OutlineTransparency = 0.25
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.Parent = instance
+	end
+
+	local entry = { gui = gui, label = label, highlight = highlight }
+	group.entries[instance] = entry
+	return entry
+end
+
+local function syncGroup(name, wanted)
+	local group = ensureGroup(name, ESP.groups[name] and ESP.groups[name].options or {
+		color = Color3.fromRGB(255, 255, 255),
+	})
+	local seen = {}
+	for instance, data in pairs(wanted) do
+		if instance and instance.Parent then
+			seen[instance] = true
+			local entry = group.entries[instance]
+			if not entry or entry.gui == nil or entry.gui.Adornee ~= instance or entry.gui.Parent == nil then
+				removeEntry(group, instance)
+				entry = createEntry(group, instance)
+			end
+			if entry and entry.label then
+				entry.label.Text = data.text
+				if data.color then
+					entry.label.TextColor3 = data.color
+				end
+				if entry.highlight and data.color then
+					entry.highlight.FillColor = data.color
+					entry.highlight.OutlineColor = data.color
+				end
+			end
+		end
+	end
+	for instance in pairs(group.entries) do
+		if not seen[instance] then
+			removeEntry(group, instance)
+		end
+	end
+end
+
+local function clearGroup(name)
+	local group = ESP.groups[name]
+	if not group then
+		return
+	end
+	for instance in pairs(group.entries) do
+		removeEntry(group, instance)
+	end
+end
+
+local function espRange()
+	return flag("EspRange", 500)
+end
+
+----- Scanners -----
+
+local function playerStats(player)
+	local current = player.Character
+	if not current then
+		return nil
+	end
+	return statsOf(current)
+end
+
+local function isAlive(player)
+	local current = player.Character
+	if not current then
+		return false
+	end
+	local hp = current:FindFirstChildOfClass("Humanoid")
+	if not hp then
+		return false
+	end
+	if hp.Health <= 0 then
+		return false
+	end
+	local stats = statsOf(current)
+	if stats then
+		local locked = stats:GetAttribute(ATTR.Locked)
+		if locked == true then
+			return false
+		end
+	end
+	return true
+end
+
+local function readHealth(model)
+	local humanoidInstance = model:FindFirstChildOfClass("Humanoid")
+	local stats = statsOf(model)
+	local health = stats and stats:GetAttribute("Health")
+	local maxHealth = stats and stats:GetAttribute("MaxHealth")
+	if typeof(health) ~= "number" then
+		health = humanoidInstance and humanoidInstance.Health or 0
+	end
+	if typeof(maxHealth) ~= "number" then
+		maxHealth = humanoidInstance and humanoidInstance.MaxHealth or 100
+	end
+	return health, maxHealth
+end
+
+local function scanPlayers(origin)
+	local wanted = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and isAlive(player) then
+			local model = player.Character
+			local target = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+			local targetPosition = positionOf(model)
+			if target and targetPosition then
+				local distance = (targetPosition - origin).Magnitude
+				if distance <= espRange() then
+					local health = readHealth(model)
+					local stats = statsOf(model)
+					local weapon = stats and stats:GetAttribute(ATTR.Equipped)
+					local label = player.Name
+					if flag("EspHealth", true) then
+						label = label .. " " .. math.floor(health) .. "hp"
+					end
+					if flag("EspWeapon", false) and typeof(weapon) == "string" and weapon ~= "" then
+						label = label .. " | " .. weapon
+					end
+					if flag("EspDistance", true) then
+						label = label .. " | " .. formatDistance(distance) .. "m"
+					end
+					wanted[target] = {
+						text = label,
+						color = Color3.fromRGB(255, 96, 110),
+					}
+				end
+			end
+		end
+	end
+	return wanted
+end
+
+local function categoryOfItemId(itemId)
+	if not Items or not Items.rows then
+		return nil
+	end
+	local row = Items.rows[itemId]
+	if not row then
+		return nil
+	end
+	return row.kind
+end
+
+local LOOT_CACHE = {
+	at = 0,
+	prompts = {},
+}
+
+local function lootPrompts()
+	local now = os.clock()
+	if now - LOOT_CACHE.at < 1.5 and #LOOT_CACHE.prompts > 0 then
+		return LOOT_CACHE.prompts
+	end
+	LOOT_CACHE.at = now
+	local list = {}
+	local lootFolder = Workspace:FindFirstChild("Loot")
+	if lootFolder then
+		for _, prompt in ipairs(lootFolder:GetDescendants()) do
+			if prompt:IsA("ProximityPrompt") then
+				local item = prompt.Parent
+				if item and item.Parent then
+					local base = item:IsA("BasePart") and item or item:FindFirstChildWhichIsA("BasePart")
+					if base then
+						table.insert(list, {
+							item = item,
+							base = base,
+							itemId = (prompt.ObjectText ~= "" and prompt.ObjectText) or item.Name,
+						})
+					end
+				end
+			end
+		end
+	end
+	LOOT_CACHE.prompts = list
+	return list
+end
+
+local function scanLoot(origin)
+	local wanted = {}
+	local selected = flag("LootTypes", CATEGORY_NAMES)
+	if type(selected) ~= "table" then
+		selected = CATEGORY_NAMES
+	end
+	local wantedKinds = {}
+	for _, name in ipairs(selected) do
+		local kind = CATEGORY_KIND[name]
+		if kind then
+			wantedKinds[kind] = true
+		end
+	end
+	local limit = flag("LootLimit", 60)
+	local range = flag("LootRange", 250)
+	local candidates = {}
+	for _, entry in ipairs(lootPrompts()) do
+		local kind = categoryOfItemId(entry.itemId)
+		if kind == nil or wantedKinds[kind] == true then
+			local distance = (entry.base.Position - origin).Magnitude
+			if distance <= range then
+				table.insert(candidates, {
+					instance = entry.base,
+					distance = distance,
+					text = entry.itemId .. " | " .. formatDistance(distance) .. "m",
+					color = (kind and CATEGORY_COLORS[kind]) or Color3.fromRGB(220, 220, 220),
+				})
+			end
+		end
+	end
+	table.sort(candidates, function(a, b)
+		return a.distance < b.distance
+	end)
+	for index = 1, math.min(#candidates, limit) do
+		local candidate = candidates[index]
+		wanted[candidate.instance] = {
+			text = candidate.text,
+			color = candidate.color,
+		}
+	end
+	return wanted
+end
+
+local AUTO_LOOT_DEBUG = {
+	attempts = 0,
+	fired = 0,
+	lastPrompt = nil,
+	lastDistance = nil,
+}
+
+local function autoLootStep()
+	if not flag("AutoLoot", false) then
+		return
+	end
+	if type(fireproximityprompt) ~= "function" then
+		return
+	end
+	local origin = rootPart()
+	if not origin then
+		return
+	end
+	AUTO_LOOT_DEBUG.attempts = AUTO_LOOT_DEBUG.attempts + 1
+	local range = flag("PickupRange", 9)
+	local selected = flag("LootTypes", CATEGORY_NAMES)
+	if type(selected) ~= "table" then
+		selected = CATEGORY_NAMES
+	end
+	local wantedKinds = {}
+	for _, name in ipairs(selected) do
+		local kind = CATEGORY_KIND[name]
+		if kind then
+			wantedKinds[kind] = true
+		end
+	end
+	local candidates = {}
+	for _, entry in ipairs(lootPrompts()) do
+		local kind = categoryOfItemId(entry.itemId)
+		if kind == nil or wantedKinds[kind] == true then
+			local prompt = entry.item:FindFirstChildWhichIsA("ProximityPrompt", true)
+			if prompt and prompt.Enabled and prompt.Parent then
+				local distance = (entry.base.Position - origin.Position).Magnitude
+				local reach = math.min(range, math.max(prompt.MaxActivationDistance - 0.5, 2))
+				if distance <= reach then
+					table.insert(candidates, {
+						prompt = prompt,
+						distance = distance,
+						name = entry.itemId,
+					})
+				end
+			end
+		end
+	end
+	table.sort(candidates, function(a, b)
+		return a.distance < b.distance
+	end)
+	for index = 1, math.min(#candidates, 3) do
+		local candidate = candidates[index]
+		local ok = pcall(fireproximityprompt, candidate.prompt)
+		if ok then
+			AUTO_LOOT_DEBUG.fired = AUTO_LOOT_DEBUG.fired + 1
+			AUTO_LOOT_DEBUG.lastPrompt = candidate.name
+			AUTO_LOOT_DEBUG.lastDistance = candidate.distance
+		end
+	end
+end
+
+local function scanAnimals(origin)
+	local wanted = {}
+	local folder = Workspace:FindFirstChild("Wildlife")
+	if not folder then
+		return wanted
+	end
+	for _, model in ipairs(folder:GetChildren()) do
+		local stats = statsOf(model)
+		if stats then
+			local position = positionOf(model)
+			if position then
+				local distance = (position - origin).Magnitude
+				if distance <= espRange() then
+					local species = stats:GetAttribute(ATTR.Species)
+					local health = readHealth(model)
+					local hostile = typeof(species) == "string" and HOSTILE_SPECIES[species] == true
+					local label = tostring(species or model.Name)
+					if flag("AnimalHealth", true) then
+						label = label .. " " .. math.floor(health) .. "hp"
+					end
+					label = label .. " | " .. formatDistance(distance) .. "m"
+					wanted[model] = {
+						text = label,
+						color = hostile and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(150, 220, 255),
+					}
+				end
+			end
+		end
+	end
+	return wanted
+end
+
+local function scanWater(origin)
+	local wanted = {}
+	local zones = Workspace:FindFirstChild("WaterZone")
+	if not zones then
+		return wanted
+	end
+	for _, part in ipairs(zones:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local distance = (part.Position - origin).Magnitude
+			if distance <= espRange() then
+				wanted[part] = {
+					text = "Water | " .. formatDistance(distance) .. "m",
+					color = Color3.fromRGB(90, 200, 255),
+				}
+			end
+		end
+	end
+	return wanted
+end
+
+local function waterSources(origin, limit)
+	local list = {}
+	local zones = Workspace:FindFirstChild("WaterZone")
+	if zones then
+		for _, part in ipairs(zones:GetDescendants()) do
+			if part:IsA("BasePart") then
+				table.insert(list, {
+					name = "Water",
+					position = part.Position,
+				})
+			end
+		end
+	end
+	for _, entry in ipairs(list) do
+		entry.distance = (entry.position - origin).Magnitude
+	end
+	table.sort(list, function(a, b)
+		return a.distance < b.distance
+	end)
+	local rows = {}
+	for index = 1, math.min(#list, limit or 3) do
+		local entry = list[index]
+		table.insert(rows, {
+			Name = entry.name,
+			Value = formatDistance(entry.distance) .. "m",
+		})
+	end
+	return rows
+end
+
+----- Inventory and server calls -----
+
+local function inventory()
+	if InventoryClient and InventoryClient.slots then
+		return InventoryClient
+	end
+	return nil
+end
+
+local function slots()
+	local inv = inventory()
+	if not inv then
+		return {}
+	end
+	local list = {}
+	for slot, item in pairs(inv.slots) do
+		if item and typeof(item.id) == "string" and item.id ~= "" and (item.count or 0) > 0 then
+			table.insert(list, {
+				slot = slot,
+				id = item.id,
+				count = item.count or 1,
+			})
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.slot < b.slot
+	end)
+	return list
+end
+
+local function countOf(itemId)
+	local total = 0
+	for _, item in ipairs(slots()) do
+		if item.id == itemId then
+			total = total + item.count
+		end
+	end
+	return total
+end
+
+local function findSlot(candidates)
+	for _, wanted in ipairs(candidates) do
+		for _, item in ipairs(slots()) do
+			if item.id == wanted then
+				return item
+			end
+		end
+	end
+	return nil
+end
+
+local function consume(item)
+	if not item or not Network or not Network.ConsumeItem then
+		return false
+	end
+	local ok = pcall(function()
+		Network.ConsumeItem.Fire({ slot = item.slot })
+	end)
+	return ok
+end
+
+local function craft(recipe)
+	if not Network or not Network.CraftItem then
+		return false
+	end
+	local ok = pcall(function()
+		Network.CraftItem.Fire({ recipe = recipe })
+	end)
+	return ok
+end
+
+local function equip(item)
+	if not item or not Network or not Network.SelectSlot then
+		return false
+	end
+	local ok = pcall(function()
+		Network.SelectSlot.Fire({ slot = item.slot, at = workspace:GetServerTimeNow() })
+	end)
+	return ok
+end
+
+----- Meters -----
+
+local function meterValue(name)
+	local stats = statsOf(character())
+	if not stats then
+		return nil
+	end
+	if Meters and Meters.valueOf then
+		local ok, value = pcall(function()
+			return Meters.valueOf(stats, name)
+		end)
+		if ok and typeof(value) == "number" then
+			return value
+		end
+	end
+	local anchor = stats:GetAttribute(name)
+	local rate = stats:GetAttribute(name .. "Rate")
+	local at = stats:GetAttribute(ATTR.MeterAt)
+	if typeof(anchor) ~= "number" then
+		return nil
+	end
+	if typeof(rate) ~= "number" or typeof(at) ~= "number" then
+		return anchor
+	end
+	return math.clamp(anchor + rate * math.max(0, workspace:GetServerTimeNow() - at), 0, 100)
+end
+
+local function ownHealth()
+	local model = character()
+	if not model then
+		return nil, nil
+	end
+	return readHealth(model)
+end
+
+----- Combat -----
+
+local AIM = {
+	point = nil,
+	targetName = nil,
+	circle = nil,
+}
+
+local originalAimPoint = nil
+
+local function installAimPatch()
+	if not CameraRig or type(CameraRig.aimPoint) ~= "function" then
+		return false
+	end
+	originalAimPoint = CameraRig.aimPoint
+	local wrapper = function()
+		if AIM.point then
+			return AIM.point
+		end
+		return originalAimPoint()
+	end
+	local ok = pcall(function()
+		CameraRig.aimPoint = wrapper
+	end)
+	if ok then
+		return true
+	end
+	if type(setreadonly) == "function" then
+		pcall(setreadonly, CameraRig, false)
+		local retried = pcall(function()
+			CameraRig.aimPoint = wrapper
+		end)
+		if retried then
+			return true
+		end
+	end
+	originalAimPoint = nil
+	return false
+end
+
+local AIM_PATCHED = installAimPatch()
+
+local function isDrawing()
+	local model = character()
+	if not model then
+		return false
+	end
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+	return root:GetAttribute(ATTR.Drawing) == true
+end
+
+local function pickTarget()
+	local camera = Workspace.CurrentCamera
+	local origin = rootPart()
+	if not camera or not origin then
+		return nil
+	end
+	local maxAngle = math.rad(flag("AimFov", 25))
+	local aimPart = flag("AimPart", "Head")
+	local cameraPosition = camera.CFrame.Position
+	local lookVector = camera.CFrame.LookVector
+	local best, bestAngle = nil, maxAngle
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and isAlive(player) then
+			local model = player.Character
+			local head = model:FindFirstChild("Head")
+			local part = head
+			if aimPart ~= "Head" then
+				part = model:FindFirstChild("HumanoidRootPart") or head
+			end
+			if part and part:IsA("BasePart") then
+				local targetPosition = part.Position
+				local delta = targetPosition - cameraPosition
+				local distance = delta.Magnitude
+				if distance > 0.5 and distance <= espRange() then
+					local angle = math.acos(math.clamp(lookVector:Dot(delta.Unit), -1, 1))
+					if angle < bestAngle then
+						best, bestAngle = {
+							position = targetPosition,
+							name = player.Name,
+							distance = distance,
+							angle = angle,
+						}, angle
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function updateAimCircle()
+	if not flag("ShowFov", false) then
+		if AIM.circle then
+			AIM.circle.Visible = false
+		end
+		return
+	end
+	if not AIM.circle then
+		local ok, circle = pcall(function()
+			local newCircle = Drawing.new("Circle")
+			newCircle.Thickness = 1.5
+			newCircle.NumSides = 64
+			newCircle.Transparency = 0.65
+			newCircle.Filled = false
+			newCircle.Color = Color3.fromRGB(255, 59, 127)
+			return newCircle
+		end)
+		if not ok then
+			return
+		end
+		AIM.circle = circle
+	end
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local viewport = camera.ViewportSize
+	local camFov = math.rad(camera.FieldOfView)
+	local aimFov = math.rad(flag("AimFov", 25))
+	local radius = (viewport.Y / 2) * (math.tan(aimFov) / math.tan(camFov / 2))
+	AIM.circle.Position = Vector2.new(viewport.X / 2, viewport.Y / 2)
+	AIM.circle.Radius = math.clamp(radius, 8, viewport.Y)
+	AIM.circle.Visible = true
+end
+
+local function combatStep()
+	if not CameraRig then
+		return
+	end
+	local enabled = flag("AimAssist", false) and AIM_PATCHED
+	local wantedDrawing = isDrawing()
+	local armed = enabled and (not flag("AimOnlyDrawing", true) or wantedDrawing)
+	local target = nil
+	if armed then
+		target = pickTarget()
+	end
+	if armed and target then
+		AIM.point = target.position
+		AIM.targetName = target.name
+	else
+		AIM.point = nil
+		AIM.targetName = nil
+	end
+	updateAimCircle()
+end
+
+----- World -----
+
+local function workspaceNumber(name, fallback)
+	local value = Workspace:GetAttribute(name)
+	if typeof(value) == "number" then
+		return value
+	end
+	return fallback
+end
+
+local function barrierInfo()
+	local center = Workspace:GetAttribute("BarrierCenter")
+	local toSize = workspaceNumber("BarrierTo", 2048)
+	local stage = workspaceNumber("BarrierStage", 0)
+	local at = Workspace:GetAttribute("BarrierAt")
+	local origin = rootPart()
+	local distance = nil
+	local status = "Ready"
+	if typeof(center) == "Vector3" and origin then
+		local half = math.max(toSize / 2, 1)
+		local dx = math.abs(origin.Position.X - center.X)
+		local dz = math.abs(origin.Position.Z - center.Z)
+		distance = math.min(half - dx, half - dz)
+		status = distance > 0 and "Safe" or "Outside the zone"
+	end
+	return {
+		distance = distance,
+		status = status,
+		stage = stage,
+		at = at,
+		size = toSize,
+	}
+end
+
+local function clockString()
+	local hour = math.floor(Lighting.ClockTime) % 24
+	local minute = math.floor((Lighting.ClockTime % 1) * 60)
+	return string.format("%02d:%02d", hour, minute)
+end
+
+----- UI -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Forest Arena",
+	LoadingSubtitle = "visuals, survival, combat",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptFA" },
+	Home = {
+		Title = "Forest Arena",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogsTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogsBox = LogsTab:CreateGroupbox({ Name = "Activity", Side = "Left" })
+local Log = LogsBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 200,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----- Visuals -----
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local PlayersBox = VisualsTab:CreateGroupbox({ Name = "Players", Side = "Left" })
+local LootBox = VisualsTab:CreateGroupbox({ Name = "Loot", Side = "Right" })
+local AnimalBox = VisualsTab:CreateGroupbox({ Name = "Animals", Side = "Left" })
+local WaterBox = VisualsTab:CreateGroupbox({ Name = "Water", Side = "Right" })
+
+PlayersBox:CreateToggle({
+	Name = "Player ESP",
+	Desc = "Boxes names, health, weapon and distance",
+	Flag = "PlayerEsp",
+	CurrentValue = true,
+})
+
+PlayersBox:CreateToggle({
+	Name = "Health",
+	Flag = "EspHealth",
+	CurrentValue = true,
+	DependsOn = "PlayerEsp",
+})
+
+PlayersBox:CreateToggle({
+	Name = "Weapon",
+	Flag = "EspWeapon",
+	CurrentValue = true,
+	DependsOn = "PlayerEsp",
+})
+
+PlayersBox:CreateToggle({
+	Name = "Distance",
+	Flag = "EspDistance",
+	CurrentValue = true,
+	DependsOn = "PlayerEsp",
+})
+
+PlayersBox:CreateSlider({
+	Name = "Range",
+	Range = { 50, 2000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 500,
+	Flag = "EspRange",
+})
+
+LootBox:CreateToggle({
+	Name = "Loot ESP",
+	Desc = "Ground items and resources, filtered by type",
+	Flag = "LootEsp",
+	CurrentValue = true,
+})
+
+LootBox:CreateDropdown({
+	Name = "Types",
+	Options = CATEGORY_NAMES,
+	MultipleOptions = true,
+	CurrentOption = CATEGORY_NAMES,
+	Flag = "LootTypes",
+	DependsOn = "LootEsp",
+})
+
+LootBox:CreateSlider({
+	Name = "Range",
+	Range = { 20, 800 },
+	Increment = 20,
+	Suffix = " studs",
+	CurrentValue = 250,
+	Flag = "LootRange",
+	DependsOn = "LootEsp",
+})
+
+LootBox:CreateSlider({
+	Name = "Max markers",
+	Range = { 10, 200 },
+	Increment = 10,
+	CurrentValue = 60,
+	Flag = "LootLimit",
+	DependsOn = "LootEsp",
+})
+
+LootBox:CreateToggle({
+	Name = "Pick up loot",
+	Desc = "Grabs nearby loot and resources through the game prompt",
+	Flag = "AutoLoot",
+	CurrentValue = false,
+})
+
+LootBox:CreateSlider({
+	Name = "Pickup range",
+	Range = { 4, 20 },
+	Increment = 1,
+	Suffix = " studs",
+	CurrentValue = 9,
+	Flag = "PickupRange",
+	DependsOn = "AutoLoot",
+})
+
+AnimalBox:CreateToggle({
+	Name = "Animal ESP",
+	Desc = "Species, health and distance for every animal",
+	Flag = "AnimalEsp",
+	CurrentValue = true,
+})
+
+AnimalBox:CreateToggle({
+	Name = "Health",
+	Flag = "AnimalHealth",
+	CurrentValue = true,
+	DependsOn = "AnimalEsp",
+})
+
+WaterBox:CreateToggle({
+	Name = "Water ESP",
+	Desc = "Marks every water source around you",
+	Flag = "WaterEsp",
+	CurrentValue = false,
+})
+
+----- Survival -----
+
+local SurvivalTab = Window:CreateTab({ Name = "Survival", Icon = "heart-pulse" })
+local VitalsBox = SurvivalTab:CreateGroupbox({ Name = "Vitals", Side = "Left" })
+local AutoBox = SurvivalTab:CreateGroupbox({ Name = "Automation", Side = "Right" })
+
+VitalsBox:CreateStatus({ Name = "Health", Style = "Bar", Max = 100, UpdateRate = 0.5, Update = function()
+	local health, maxHealth = ownHealth()
+	if not health then
+		return 0, 100
+	end
+	return health, maxHealth
+end })
+
+VitalsBox:CreateStatus({ Name = "Hunger", Style = "Bar", Max = 100, UpdateRate = 0.5, Update = function()
+	return math.floor(meterValue("Hunger") or 0), 100
+end })
+
+VitalsBox:CreateStatus({ Name = "Thirst", Style = "Bar", Max = 100, UpdateRate = 0.5, Update = function()
+	return math.floor(meterValue("Thirst") or 0), 100
+end })
+
+VitalsBox:CreateStatus({ Name = "Oxygen", Style = "Bar", Max = 100, UpdateRate = 0.5, Update = function()
+	return math.floor(meterValue("Oxygen") or 0), 100
+end })
+
+VitalsBox:CreateStatus({ Name = "Alive", Style = "Row", UpdateRate = 1, Update = function()
+	local alive = Workspace:GetAttribute("Alive")
+	local map = Workspace:GetAttribute("Map")
+	return tostring(alive or "?") .. " alive | " .. tostring(map or "?")
+end })
+
+AutoBox:CreateToggle({
+	Name = "Auto eat",
+	Desc = "Eats the best food when hunger drops below the threshold",
+	Flag = "AutoEat",
+	CurrentValue = false,
+})
+
+AutoBox:CreateSlider({
+	Name = "Eat below",
+	Range = { 5, 90 },
+	Increment = 5,
+	CurrentValue = 45,
+	Flag = "EatBelow",
+	DependsOn = "AutoEat",
+})
+
+AutoBox:CreateToggle({
+	Name = "Auto drink",
+	Desc = "Drinks from a bottle when thirst drops below the threshold",
+	Flag = "AutoDrink",
+	CurrentValue = false,
+})
+
+AutoBox:CreateSlider({
+	Name = "Drink below",
+	Range = { 5, 90 },
+	Increment = 5,
+	CurrentValue = 45,
+	Flag = "DrinkBelow",
+	DependsOn = "AutoDrink",
+})
+
+AutoBox:CreateToggle({
+	Name = "Auto heal",
+	Desc = "Uses medicine and bandages when health drops",
+	Flag = "AutoHeal",
+	CurrentValue = false,
+})
+
+AutoBox:CreateSlider({
+	Name = "Heal below",
+	Range = { 10, 90 },
+	Increment = 5,
+	CurrentValue = 60,
+	Flag = "HealBelow",
+	DependsOn = "AutoHeal",
+})
+
+AutoBox:CreateToggle({
+	Name = "Auto craft",
+	Desc = "Crafts ammo, bandages and a torch at a crafting station",
+	Flag = "AutoCraft",
+	CurrentValue = false,
+})
+
+----- Combat -----
+
+local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "crosshair" })
+local AimBox = CombatTab:CreateGroupbox({ Name = "Aim", Side = "Left" })
+local AimInfoBox = CombatTab:CreateGroupbox({ Name = "Target", Side = "Right" })
+
+AimBox:CreateToggle({
+	Name = "Aim assist",
+	Desc = "Redirects your shots to the closest target inside the FOV",
+	Flag = "AimAssist",
+	CurrentValue = false,
+})
+
+AimBox:CreateToggle({
+	Name = "Only while aiming",
+	Flag = "AimOnlyDrawing",
+	CurrentValue = true,
+	DependsOn = "AimAssist",
+})
+
+AimBox:CreateDropdown({
+	Name = "Aim part",
+	Options = { "Head", "Chest" },
+	CurrentOption = "Head",
+	Flag = "AimPart",
+	DependsOn = "AimAssist",
+})
+
+AimBox:CreateSlider({
+	Name = "FOV",
+	Range = { 3, 90 },
+	Increment = 1,
+	Suffix = " deg",
+	CurrentValue = 25,
+	Flag = "AimFov",
+	DependsOn = "AimAssist",
+})
+
+AimBox:CreateToggle({
+	Name = "Field of view circle",
+	Flag = "ShowFov",
+	CurrentValue = true,
+	DependsOn = "AimAssist",
+})
+
+AimInfoBox:CreateStatus({ Name = "Target", Style = "Row", UpdateRate = 0.2, Update = function()
+	if AIM.targetName then
+		return "<Success>" .. AIM.targetName .. "</Success>"
+	end
+	return "<Muted>No target</Muted>"
+end })
+
+AimInfoBox:CreateStatus({ Name = "Aimed", Style = "Row", UpdateRate = 0.2, Update = function()
+	return AIM.point and "<Success>Yes</Success>" or "<Muted>No</Muted>"
+end })
+
+----- World -----
+
+local WorldTab = Window:CreateTab({ Name = "World", Icon = "globe" })
+local MatchBox = WorldTab:CreateGroupbox({ Name = "Match", Side = "Left" })
+local WorldInfoBox = WorldTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+MatchBox:CreateStatus({ Name = "Phase", Style = "Row", UpdateRate = 1, Update = function()
+	local phase = Workspace:GetAttribute("Phase")
+	local gameStarted = Workspace:GetAttribute("GameStarted")
+	return tostring(phase or "?") .. " | started " .. tostring(gameStarted)
+end })
+
+MatchBox:CreateStatus({ Name = "Map", Style = "Row", UpdateRate = 2, Update = function()
+	return tostring(Workspace:GetAttribute("Map") or "?") .. " | " .. clockString()
+end })
+
+MatchBox:CreateStatus({ Name = "Barrier", Style = "Row", UpdateRate = 0.5, Update = function()
+	local info = barrierInfo()
+	if not info.distance then
+		return "<Muted>Ready</Muted>"
+	end
+	local text = formatDistance(math.abs(info.distance)) .. "m from edge"
+	if info.distance <= 0 then
+		return "<Error>" .. text .. "</Error>"
+	end
+	if info.distance < 40 then
+		return "<Warning>" .. text .. "</Warning>"
+	end
+	return "<Success>" .. text .. "</Success>"
+end })
+
+MatchBox:CreateStatus({ Name = "Water", Style = "Row", UpdateRate = 2, Update = function()
+	local origin = rootPart()
+	if not origin then
+		return "<Muted>None</Muted>"
+	end
+	local rows = waterSources(origin.Position, 1)
+	if #rows == 0 then
+		return "<Muted>None</Muted>"
+	end
+	return rows[1].Name .. " " .. rows[1].Value
+end })
+
+WorldInfoBox:CreateStatusList({
+	Name = "Water finder",
+	Rows = {},
+	MaxRows = 4,
+	EmptyText = "None",
+	UpdateRate = 2,
+	Update = function()
+		local origin = rootPart()
+		if not origin then
+			return {}
+		end
+		return waterSources(origin.Position, 3)
+	end,
+})
+
+WorldInfoBox:CreateStatus({ Name = "Weather", Style = "Row", UpdateRate = 1, Update = function()
+	local parts = {}
+	for _, name in ipairs({ "Raining", "Thunderstorm", "ForestFire", "Famine", "Drought", "Meteor", "Tornado" }) do
+		local value = Workspace:GetAttribute(name)
+		if value == true then
+			table.insert(parts, name)
+		end
+	end
+	if #parts == 0 then
+		return "<Muted>Clear</Muted>"
+	end
+	return "<Error>" .. table.concat(parts, ", ") .. "</Error>"
+end })
+
+----- Settings -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+local UnloadBox = SettingsTab:CreateGroupbox({ Name = "Unload", Side = "Left" })
+
+UnloadBox:CreateButton({
+	Name = "Unload",
+	Desc = "Removes the hub and restores the game",
+	Icon = "power",
+	Style = "Primary",
+	Callback = function()
+		if getgenv().RobScriptFA and getgenv().RobScriptFA.Destroy then
+			getgenv().RobScriptFA.Destroy()
+		end
+	end,
+})
+
+----- Runtime -----
+
+local alive = true
+
+local function destroy()
+	if not alive then
+		return
+	end
+	alive = false
+	STOP = true
+	for _, connection in ipairs(CONNECTIONS) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	CONNECTIONS = {}
+	for _, name in ipairs({ "players", "loot", "animals", "water" }) do
+		clearGroup(name)
+	end
+	if AIM.circle then
+		pcall(function()
+			AIM.circle:Remove()
+		end)
+		AIM.circle = nil
+	end
+	if CameraRig and originalAimPoint then
+		pcall(function()
+			CameraRig.aimPoint = originalAimPoint
+		end)
+	end
+	pcall(function()
+		Window:Destroy()
+	end)
+	if getgenv().RobScriptFA then
+		getgenv().RobScriptFA = nil
+	end
+end
+
+getgenv().RobScriptFA = {
+	Destroy = destroy,
+	version = "1.0",
+	Flags = Airflow.Flags,
+	Window = Window,
+	State = {
+		Aim = AIM,
+		AimPatched = AIM_PATCHED,
+		Esp = ESP,
+		Meters = meterValue,
+		Slots = slots,
+		LootStep = autoLootStep,
+		LootDebug = AUTO_LOOT_DEBUG,
+	},
+}
+
+local function espLoop()
+	while not STOP do
+		local origin = positionOf(character())
+		if origin then
+			if flag("PlayerEsp", true) then
+				ensureGroup("players", {
+					color = Color3.fromRGB(255, 96, 110),
+					offset = Vector3.new(0, 0.4, 0),
+					size = UDim2.fromOffset(180, 22),
+					highlight = true,
+				})
+				syncGroup("players", scanPlayers(origin))
+			else
+				clearGroup("players")
+			end
+			if flag("LootEsp", true) then
+				ensureGroup("loot", {
+					color = Color3.fromRGB(120, 180, 255),
+					offset = Vector3.new(0, 1.6, 0),
+					size = UDim2.fromOffset(140, 20),
+					textSize = 11,
+					highlight = false,
+				})
+				syncGroup("loot", scanLoot(origin))
+			else
+				clearGroup("loot")
+			end
+			if flag("AnimalEsp", true) then
+				ensureGroup("animals", {
+					color = Color3.fromRGB(255, 70, 70),
+					offset = Vector3.new(0, 2.4, 0),
+					size = UDim2.fromOffset(150, 21),
+					highlight = true,
+				})
+				syncGroup("animals", scanAnimals(origin))
+			else
+				clearGroup("animals")
+			end
+			if flag("WaterEsp", false) then
+				ensureGroup("water", {
+					color = Color3.fromRGB(90, 200, 255),
+					offset = Vector3.new(0, 0, 0),
+					size = UDim2.fromOffset(130, 20),
+					highlight = false,
+				})
+				syncGroup("water", scanWater(origin))
+			else
+				clearGroup("water")
+			end
+		end
+		task.wait(0.35)
+	end
+end
+
+local function automationLoop()
+	local cooldowns = {}
+
+	local function ready(key, seconds)
+		local now = os.clock()
+		if not cooldowns[key] or now - cooldowns[key] >= seconds then
+			cooldowns[key] = now
+			return true
+		end
+		return false
+	end
+
+	while not STOP do
+		if character() then
+			if flag("AutoEat", false) and ready("eat", 2.5) then
+				local hunger = meterValue("Hunger")
+				if hunger and hunger < flag("EatBelow", 45) then
+					local item = findSlot(FOOD_PRIORITY)
+					if item and consume(item) then
+						Log:Push("Ate <Accent>" .. item.id .. "</Accent>")
+					end
+				end
+			end
+			if flag("AutoDrink", false) and ready("drink", 2.5) then
+				local thirst = meterValue("Thirst")
+				if thirst and thirst < flag("DrinkBelow", 45) then
+					local item = findSlot(DRINK_ITEMS)
+					if item and consume(item) then
+						Log:Push("Drank water")
+					end
+				end
+			end
+			if flag("AutoHeal", false) and ready("heal", 2.5) then
+				local health = ownHealth()
+				if health and health < flag("HealBelow", 60) then
+					local item = findSlot(HEAL_PRIORITY)
+					if item and consume(item) then
+						Log:Push("Healed with <Accent>" .. item.id .. "</Accent>")
+					end
+				end
+			end
+			if flag("AutoCraft", false) and ready("craft", 3) then
+				local station = CollectionService:GetTagged("CraftingPrompt")
+				local origin = positionOf(character())
+				local nearStation = false
+				for _, prompt in ipairs(station) do
+					local part = prompt.Parent
+					if part and part:IsA("BasePart") and origin then
+						if (part.Position - origin).Magnitude <= 12 then
+							nearStation = true
+							break
+						end
+					end
+				end
+				if nearStation then
+					if countOf("Wooden Arrows") + countOf("Arrows") < 1 and countOf("Firewood") >= 1 and countOf("Stone") >= 1 then
+						if craft("Wooden Arrows") then
+							Log:Push("Crafted <Accent>Wooden Arrows</Accent>")
+						end
+					elseif ownHealth() < 80 and countOf("Herb") >= 3 then
+						if craft("Bandage") then
+							Log:Push("Crafted <Accent>Bandage</Accent>")
+						end
+					elseif countOf("Firewood") >= 1 and (Lighting.ClockTime < 6 or Lighting.ClockTime > 18) and countOf("Wooden Torch") < 1 and countOf("Torch") < 1 then
+						if craft("Wooden Torch") then
+							Log:Push("Crafted <Accent>Wooden Torch</Accent>")
+						end
+					end
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+end
+
+track(RunService.RenderStepped:Connect(function()
+	if STOP then
+		return
+	end
+	pcall(combatStep)
+end))
+
+task.spawn(espLoop)
+task.spawn(automationLoop)
+
+local function lootLoop()
+	while not STOP do
+		if flag("AutoLoot", false) and character() then
+			pcall(autoLootStep)
+		end
+		task.wait(0.15)
+	end
+end
+
+task.spawn(lootLoop)
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(1)
+	Log:Push("Character respawned")
+end))
+
+Window:LoadAutoload()
+Window:Notify({ Title = "Loaded", Content = "Forest Arena hub is ready", Type = "Success" })
+
+Log:Push("Hub <Accent>v1.0</Accent> loaded")
+if not AIM_PATCHED then
+	Log:Push("<Warning>CameraRig is locked: aim assist disabled</Warning>")
+end
+if not Network then
+	Log:Push("<Warning>Network module not found: automation disabled</Warning>")
+end
+if not Meters then
+	Log:Push("<Warning>Meters module not found: readings are approximate</Warning>")
+end
