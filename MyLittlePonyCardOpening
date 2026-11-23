@@ -1,0 +1,1614 @@
+-- Robscript Team - My Little Pony Card Opening
+-- Game: My Little Pony Card Opening | placeId 76275796126573
+-- Window: RightControl | Unload: Settings -> Unload | API: getgenv().RobScriptTS
+--
+-- What it does:
+--   Packs      - a rotation of up to four sets: opens the chosen number of packs of the first set, then the
+--                same for the next one and around again. Packs are bought from the shop when the stash is
+--                empty and there are enough coins for it.
+--   Duplicates - after every open it sells duplicates above the keep limit, protected by the rarity tier,
+--                favourites, shelf copies and display copies.
+--   Pony Pairs - plays the memory table: deals a board, asks the server for one card at a time and matches
+--                the pairs it has already seen.
+--
+-- How it works: the game is one client LocalScript that talks to ReplicatedStorage.Remotes. The hub calls the
+-- very same remotes - BuyPack(set, qty), OpenPack(set, fast, packs, sides), SellCards({id = count}) and
+-- Memory("deal" / "flip", index). Nothing is hooked or rewritten, every request is the call the game itself
+-- makes, only without the pack animation in front of it.
+
+do
+	local existing = getgenv().RobScriptTS
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local VERSION = "1.0"
+local STOP = false
+local CONNECTIONS = {}
+
+local function track(connection)
+	if connection then
+		table.insert(CONNECTIONS, connection)
+	end
+	return connection
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[RobScript TS] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF77B6"),
+	AccentDark = Color3.fromHex("#1C0A14"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Language -----
+
+Airflow:AddLanguage("ru", {
+	Name = "Русский",
+	Flag = "ru",
+	Strings = {
+		["packs, duplicates, pony pairs"] = "паки, дубли, pony pairs",
+		["Packs"] = "Паки",
+		["Duplicates"] = "Дубли",
+		["Pony Pairs"] = "Pony Pairs",
+		["Settings"] = "Настройки",
+		["Activity"] = "События",
+		["Nothing yet"] = "Пока пусто",
+		["Auto open"] = "Автооткрытие",
+		["Runs the rotation of packs"] = "Крутит ротацию паков",
+		["Auto buy"] = "Автопокупка",
+		["Buys a pack in the shop when the stash is empty"] = "Покупает пак в магазине, когда кончились",
+		["Keep coins"] = "Резерв монет",
+		["Never spends coins below this"] = "Не тратит монеты ниже этого остатка",
+		["Fast open"] = "Быстрое вскрытие",
+		["Asks the server to skip the pack animation"] = "Просит сервер пропустить анимацию пака",
+		["Open delay"] = "Пауза между паками",
+		["Rotation"] = "Ротация",
+		["Slot 1"] = "Слот 1",
+		["Slot 2"] = "Слот 2",
+		["Slot 3"] = "Слот 3",
+		["Slot 4"] = "Слот 4",
+		["Packs per slot"] = "Паков на слот",
+		["How many packs to open before the next set"] = "Сколько паков открыть, прежде чем сменить сет",
+		["State"] = "Состояние",
+		["Set"] = "Сет",
+		["Queue"] = "Очередь",
+		["Log pulls"] = "Логировать дропы",
+		["Auto sell duplicates"] = "Автопродажа дублей",
+		["Sells duplicates right after every open"] = "Продаёт дубли сразу после вскрытия",
+		["Keep per card"] = "Оставить на карту",
+		["Copies kept for every card"] = "Сколько копий держать",
+		["Sell up to tier"] = "Продавать до тира",
+		["Cards of this rarity and below can be sold"] = "Карты этой редкости и ниже можно продавать",
+		["Protect favourites"] = "Защищать избранное",
+		["Favourites are never sold"] = "Избранное не продаётся",
+		["Sales"] = "Продажи",
+		["Auto play"] = "Автоигра",
+		["Deals new boards and matches the pairs"] = "Раздаёт доски и собирает пары",
+		["Flip delay"] = "Пауза между флипами",
+		["Pause before every card"] = "Пауза перед каждой картой",
+		["Board limit"] = "Лимит досок",
+		["0 means endless"] = "0 — без предела",
+		["Board"] = "Доска",
+		["Earnings"] = "Заработок",
+		["From pairs"] = "С пар",
+		["Boards done"] = "Досок собрано",
+		["Coins now"] = "Монет сейчас",
+		["Manual"] = "Вручную",
+		["Open one pack"] = "Открыть один пак",
+		["Sell duplicates now"] = "Продать дубли",
+		["Play one board"] = "Сыграть доску",
+		["Unload hub"] = "Выгрузить хаб",
+		["Version"] = "Версия",
+		["RightControl hides the window"] = "RightControl скрывает окно",
+		["Session"] = "Сессия",
+		["Opened"] = "Открыто",
+		["Sold"] = "Продано",
+		["Reset stats"] = "Сбросить счётчики",
+		["Idle"] = "Ожидание",
+		["None"] = "Нет",
+		["Waiting"] = "Ожидание",
+		["No pack"] = "Нет пака",
+		["At a glance"] = "Кратко",
+		["Coins"] = "Монеты",
+		["Packs in rotation"] = "Паки в ротации",
+		["Duplicates ready"] = "Дублей к продаже",
+		["Menu"] = "Режим",
+		["Step"] = "Шаг",
+		["Owned"] = "В наличии",
+		["How to use"] = "Как пользоваться",
+		["Set for this slot, None skips it"] = "Сет для слота, «Нет» — пропустить",
+		["Writes every pack into the Activity tab"] = "Пишет каждый пак в «События»",
+		["1. Pony Pairs → Auto play — this is what pays for the packs"] = "1. Pony Pairs → Автоигра — это и оплачивает паки",
+		["2. Packs → pick up to four sets and how many packs per slot"] = "2. Паки → выбери до четырёх сетов и сколько паков на слот",
+		["3. Turn on Auto open; Auto buy spends the coins it earns"] = "3. Включи автооткрытие; автопокупка тратит заработанные монеты",
+		["4. Duplicates sells the extras and keeps one, favourites and shelf copies"] = "4. Дубли продают лишнее, оставляя одну копию, избранное и полку",
+		["Rare pull"] = "Редкая карта",
+		["Ready"] = "Готово",
+		["Rate"] = "Скорость",
+	},
+})
+
+----- State -----
+
+local S = {
+	PacksOn = false,
+	AutoBuy = true,
+	Reserve = 0,
+	FastOpen = true,
+	OpenDelay = 0.35,
+	SlotSize = 3,
+	Slots = { "MOON3", "HWE", nil, nil },
+	LogPulls = true,
+
+	AutoSell = true,
+	Keep = 1,
+	SellTier = 4,
+	ProtectFavorites = true,
+
+	PairsOn = false,
+	FlipDelay = 0.1,
+	BoardLimit = 0,
+}
+
+local STATS = {
+	Opens = 0,
+	Pulls = 0,
+	Fresh = 0,
+	Sold = 0,
+	SoldCoins = 0,
+	Boards = 0,
+	Matches = 0,
+	PairCoins = 0,
+	Started = os.clock(),
+}
+
+local RUNTIME = {
+	PackState = "Idle",
+	PackSet = "-",
+	PackQueue = "-",
+	Board = "Idle",
+	SaleText = "-",
+	SaleTone = "Muted",
+}
+
+-- Forward declaration: the log box is created with the window further down, while the workers above it
+-- already push messages into it.
+local log
+local notify
+
+----- Game data -----
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+if not Remotes then
+	error("[RobScript TS] ReplicatedStorage.Remotes is missing")
+end
+
+local Shared = ReplicatedStorage:FindFirstChild("Shared")
+local CardData = nil
+if Shared then
+	local ok, data = pcall(function()
+		return require(Shared.CardData)
+	end)
+	if ok then
+		CardData = data
+	end
+end
+if not CardData or type(CardData.Cards) ~= "table" then
+	error("[RobScript TS] CardData is missing")
+end
+
+local SET_IDS = {}
+for _, setId in ipairs(CardData.SetOrder or {}) do
+	table.insert(SET_IDS, setId)
+end
+
+local SET_NAMES = {}
+local SET_BY_NAME = {}
+for _, setId in ipairs(SET_IDS) do
+	local set = CardData.Sets[setId]
+	local label = (set and (set.name or set.short)) or setId
+	table.insert(SET_NAMES, label)
+	SET_BY_NAME[label] = setId
+end
+
+local function setLabel(setId)
+	local set = setId and CardData.Sets[setId]
+	return (set and (set.name or set.short)) or "-"
+end
+
+local function cardInfo(cardId)
+	local card = CardData.ById[cardId]
+	if not card then
+		return nil, nil, nil
+	end
+	local rarity = CardData.Rarities[card.rarity]
+	return card, card.rarity, rarity
+end
+
+local function rarityUnderTier(cardId, tier)
+	local _, rarityKey, rarity = cardInfo(cardId)
+	if not rarity then
+		return false
+	end
+	return rarity.tier <= tier
+end
+
+local function tierName(tier)
+	local bestKey, bestTier = nil, -1
+	for key, rarity in pairs(CardData.Rarities) do
+		if rarity.tier <= tier and rarity.tier > bestTier then
+			bestKey, bestTier = key, rarity.tier
+		end
+	end
+	return bestKey or "N"
+end
+
+----- Game client bridge -----
+
+-- The game keeps its own copy of the profile in PlayerScripts.Client.Store and repaints the HUD, the binder,
+-- the shelf and the desk whenever that copy changes. Calls made from the hub never touch that copy, so a
+-- pack opened from here would show up in the hub but not in the game. Every payload is therefore pushed back
+-- through Store.applySnapshot - the very function the game itself uses after its own remote calls.
+
+local GameStore = nil
+local lastPush = 0
+local lastSignature = ""
+local pendingProfile = nil
+local pendingScheduled = false
+
+local function profileSignature(profile)
+	local owned, packs = 0, 0
+	for _, count in pairs(profile.owned or {}) do
+		owned = owned + count
+	end
+	for _, count in pairs(profile.packs or {}) do
+		packs = packs + count
+	end
+	return string.format("%d|%d|%d", profile.money or -1, owned, packs)
+end
+
+local function gameStore()
+	if GameStore ~= nil then
+		return GameStore or nil
+	end
+	local ok, store = pcall(function()
+		return require(LocalPlayer.PlayerScripts.Client.Store)
+	end)
+	if ok and type(store) == "table" and type(store.applySnapshot) == "function" then
+		GameStore = store
+	else
+		GameStore = false
+	end
+	return GameStore or nil
+end
+
+local function pushToGame(profile, force)
+	if type(profile) ~= "table" then
+		return
+	end
+	if type(profile.money) ~= "number" or type(profile.owned) ~= "table" or type(profile.packs) ~= "table" then
+		return
+	end
+	local store = gameStore()
+	if not store then
+		return
+	end
+	local signature = profileSignature(profile)
+	if not force and signature == lastSignature then
+		return
+	end
+	if not force and os.clock() - lastPush < 0.35 then
+		-- Too soon after the previous repaint: keep the newest state and flush it once the gap is over,
+		-- otherwise a quick buy-then-open would leave a phantom pack in the game's own copy.
+		pendingProfile = profile
+		if not pendingScheduled then
+			pendingScheduled = true
+			task.delay(0.4, function()
+				pendingScheduled = false
+				local queued = pendingProfile
+				pendingProfile = nil
+				if queued then
+					pushToGame(queued, true)
+				end
+			end)
+		end
+		return
+	end
+	lastPush = os.clock()
+	lastSignature = signature
+	if not pcall(store.applySnapshot, profile) then
+		GameStore = false
+	end
+end
+
+----- Profile -----
+
+local PROFILE = {
+	money = 0,
+	packs = {},
+	owned = {},
+	fav = {},
+	shelf = {},
+	display = { rows = {} },
+}
+
+local function applyProfile(profile)
+	if type(profile) ~= "table" then
+		return
+	end
+	if type(profile.money) == "number" then
+		PROFILE.money = profile.money
+	end
+	if type(profile.packs) == "table" then
+		PROFILE.packs = profile.packs
+	end
+	if type(profile.owned) == "table" then
+		PROFILE.owned = profile.owned
+	end
+	if type(profile.fav) == "table" then
+		PROFILE.fav = profile.fav
+	end
+	if type(profile.shelf) == "table" then
+		PROFILE.shelf = profile.shelf
+	end
+	if type(profile.display) == "table" then
+		PROFILE.display = profile.display
+	end
+	pushToGame(profile)
+end
+
+local function invoke(name, ...)
+	local remote = Remotes:FindFirstChild(name)
+	if not remote or not remote:IsA("RemoteFunction") then
+		return false
+	end
+	local results = table.pack(pcall(function(...)
+		return remote:InvokeServer(...)
+	end, ...))
+	if not results[1] then
+		return false
+	end
+	for index = 2, results.n do
+		local value = results[index]
+		if type(value) == "table" then
+			return true, value
+		end
+	end
+	return true, nil
+end
+
+local function refreshProfile()
+	local ok, profile = invoke("GetProfile")
+	if ok and type(profile) == "table" then
+		applyProfile(profile)
+	end
+	return PROFILE
+end
+
+local function packCount(setId)
+	return (PROFILE.packs or {})[setId] or 0
+end
+
+local function ownedCount(cardId)
+	return (PROFILE.owned or {})[cardId] or 0
+end
+
+----- Duplicates -----
+
+local function shelfCopies(cardId)
+	local total = 0
+	for _, value in pairs(PROFILE.shelf or {}) do
+		if value == cardId then
+			total = total + 1
+		end
+	end
+	return total
+end
+
+local function displayCopies(cardId)
+	local total = 0
+	local rows = (PROFILE.display or {}).rows or {}
+	for _, row in ipairs(rows) do
+		for _, slot in ipairs(row.s or {}) do
+			if type(slot) == "string" and slot:sub(1, #cardId + 3) == "c:" .. cardId .. ":" then
+				total = total + 1
+				break
+			end
+		end
+	end
+	return total
+end
+
+local function keepFor(cardId)
+	return math.max(1, S.Keep) + shelfCopies(cardId) + displayCopies(cardId)
+end
+
+local function buildSellPlan()
+	local plan, total = {}, 0
+	for cardId, count in pairs(PROFILE.owned or {}) do
+		local keep = keepFor(cardId)
+		if count > keep and rarityUnderTier(cardId, S.SellTier) then
+			if not (S.ProtectFavorites and (PROFILE.fav or {})[cardId]) then
+				plan[cardId] = count - keep
+				total = total + plan[cardId]
+			end
+		end
+	end
+	return plan, total
+end
+
+local function sellableSummary()
+	local plan, total = buildSellPlan()
+	local coins = 0
+	for cardId, count in pairs(plan) do
+		local _, _, rarity = cardInfo(cardId)
+		if rarity then
+			coins = coins + (rarity.sell or 0) * count
+		end
+	end
+	return total, coins
+end
+
+local function sendPlan(plan)
+	local ids = {}
+	for cardId in pairs(plan) do
+		table.insert(ids, cardId)
+	end
+	table.sort(ids)
+
+	local batches, batch, size = {}, {}, 0
+	for _, cardId in ipairs(ids) do
+		batch[cardId] = plan[cardId]
+		size = size + plan[cardId]
+		if size >= 40 then
+			table.insert(batches, batch)
+			batch, size = {}, 0
+		end
+	end
+	if size > 0 then
+		table.insert(batches, batch)
+	end
+
+	local sold, coins = 0, 0
+	for _, group in ipairs(batches) do
+		local ok, payload = invoke("SellCards", group)
+		if ok and type(payload) == "table" then
+			if payload.profile then
+				applyProfile(payload.profile)
+			end
+			sold = sold + (payload.count or 0)
+			coins = coins + (payload.gained or 0)
+		end
+		task.wait(0.12)
+	end
+	return sold, coins
+end
+
+local function sellDuplicates(manual)
+	if not PROFILE.owned then
+		refreshProfile()
+	end
+	local plan, total = buildSellPlan()
+	if total == 0 then
+		if manual then
+			RUNTIME.SaleText = "No duplicates to sell"
+			RUNTIME.SaleTone = "Muted"
+			log("Nothing to sell", "Warning")
+		end
+		return 0, 0
+	end
+	local sold, coins = sendPlan(plan)
+	if sold > 0 then
+		STATS.Sold = STATS.Sold + sold
+		STATS.SoldCoins = STATS.SoldCoins + coins
+		RUNTIME.SaleText = string.format("Sold %d for %d coins", sold, coins)
+		RUNTIME.SaleTone = "Success"
+		log(string.format("<Success>Sold %d duplicates</Success> <Muted>+%d coins</Muted>", sold, coins))
+	end
+	return sold, coins
+end
+
+----- Packs -----
+
+local packLock = false
+
+local function buyOne(setId)
+	local set = CardData.Sets[setId]
+	local price = (set and set.price) or 0
+	if S.Reserve > 0 and PROFILE.money - price < S.Reserve then
+		return false, "reserve"
+	end
+	if PROFILE.money < price then
+		return false, "money"
+	end
+	local ok = invoke("BuyPack", setId, 1)
+	if not ok then
+		return false, "remote"
+	end
+	refreshProfile()
+	if packCount(setId) > 0 then
+		return true
+	end
+	return false, "shop"
+end
+
+local function openOne(setId)
+	local ok, payload = invoke("OpenPack", setId, S.FastOpen, 1, {})
+	if not ok or type(payload) ~= "table" then
+		return false
+	end
+	if payload.profile then
+		applyProfile(payload.profile)
+	end
+	local cards = payload.cards or {}
+	local fresh = 0
+	local bestTier, bestName = -1, nil
+	for _, entry in ipairs(cards) do
+		if entry.new then
+			fresh = fresh + 1
+		end
+		local card, _, rarity = cardInfo(entry.id)
+		if rarity and rarity.tier > bestTier then
+			bestTier = rarity.tier
+			bestName = card and card.name or tostring(entry.id)
+		end
+	end
+	STATS.Opens = STATS.Opens + 1
+	STATS.Pulls = STATS.Pulls + #cards
+	STATS.Fresh = STATS.Fresh + fresh
+	if bestTier >= 7 and bestName and notify then
+		notify("Rare pull", string.format("%s · %s", bestName, tierName(bestTier)))
+	end
+	if S.LogPulls and #cards > 0 then
+		local names = {}
+		for index, entry in ipairs(cards) do
+			if index > 4 then
+				break
+			end
+			local card = CardData.ById[entry.id]
+			table.insert(names, (card and card.name) or tostring(entry.id))
+		end
+		log(string.format(
+			"<Accent>%s</Accent> <Muted>· %d cards, %d new · %s</Muted>",
+			setLabel(setId),
+			#cards,
+			fresh,
+			table.concat(names, ", ")
+		))
+	end
+	return true
+end
+
+local function rotationSets()
+	local list = {}
+	for index = 1, 4 do
+		local setId = S.Slots[index]
+		if setId and CardData.Sets[setId] then
+			table.insert(list, setId)
+		end
+	end
+	return list
+end
+
+local function packWorker()
+	if packLock then
+		return
+	end
+	packLock = true
+	task.spawn(function()
+		local lastWarn = 0
+		while S.PacksOn and not STOP do
+			local sets = rotationSets()
+			if #sets == 0 then
+				RUNTIME.PackState = "Rotation is empty"
+				S.PacksOn = false
+				log("Rotation is empty", "Warning")
+				break
+			end
+
+			local openedAny = false
+			for _, setId in ipairs(sets) do
+				if not (S.PacksOn and not STOP) then
+					break
+				end
+				for index = 1, S.SlotSize do
+					if not (S.PacksOn and not STOP) then
+						break
+					end
+					RUNTIME.PackSet = setLabel(setId)
+					RUNTIME.PackQueue = string.format("%s · %d/%d", setLabel(setId), index, S.SlotSize)
+					local opened = false
+
+					if packCount(setId) > 0 then
+						opened = openOne(setId)
+					elseif S.AutoBuy then
+						local bought = buyOne(setId)
+						if bought then
+							opened = openOne(setId)
+						end
+					end
+
+					if opened then
+						openedAny = true
+						RUNTIME.PackState = string.format("Opening · %d coins", PROFILE.money)
+						if S.AutoSell then
+							sellDuplicates(false)
+						end
+					else
+						RUNTIME.PackState = string.format("No pack · %d coins", PROFILE.money)
+					end
+
+					task.wait(math.max(0.1, S.OpenDelay))
+				end
+			end
+
+			if not openedAny then
+				local need = math.huge
+				for _, setId in ipairs(sets) do
+					local set = CardData.Sets[setId]
+					if set and type(set.price) == "number" and set.price < need then
+						need = set.price
+					end
+				end
+				if need == math.huge then
+					RUNTIME.PackState = "Waiting for coins"
+				else
+					RUNTIME.PackState = string.format("Waiting · %d/%d coins", PROFILE.money, need)
+				end
+				if os.clock() - lastWarn > 20 then
+					lastWarn = os.clock()
+					log(string.format(
+						"<Warning>No pack and not enough coins</Warning> <Muted>· have %d, cheapest pack %s · turn on Pony Pairs</Muted>",
+						PROFILE.money,
+						need == math.huge and "?" or tostring(need)
+					))
+				end
+				task.wait(3)
+			end
+		end
+		if not S.PacksOn then
+			RUNTIME.PackState = "Idle"
+		end
+		packLock = false
+	end)
+end
+
+----- Pony Pairs -----
+
+local pairsLock = false
+
+local function playBoard()
+	local state = {
+		known = {},
+		matched = {},
+		first = nil,
+		flips = 0,
+		matchedCount = 0,
+		finished = false,
+	}
+
+	local function recount()
+		local total = 0
+		for index = 1, 12 do
+			if state.matched[index] then
+				total = total + 1
+			end
+		end
+		state.matchedCount = total
+	end
+
+	local function markMatched(a, b)
+		if a then
+			state.matched[a] = true
+		end
+		if b then
+			state.matched[b] = true
+		end
+		recount()
+	end
+
+	local function knownPartner(cardId, exclude)
+		for index = 1, 12 do
+			if index ~= exclude and not state.matched[index] and state.known[index] == cardId then
+				return index
+			end
+		end
+		return nil
+	end
+
+	local function unknownPos(exclude)
+		for index = 1, 12 do
+			if index ~= exclude and not state.matched[index] and not state.known[index] then
+				return index
+			end
+		end
+		return nil
+	end
+
+	local function anyPos(exclude)
+		for index = 1, 12 do
+			if index ~= exclude and not state.matched[index] then
+				return index
+			end
+		end
+		return nil
+	end
+
+	local function flipAt(index)
+		if STOP or not S.PairsOn then
+			return nil
+		end
+		local ok, payload = invoke("Memory", "flip", index)
+		state.flips = state.flips + 1
+		if S.FlipDelay > 0 then
+			task.wait(S.FlipDelay)
+		end
+		if not ok or type(payload) ~= "table" or not payload.id then
+			return nil
+		end
+		state.known[index] = payload.id
+		if payload.match then
+			STATS.Matches = STATS.Matches + 1
+		end
+		if type(payload.pay) == "number" and payload.pay > 0 then
+			STATS.PairCoins = STATS.PairCoins + payload.pay
+		end
+		if type(payload.bonus) == "number" and payload.bonus > 0 then
+			STATS.PairCoins = STATS.PairCoins + payload.bonus
+		end
+		if payload.profile then
+			applyProfile(payload.profile)
+		end
+		if payload.finished then
+			state.finished = true
+		end
+		return payload
+	end
+
+	for _ = 1, 30 do
+		if STOP or not S.PairsOn or state.finished or state.matchedCount >= 12 then
+			break
+		end
+
+		if not state.first then
+			local first = unknownPos() or anyPos()
+			if not first then
+				break
+			end
+			local answer = flipAt(first)
+			if not answer then
+				markMatched(first, nil)
+			else
+				state.first = first
+				local partner = knownPartner(state.known[first], first)
+				if partner then
+					local second = flipAt(partner)
+					if second and second.match then
+						markMatched(first, partner)
+						state.first = nil
+					elseif second then
+						state.first = nil
+					else
+						markMatched(partner, nil)
+					end
+				end
+			end
+		else
+			local first = state.first
+			local target = knownPartner(state.known[first], first) or unknownPos(first) or anyPos(first)
+			if not target then
+				state.first = nil
+			else
+				local answer = flipAt(target)
+				if not answer then
+					markMatched(target, nil)
+					state.first = nil
+				elseif answer.match then
+					markMatched(first, target)
+					state.first = nil
+				else
+					state.first = nil
+				end
+			end
+		end
+
+		RUNTIME.Board = string.format("%d/6 pairs", math.floor(state.matchedCount / 2))
+	end
+
+	RUNTIME.Board = string.format("%d/6 pairs", math.floor(state.matchedCount / 2))
+	return state
+end
+
+local function pairsWorker()
+	if pairsLock then
+		return
+	end
+	pairsLock = true
+	task.spawn(function()
+		while S.PairsOn and not STOP do
+			if S.BoardLimit > 0 and STATS.Boards >= S.BoardLimit then
+				S.PairsOn = false
+				RUNTIME.Board = "Board limit reached"
+				log("Board limit reached", "Warning")
+				break
+			end
+
+			local ok, deal = invoke("Memory", "deal")
+			if not (ok and type(deal) == "table" and type(deal.faces) == "table") then
+				RUNTIME.Board = "Waiting for a table"
+				task.wait(1.6)
+			else
+				RUNTIME.Board = "0/6 pairs"
+				local state = playBoard()
+				if state.finished or state.matchedCount >= 12 then
+					STATS.Boards = STATS.Boards + 1
+					RUNTIME.Board = string.format("Board %d done", STATS.Boards)
+					log(string.format(
+						"<Success>Board %d done</Success> <Muted>· %d flips · +%d coins</Muted>",
+						STATS.Boards,
+						state.flips,
+						STATS.PairCoins
+					))
+				else
+					RUNTIME.Board = string.format("Stuck at %d/6", math.floor(state.matchedCount / 2))
+				end
+				task.wait(1.7)
+			end
+		end
+		if not S.PairsOn then
+			RUNTIME.Board = "Idle"
+		end
+		pairsLock = false
+	end)
+end
+
+local function enablePacks(value)
+	S.PacksOn = value and true or false
+	if S.PacksOn then
+		refreshProfile()
+		packWorker()
+		log("Packs on", "Success")
+	else
+		log("Packs off")
+	end
+end
+
+local function enablePairs(value)
+	S.PairsOn = value and true or false
+	if S.PairsOn then
+		pairsWorker()
+		log("Pony Pairs on", "Success")
+	else
+		RUNTIME.Board = "Idle"
+		log("Pony Pairs off")
+	end
+end
+
+----- Window -----
+
+local WINDOW = Airflow:CreateWindow({
+	Name = "Pony Cards",
+	LoadingSubtitle = "packs, duplicates, pony pairs",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(800, 560),
+	Backdrop = { Weather = "Stars", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptPonyCards" },
+	Home = {
+		Title = "Pony Cards",
+		Welcome = "Welcome back,",
+		Tier = "v" .. VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local LogsTab = WINDOW:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogsBox = LogsTab:CreateGroupbox({ Name = "Activity", Side = "Left" })
+local LOG = LogsBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 250,
+	MaxRows = 16,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+	log = function(text, tone)
+	if LOG then
+		LOG:Push(text, tone)
+	end
+end
+
+notify = function(title, content)
+	pcall(function()
+		WINDOW:Notify({ Title = title, Content = content, Type = "Success" })
+	end)
+end
+
+----- Packs tab -----
+
+local PacksTab = WINDOW:CreateTab({ Name = "Packs", Icon = "package" })
+local OverviewBox = PacksTab:CreateGroupbox({ Name = "At a glance", Side = "Left" })
+local OpenBox = PacksTab:CreateGroupbox({ Name = "Auto open", Side = "Left" })
+local RotationBox = PacksTab:CreateGroupbox({ Name = "Rotation", Side = "Right" })
+
+OverviewBox:CreateStatus({
+	Name = "Coins",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success>", PROFILE.money)
+	end,
+})
+
+OverviewBox:CreateStatus({
+	Name = "Packs in rotation",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local parts = {}
+		for _, setId in ipairs(rotationSets()) do
+			table.insert(parts, string.format("%s <b>%d</b>", CardData.Sets[setId].short or setId, packCount(setId)))
+		end
+		if #parts == 0 then
+			return "<Muted>no sets picked</Muted>"
+		end
+		return table.concat(parts, " <Muted>·</Muted> ")
+	end,
+})
+
+OverviewBox:CreateStatus({
+	Name = "Duplicates ready",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local count, coins = sellableSummary()
+		if count == 0 then
+			return "<Muted>none</Muted>"
+		end
+		return string.format("<Accent>%d</Accent> <Muted>cards · ~%d coins</Muted>", count, coins)
+	end,
+})
+
+OverviewBox:CreateStatus({
+	Name = "Session",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format(
+			"<Accent>%d</Accent> <Muted>packs · %d boards · +%d coins</Muted>",
+			STATS.Opens,
+			STATS.Boards,
+			STATS.PairCoins + STATS.SoldCoins
+		)
+	end,
+})
+
+OverviewBox:CreateStatus({
+	Name = "Menu",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if S.PacksOn and S.PairsOn then
+			return "<Success>opening and earning</Success>"
+		elseif S.PacksOn then
+			return "<Accent>opening packs</Accent>"
+		elseif S.PairsOn then
+			return "<Accent>earning on Pony Pairs</Accent>"
+		end
+		return "<Muted>idle</Muted>"
+	end,
+})
+
+OpenBox:CreateToggle({
+	Name = "Auto open",
+	Desc = "Runs the rotation of packs",
+	Flag = "PacksOn",
+	CurrentValue = false,
+	Callback = function(value)
+		enablePacks(value)
+	end,
+})
+
+OpenBox:CreateToggle({
+	Name = "Auto buy",
+	Desc = "Buys a pack in the shop when the stash is empty",
+	Flag = "AutoBuy",
+	CurrentValue = true,
+	Callback = function(value)
+		S.AutoBuy = value
+	end,
+})
+
+OpenBox:CreateSlider({
+	Name = "Keep coins",
+	Desc = "Never spends coins below this",
+	Range = { 0, 2000 },
+	Increment = 10,
+	Suffix = " coins",
+	CurrentValue = 0,
+	Flag = "Reserve",
+	Callback = function(value)
+		S.Reserve = value
+	end,
+})
+
+OpenBox:CreateToggle({
+	Name = "Fast open",
+	Desc = "Asks the server to skip the pack animation",
+	Flag = "FastOpen",
+	CurrentValue = true,
+	Callback = function(value)
+		S.FastOpen = value
+	end,
+})
+
+OpenBox:CreateSlider({
+	Name = "Open delay",
+	Range = { 0.1, 3 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.35,
+	Flag = "OpenDelay",
+	Callback = function(value)
+		S.OpenDelay = value
+	end,
+})
+
+OpenBox:CreateToggle({
+	Name = "Log pulls",
+	Desc = "Writes every pack into the Activity tab",
+	Flag = "LogPulls",
+	CurrentValue = true,
+	Callback = function(value)
+		S.LogPulls = value
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.4,
+	Update = function()
+		return string.format("<Accent>%s</Accent>", RUNTIME.PackState)
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Set",
+	Style = "Row",
+	UpdateRate = 0.4,
+	Update = function()
+		return string.format("<Muted>%s</Muted>", RUNTIME.PackSet)
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Step",
+	Style = "Row",
+	UpdateRate = 0.4,
+	Update = function()
+		return string.format("<Muted>%s</Muted>", RUNTIME.PackQueue)
+	end,
+})
+
+for index = 1, 4 do
+	RotationBox:CreateDropdown({
+		Name = "Slot " .. index,
+		Desc = "Set for this slot, None skips it",
+		Options = (function()
+			local options = { "None" }
+			for _, label in ipairs(SET_NAMES) do
+				table.insert(options, label)
+			end
+			return options
+		end)(),
+		CurrentOption = (S.Slots[index] and setLabel(S.Slots[index])) or "None",
+		Flag = "PackSlot" .. index,
+		Callback = function(value)
+			S.Slots[index] = SET_BY_NAME[value] or nil
+		end,
+	})
+end
+
+RotationBox:CreateSlider({
+	Name = "Packs per slot",
+	Desc = "How many packs to open before the next set",
+	Range = { 1, 20 },
+	Increment = 1,
+	CurrentValue = 3,
+	Flag = "SlotSize",
+	Callback = function(value)
+		S.SlotSize = math.floor(value)
+	end,
+})
+
+RotationBox:CreateStatus({
+	Name = "Queue",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local parts = {}
+		for _, setId in ipairs(rotationSets()) do
+			table.insert(parts, (CardData.Sets[setId].short or setId))
+		end
+		if #parts == 0 then
+			return "<Muted>empty</Muted>"
+		end
+		return string.format("<Accent>%s</Accent> <Muted>x%d</Muted>", table.concat(parts, " → "), S.SlotSize)
+	end,
+})
+
+RotationBox:CreateStatus({
+	Name = "Owned",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local parts = {}
+		for _, setId in ipairs(rotationSets()) do
+			table.insert(parts, string.format("%s <b>%d</b>", CardData.Sets[setId].short or setId, packCount(setId)))
+		end
+		if #parts == 0 then
+			return "<Muted>none</Muted>"
+		end
+		return table.concat(parts, " <Muted>·</Muted> ")
+	end,
+})
+
+RotationBox:CreateButton({
+	Name = "Open one pack",
+	Icon = "package-open",
+	Callback = function()
+		local sets = rotationSets()
+		if #sets == 0 then
+			log("Rotation is empty", "Warning")
+			return
+		end
+		local setId = sets[1]
+		if packCount(setId) <= 0 and S.AutoBuy then
+			buyOne(setId)
+		end
+		if packCount(setId) > 0 and openOne(setId) then
+			sellDuplicates(false)
+		else
+			log("No pack and no coins", "Warning")
+		end
+	end,
+})
+
+----- Duplicates tab -----
+
+local DupTab = WINDOW:CreateTab({ Name = "Duplicates", Icon = "layers" })
+local DupBox = DupTab:CreateGroupbox({ Name = "Auto sell duplicates", Side = "Left" })
+local SalesBox = DupTab:CreateGroupbox({ Name = "Sales", Side = "Right" })
+
+DupBox:CreateToggle({
+	Name = "Auto sell duplicates",
+	Desc = "Sells duplicates right after every open",
+	Flag = "AutoSell",
+	CurrentValue = true,
+	Callback = function(value)
+		S.AutoSell = value
+	end,
+})
+
+DupBox:CreateSlider({
+	Name = "Keep per card",
+	Desc = "Copies kept for every card",
+	Range = { 1, 5 },
+	Increment = 1,
+	CurrentValue = 1,
+	Flag = "Keep",
+	Callback = function(value)
+		S.Keep = math.floor(value)
+	end,
+})
+
+DupBox:CreateSlider({
+	Name = "Sell up to tier",
+	Desc = "Cards of this rarity and below can be sold",
+	Range = { 0, 10 },
+	Increment = 0.5,
+	CurrentValue = 4,
+	Flag = "SellTier",
+	Callback = function(value)
+		S.SellTier = value
+	end,
+})
+
+DupBox:CreateToggle({
+	Name = "Protect favourites",
+	Desc = "Favourites are never sold",
+	Flag = "ProtectFavorites",
+	CurrentValue = true,
+	Callback = function(value)
+		S.ProtectFavorites = value
+	end,
+})
+
+DupBox:CreateStatus({
+	Name = "Selling",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Muted>up to</Muted> <Accent>%s</Accent>", tierName(S.SellTier))
+	end,
+})
+
+DupBox:CreateStatus({
+	Name = "Sold",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>+%d coins</Muted>", STATS.Sold, STATS.SoldCoins)
+	end,
+})
+
+DupBox:CreateButton({
+	Name = "Sell duplicates now",
+	Icon = "coins",
+	Style = "Primary",
+	Callback = function()
+		refreshProfile()
+		sellDuplicates(true)
+	end,
+})
+
+SalesBox:CreateStatus({
+	Name = "Last sale",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return RUNTIME.SaleText
+	end,
+})
+
+SalesBox:CreateStatus({
+	Name = "Ready",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local count, coins = sellableSummary()
+		if count == 0 then
+			return "<Muted>nothing to sell</Muted>"
+		end
+		return string.format("<Accent>%d</Accent> <Muted>cards · ~%d coins</Muted>", count, coins)
+	end,
+})
+
+----- Pony Pairs tab -----
+
+local PairsTab = WINDOW:CreateTab({ Name = "Pony Pairs", Icon = "circle-dot" })
+local PairsBox = PairsTab:CreateGroupbox({ Name = "Auto play", Side = "Left" })
+local EarnBox = PairsTab:CreateGroupbox({ Name = "Earnings", Side = "Right" })
+
+PairsBox:CreateToggle({
+	Name = "Auto play",
+	Desc = "Deals new boards and matches the pairs",
+	Flag = "PairsOn",
+	CurrentValue = false,
+	Callback = function(value)
+		enablePairs(value)
+	end,
+})
+
+PairsBox:CreateSlider({
+	Name = "Flip delay",
+	Desc = "Pause before every card",
+	Range = { 0.05, 1 },
+	Increment = 0.05,
+	Suffix = " s",
+	CurrentValue = 0.1,
+	Flag = "FlipDelay",
+	Callback = function(value)
+		S.FlipDelay = value
+	end,
+})
+
+PairsBox:CreateSlider({
+	Name = "Board limit",
+	Desc = "0 means endless",
+	Range = { 0, 500 },
+	Increment = 5,
+	CurrentValue = 0,
+	Flag = "BoardLimit",
+	Callback = function(value)
+		S.BoardLimit = math.floor(value)
+	end,
+})
+
+PairsBox:CreateStatus({
+	Name = "Board",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.3,
+	Update = function()
+		return string.format("<Accent>%s</Accent>", RUNTIME.Board)
+	end,
+})
+
+PairsBox:CreateButton({
+	Name = "Play one board",
+	Icon = "play",
+	Callback = function()
+		task.spawn(function()
+			local ok, deal = invoke("Memory", "deal")
+			if not (ok and type(deal) == "table" and type(deal.faces) == "table") then
+				log("Table is busy, try again in a moment", "Warning")
+				return
+			end
+			local wasOn = S.PairsOn
+			S.PairsOn = true
+			local state = playBoard()
+			S.PairsOn = wasOn
+			log(string.format("Board: %d flips", state.flips))
+		end)
+	end,
+})
+
+EarnBox:CreateStatus({
+	Name = "From pairs",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success>", STATS.PairCoins)
+	end,
+})
+
+EarnBox:CreateStatus({
+	Name = "Rate",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local elapsed = math.max(1, os.clock() - STATS.Started)
+		local rate = math.floor(STATS.PairCoins / elapsed * 60)
+		return string.format("<Success>%d</Success> <Muted>coins/min</Muted>", rate)
+	end,
+})
+
+EarnBox:CreateStatus({
+	Name = "Boards done",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Accent>%d</Accent>", STATS.Boards)
+	end,
+})
+
+EarnBox:CreateStatus({
+	Name = "Coins now",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Success>%d</Success>", PROFILE.money)
+	end,
+})
+
+EarnBox:CreateStatus({
+	Name = "Opened",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return string.format("<Accent>%d</Accent> <Muted>packs, %d cards</Muted>", STATS.Opens, STATS.Pulls)
+	end,
+})
+
+----- Settings tab -----
+
+local KeysTab = WINDOW:CreateTab({ Name = "Settings", Icon = "settings" })
+local HowBox = KeysTab:CreateGroupbox({ Name = "How to use", Side = "Left" })
+local KeysBox = KeysTab:CreateGroupbox({ Name = "Manual", Side = "Left" })
+local InfoBox = KeysTab:CreateGroupbox({ Name = "Version", Side = "Right" })
+
+HowBox:CreateLabel({
+	Name = "Step 1",
+	Text = "1. Pony Pairs → Auto play — this is what pays for the packs",
+})
+
+HowBox:CreateLabel({
+	Name = "Step 2",
+	Text = "2. Packs → pick up to four sets and how many packs per slot",
+})
+
+HowBox:CreateLabel({
+	Name = "Step 3",
+	Text = "3. Turn on Auto open; Auto buy spends the coins it earns",
+})
+
+HowBox:CreateLabel({
+	Name = "Step 4",
+	Text = "4. Duplicates sells the extras and keeps one, favourites and shelf copies",
+})
+
+HowBox:CreateLabel({
+	Name = "Note",
+	Text = "<Muted>Packs open on the server, so the cards go straight into the binder and the opening screen does not play. The drop list is in Logs.</Muted>",
+})
+
+KeysBox:CreateButton({
+	Name = "Reset stats",
+	Icon = "rotate-ccw",
+	Callback = function()
+		STATS.Opens = 0
+		STATS.Pulls = 0
+		STATS.Fresh = 0
+		STATS.Sold = 0
+		STATS.SoldCoins = 0
+		STATS.Boards = 0
+		STATS.Matches = 0
+		STATS.PairCoins = 0
+		STATS.Started = os.clock()
+		log("Counters reset")
+	end,
+})
+
+KeysBox:CreateButton({
+	Name = "Unload hub",
+	Icon = "power",
+	Style = "Primary",
+	Confirm = true,
+	Callback = function()
+		if API and type(API.Destroy) == "function" then
+			API.Destroy()
+		end
+	end,
+})
+
+InfoBox:CreateLabel({
+	Name = "Version",
+	Text = "v" .. VERSION,
+})
+
+InfoBox:CreateLabel({
+	Name = "RightControl hides the window",
+	Text = "<Muted>RightControl hides the window</Muted>",
+})
+
+InfoBox:CreateLabel({
+	Name = "Remotes",
+	Text = "<Muted>BuyPack · OpenPack · SellCards · Memory</Muted>",
+})
+
+----- Runtime -----
+
+local function cleanup()
+	if STOP then
+		return
+	end
+	STOP = true
+	local waited = 0
+	while (packLock or pairsLock) and waited < 2 do
+		task.wait(0.1)
+		waited = waited + 0.1
+	end
+	for _, connection in ipairs(CONNECTIONS) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	CONNECTIONS = {}
+	pcall(function()
+		WINDOW:Destroy()
+	end)
+	getgenv().RobScriptTS = nil
+end
+
+API = {
+	Version = VERSION,
+	Destroy = cleanup,
+	Airflow = Airflow,
+	State = S,
+	Stats = STATS,
+	Profile = PROFILE,
+	Actions = {
+		OpenOne = function(setId)
+			refreshProfile()
+			if packCount(setId) <= 0 then
+				buyOne(setId)
+			end
+			if packCount(setId) > 0 then
+				return openOne(setId)
+			end
+			return false
+		end,
+		SellDuplicates = function()
+			refreshProfile()
+			return sellDuplicates(true)
+		end,
+		PlayBoard = function()
+			local ok, deal = invoke("Memory", "deal")
+			if not (ok and type(deal) == "table" and type(deal.faces) == "table") then
+				return nil, "table is busy"
+			end
+			local wasOn = S.PairsOn
+			S.PairsOn = true
+			local state = playBoard()
+			S.PairsOn = wasOn
+			return state
+		end,
+		Refresh = refreshProfile,
+		StartPacks = enablePacks,
+		StartPairs = enablePairs,
+		Sync = function()
+			pushToGame(PROFILE, true)
+		end,
+		GameStore = function()
+			return gameStore()
+		end,
+	},
+}
+getgenv().RobScriptTS = API
+
+task.spawn(function()
+	refreshProfile()
+end)
+
+-- Keep the money and stash fresh for the status rows without hammering the server.
+task.spawn(function()
+	local timer = 0
+	while not STOP do
+		task.wait(1)
+		timer = timer + 1
+		if timer >= 5 then
+			timer = 0
+			refreshProfile()
+		end
+	end
+end)
+
+WINDOW:LoadAutoload()
+
+WINDOW:Notify({ Title = "Loaded", Content = "Pony Cards hub is ready", Type = "Success" })
+log(string.format("<Success>Hub v%s loaded</Success>", VERSION))
+log("<Muted>RightControl hides the window</Muted>")
