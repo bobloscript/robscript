@@ -2,7 +2,7 @@
 pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
 =====================================================================
   CASER - Case Farm Hub (Potassium / Robly Airflow UI)
-  v1.0 - auto case opening with rotation, inventory selling by filters
+  v1.1 - auto case opening with rotation, inventory selling by filters
 =====================================================================
   Game: CASER - Open Cases & Upgrade Your Skins!
   placeId 136751105840706
@@ -26,6 +26,16 @@ pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles
     * Logs    - what the script is doing
     * Info    - protocol notes, session numbers
 
+  Live game screens (v1.1)
+    * the game repaints balance, inventory and drop feed inside one client function that every
+      server answer goes through; calling Request directly skipped it, so the game looked frozen
+      until a rejoin
+    * the hub now finds that function through getgc (fingerprint, no line numbers) and replays
+      every answer through it under client identity, because the game's own require calls are
+      refused on an executor thread
+    * nothing is hooked and the game code is not touched; if the lookup fails the hub says so in
+      Info -> Game screens and keeps farming exactly as before
+    
   Window: RightControl
   API:    getgenv().CaserHub
 =====================================================================
@@ -98,6 +108,196 @@ do
 	if ok and type(module) == "table" then
 		Economy = module
 	end
+end
+
+----- Game UI bridge -----
+
+-- The game repaints its own screens from one client function that every server answer goes
+-- through: balance ticker, inventory page, drop feed. A bare Request call skips it, which is why
+-- the game looked frozen during auto open and only a rejoin showed the new items. This block
+-- finds that function once at runtime and replays the hub's answers through it. Nothing is hooked
+-- or replaced: it is only called with the same table the server already returned to us.
+local GameBridge = {
+	apply = nil, -- the game's own apply function, once it is found
+	status = "searching", -- searching | linked | unavailable | off
+	reason = nil,
+	enabled = true,
+	failures = 0,
+	queue = {},
+	busy = false,
+	pushed = 0,
+	lastAt = 0,
+}
+
+local REVEAL_FIELDS = { "begin", "finish", "active", "drop" }
+local STORE_FIELDS = { "sync", "layout", "ready" }
+local GIFT_FIELDS = { "init", "sync", "open" }
+local CATALOG_FIELDS = { "Cases", "ById" }
+
+local function hasFields(value, fields)
+	if type(value) ~= "table" then
+		return false
+	end
+	for _, field in ipairs(fields) do
+		if value[field] == nil then
+			return false
+		end
+	end
+	return true
+end
+
+-- Executors disagree about debug.getupvalue: some return (name, value), Potassium returns the
+-- value alone, and the call errors once the index is past the last upvalue.
+local function upvaluesOf(func)
+	local values = {}
+	for index = 1, 80 do
+		local packed = table.pack(pcall(debug.getupvalue, func, index))
+		if not packed[1] then
+			break
+		end
+		local value
+		if packed.n >= 3 then
+			if packed[2] == nil then
+				break
+			end
+			value = packed[3]
+		else
+			value = packed[2]
+		end
+		if value == nil then
+			break
+		end
+		values[index] = value
+	end
+	return values
+end
+
+-- Every function of the game client reports "Players.<name>.PlayerScripts.CaserClient" as its
+-- source, so the scan survives a game update that moves line numbers. The apply function is the
+-- only one-argument closure holding the reveal state, the phone store, the gift dialog and the
+-- catalog at once (checked against build M9.14: exactly one match).
+local function findGameApplier()
+	if type(getgc) ~= "function" or type(debug) ~= "table" then
+		return nil, "the executor cannot scan functions (no getgc)"
+	end
+	local sourceName = "Players." .. tostring(LocalPlayer.Name) .. ".PlayerScripts.CaserClient"
+	local scanned, garbage = pcall(getgc, false)
+	if not scanned then
+		scanned, garbage = pcall(getgc, true)
+	end
+	if not scanned or type(garbage) ~= "table" then
+		return nil, "getgc failed"
+	end
+	for _, object in pairs(garbage) do
+		if type(object) == "function" then
+			local okSource, source = pcall(debug.info, object, "s")
+			if okSource and source == sourceName then
+				local okArity, arity = pcall(debug.info, object, "a")
+				if okArity and arity == 1 then
+					local reveal, store, gift, catalog = false, false, false, false
+					for _, value in pairs(upvaluesOf(object)) do
+						if hasFields(value, REVEAL_FIELDS) then reveal = true end
+						if hasFields(value, STORE_FIELDS) then store = true end
+						if hasFields(value, GIFT_FIELDS) then gift = true end
+						if hasFields(value, CATALOG_FIELDS) then catalog = true end
+					end
+					if reveal and store and gift and catalog then
+						return object
+					end
+				end
+			end
+		end
+	end
+	return nil, "the game UI function was not found"
+end
+
+-- The game's apply function requires its own modules, and Roblox refuses to require a normal
+-- module from an executor thread (identity 8: "Cannot require a non-RobloxScript module from a
+-- RobloxScript"). Running that one call with the identity of a regular client script is the whole
+-- trick; the previous identity is always restored.
+local function withClientIdentity(call)
+	if type(setidentity) == "function" and type(getidentity) == "function" then
+		local original = getidentity()
+		if original ~= 2 and pcall(setidentity, 2) then
+			local ok, result = pcall(call)
+			pcall(setidentity, original)
+			return ok, result
+		end
+	end
+	return pcall(call)
+end
+
+local function ensureGameBridge()
+	if GameBridge.apply then
+		return true
+	end
+	if GameBridge.status == "unavailable" then
+		return false
+	end
+	local applier, reason = findGameApplier()
+	if applier then
+		GameBridge.apply = applier
+		GameBridge.status = "linked"
+		GameBridge.reason = nil
+		return true
+	end
+	GameBridge.status = "unavailable"
+	GameBridge.reason = reason
+	return false
+end
+
+-- Answers are applied one at a time and in order, but off the opening loop: the game's repaint may
+-- yield and must never slow the farm down.
+local function pumpGameBridge()
+	if GameBridge.busy then
+		return
+	end
+	GameBridge.busy = true
+	task.spawn(function()
+		while #GameBridge.queue > 0 do
+			local response = table.remove(GameBridge.queue, 1)
+			if GameBridge.enabled and GameBridge.apply then
+				local ok, failure = withClientIdentity(function()
+					return GameBridge.apply(response)
+				end)
+				if ok then
+					GameBridge.failures = 0
+					GameBridge.pushed = GameBridge.pushed + 1
+					GameBridge.lastAt = os.clock()
+				else
+					GameBridge.failures = GameBridge.failures + 1
+					GameBridge.reason = tostring(failure)
+					if GameBridge.failures == 1 then
+						warn("[CaserHub] game UI bridge: " .. tostring(failure))
+					end
+					if GameBridge.failures >= 5 then
+						-- A game update changed the shape: stop calling it, keep the farm running.
+						GameBridge.apply = nil
+						GameBridge.status = "unavailable"
+					end
+				end
+			end
+			task.wait(0.05)
+		end
+		GameBridge.busy = false
+	end)
+end
+
+local function pushGameResponse(response)
+	if not GameBridge.enabled then
+		return
+	end
+	if type(response) ~= "table" or type(response.profile) ~= "table" then
+		return
+	end
+	if not GameBridge.apply and not ensureGameBridge() then
+		return
+	end
+	table.insert(GameBridge.queue, response)
+	if #GameBridge.queue > 6 then
+		table.remove(GameBridge.queue, 1)
+	end
+	pumpGameBridge()
 end
 
 ----- Constants -----
@@ -341,6 +541,7 @@ local function saveSaved()
 		perOpen = valueOf(ui.casesPerOpen, nil),
 		sellEvery = valueOf(ui.sellEvery, nil),
 		autoSell = ui.autoSell and toggleOf(ui.autoSell) or nil,
+		gameLive = ui.gameLive and toggleOf(ui.gameLive) or nil,
 		forceSellAt = valueOf(ui.forceSellAt, nil),
 		minValueU = valueOf(ui.minValue, nil),
 		maxValueU = valueOf(ui.maxValue, nil),
@@ -384,6 +585,12 @@ local function acceptState(response)
 	if tonumber(response.serverTime) then
 		State.serverTime = tonumber(response.serverTime)
 	end
+end
+
+-- Every server answer lands here: the hub's own numbers first, then the game's own screens.
+local function applyResponse(response)
+	acceptState(response)
+	pushGameResponse(response)
 end
 
 local function credits()
@@ -432,7 +639,7 @@ local function refreshState()
 	end
 	local response = callRemote("state", {}, 4)
 	if type(response) == "table" then
-		acceptState(response)
+		applyResponse(response)
 		return true
 	end
 	return false
@@ -786,7 +993,7 @@ local function sellNow(reason)
 			failure = tostring(transportError)
 			break
 		end
-		acceptState(response)
+		applyResponse(response)
 		if response.ok then
 			soldCount = soldCount + #chunk
 			gained = gained + (tonumber(response.value) or 0)
@@ -1044,7 +1251,7 @@ local function openAttempt()
 		State.lastOpenAt = os.clock()
 		State.notice = nil
 		State.skipReason = ""
-		acceptState(response)
+		applyResponse(response)
 		State.stats.opens = State.stats.opens + 1
 		State.stats.cases = State.stats.cases + count
 		State.stats.invested = State.stats.invested + cost
@@ -1282,7 +1489,7 @@ Window = Airflow:CreateWindow({
 	Home = {
 		Title = "Robscript Team - Caser",
 		Welcome = "Welcome back,",
-		Tier = "v1.0",
+		Tier = "v1.1",
 		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
 	},
 })
@@ -1344,6 +1551,40 @@ ui.autoSell = OpenBox:CreateToggle({
 	Flag = "AutoSell",
 	CurrentValue = Saved.autoSell ~= false,
 })
+
+ui.gameLive = OpenBox:CreateToggle({
+	Name = "Live game screens",
+	Desc = "Repaint the game's own balance, inventory and drop feed with every server answer - no rejoin needed",
+	Flag = "GameLive",
+	CurrentValue = Saved.gameLive ~= false,
+	Callback = function(enabled)
+		GameBridge.enabled = enabled
+		if enabled then
+			if not GameBridge.apply then
+				GameBridge.status = "searching"
+				ensureGameBridge()
+			end
+			if GameBridge.apply then
+				GameBridge.status = "linked"
+			end
+			-- Everything opened or sold while the switch was off is missing from the game screens,
+			-- so pull a fresh state through the bridge right away.
+			task.spawn(function()
+				refreshState()
+			end)
+		else
+			GameBridge.status = "off"
+			GameBridge.queue = {}
+		end
+	end,
+})
+
+-- The saved value is applied by the library without running the callback, so the bridge has to
+-- pick the flag up by hand or the switch would show "off" while answers keep flowing through.
+GameBridge.enabled = Saved.gameLive ~= false
+if not GameBridge.enabled then
+	GameBridge.status = "off"
+end
 
 OpenBox:CreateStatus({
 	Name = "Balance",
@@ -1828,6 +2069,45 @@ NumbersBox:CreateStatus({
 	end,
 })
 
+NumbersBox:CreateStatus({
+	Name = "Game screens",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 1,
+	Update = function()
+		-- Config restores change the flag without running its callback, so the switch on the Cases
+		-- tab stays the source of truth and the bridge follows it here once a second.
+		if ui.gameLive then
+			local wanted = toggleOf(ui.gameLive)
+			if wanted ~= GameBridge.enabled then
+				GameBridge.enabled = wanted
+				GameBridge.status = wanted and (GameBridge.apply and "linked" or "searching") or "off"
+				if not wanted then
+					GameBridge.queue = {}
+				elseif not GameBridge.apply then
+					task.spawn(function()
+						ensureGameBridge()
+					end)
+				end
+			end
+		end
+		if not GameBridge.enabled then
+			return "<Muted>off</Muted>"
+		end
+		if GameBridge.apply then
+			return "<Success>live</Success> " .. tostring(GameBridge.pushed)
+		end
+		if GameBridge.status == "unavailable" then
+			local text = tostring(GameBridge.reason or "not found")
+			text = string.gsub(text, "&", "&amp;")
+			text = string.gsub(text, "<", "&lt;")
+			text = string.gsub(text, ">", "&gt;")
+			return "<Warning>" .. text .. "</Warning>"
+		end
+		return "<Muted>linking</Muted>"
+	end,
+})
+
 NumbersBox:CreateButton({
 	Name = "Destroy hub",
 	Style = "Danger",
@@ -1842,11 +2122,36 @@ NumbersBox:CreateButton({
 ----- Boot -----
 
 task.spawn(function()
+	-- Link the game's own screens first, so even the very first state sync reaches them.
+	if GameBridge.enabled then
+		ensureGameBridge()
+	end
 	refreshState()
 	if State.vip or presetUnlocked() then
 		pushLog("<Success>VIP/preset detected</Success> - up to 10 cases per call")
 	end
 	pushLog("<Muted>Robscript Team - Caser ready</Muted> - " .. tostring(#CaseList) .. " cases in the list")
+	if not GameBridge.enabled then
+		pushLog("<Muted>Live game screens are off</Muted> - switch them on in the Cases tab")
+	elseif GameBridge.apply then
+		pushLog("<Success>Game screens linked</Success> - balance, inventory and drops update live")
+	else
+		-- The game client may still be building itself; keep trying quietly in the background.
+		task.spawn(function()
+			for _ = 1, 20 do
+				task.wait(3)
+				if not GameBridge.enabled or GameBridge.apply then
+					return
+				end
+				GameBridge.status = "searching"
+				if ensureGameBridge() then
+					pushLog("<Success>Game screens linked</Success> - balance, inventory and drops update live")
+					return
+				end
+			end
+			pushLog("<Warning>Game screens stay frozen until a rejoin</Warning> - " .. tostring(GameBridge.reason or "not found"))
+		end)
+	end
 end)
 
 ----- Public API -----
@@ -1857,6 +2162,8 @@ local function destroy()
 	State.running = false
 	State.destroyed = true
 	State.token = State.token + 1
+	GameBridge.enabled = false
+	GameBridge.queue = {}
 	pcall(saveSaved)
 	pcall(function()
 		Window:Destroy()
@@ -1905,6 +2212,13 @@ api = {
 	configFile = CONFIG_FILE,
 	window = Window,
 	ui = ui,
+	gameBridge = GameBridge,
+	relink = function()
+		GameBridge.apply = nil
+		GameBridge.failures = 0
+		GameBridge.status = "searching"
+		return ensureGameBridge()
+	end,
 }
 
 getgenv().CaserHub = api
